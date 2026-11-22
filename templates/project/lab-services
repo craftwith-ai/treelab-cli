@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# lab-services — the local services of one lane. Copy it to scripts/lab-services in your project, make it executable, commit
+# it, and adapt the stack below; lab finds it by its presence alone.
+#   stop  stops and removes this lane's stack. lab close and lab close --abandon run it from the lane's folder just before
+#         removing that folder, and lab services <project> stop <lane> runs it again afterwards. It must be idempotent: a
+#         stack already gone is a success, not a failure.
+#   list  names what the project's lanes still have, one line per resource: <lane><TAB><resource>. lab runs it once per
+#         project, from the main checkout, with LAB_LANE empty, for lab sweep, lab doctor and lab services <project> list;
+#         a non-empty LAB_LANE asks for that lane only. A lane without a folder is an orphan. It has 15 seconds; a failure
+#         (docker missing included) is shown as "not checked", never as zero.
+# lab gives it LAB_PROJECT, LAB_LANE and LAB_WORKTREE (empty when the lane's folder is already gone — then the script runs
+# from the main checkout). So never rely on files of the lane: the stack is named after the lane and that name is enough.
+# Failures do not block a closing: lab warns, names this script, and removes the lane anyway.
+set -euo pipefail
+
+project="${LAB_PROJECT:-project}"
+lane="${LAB_LANE:-lane}"
+# Compose project name: lowercase, letters, digits and dashes only — the lane is enough to find the stack without its folder.
+compose_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-'; }
+stack="$(compose_name "$project-$lane")"
+
+# lane_of <stack> <working_dir|-> → the lane of one of this project's stacks, empty otherwise. The exact lane comes from the
+# folder Compose ran in (<root>/.worktrees/<lane>: a lane named v1.2 or my_lane keeps its name). Without it (a volume whose
+# containers are gone), from the stack name after "<project>-": a lane folder still present whose Compose name matches gives
+# its exact name (a live lane is never read as closed); otherwise a "." or "_" of a closed lane reads as "-". A stack run
+# from another project's lanes, or from a folder that is not a lane, is not listed — except a volume-only stack of another
+# project whose name starts with "<project>-" (say project "shop" and "shop-admin"): give your projects distinct prefixes.
+lane_of() {
+  local s="$1" wd="$2" r
+  case "$s" in "$prefix"?*) ;; *) return 0 ;; esac
+  case "$wd" in
+    -) for r in "$root"/.worktrees/*/; do
+         r="${r%/}"; r="${r##*/}"
+         if [ "$(compose_name "$project-$r")" = "$s" ]; then printf '%s\n' "$r"; return 0; fi
+       done
+       printf '%s\n' "${s#"$prefix"}" ;;
+    */.worktrees/?*)
+      r="${wd%%/.worktrees/*}"; if [ -d "$r" ]; then r="$(cd "$r" && pwd -P)"; fi
+      [ "$r" = "$root" ] || return 0
+      wd="${wd#*/.worktrees/}"; printf '%s\n' "${wd%%/*}" ;;
+  esac
+}
+# wanted <lane> : a lane of this project, and the one asked for when LAB_LANE is set
+wanted() { [ -n "$1" ] && [ "$1" != - ] && { [ -z "$only" ] || [ "$1" = "$only" ]; }; }
+# dashes : an empty field becomes "-" (read with a tab IFS would merge two tabs and shift the fields)
+dashes() { awk -F'\t' -v OFS='\t' '{ for (i = 1; i <= NF; i++) if ($i == "") $i = "-"; print }'; }
+
+case "${1:-}" in
+  stop)
+    if ! command -v docker >/dev/null 2>&1; then echo "docker missing: nothing to stop for $stack" >&2; exit 0; fi
+    docker compose -p "$stack" down -v --remove-orphans
+    ;;
+  list)
+    if ! command -v docker >/dev/null 2>&1; then echo "docker missing: services not listed" >&2; exit 1; fi
+    prefix="$(compose_name "$project")-"
+    root="$(pwd -P)"; root="${root%%/.worktrees/*}"
+    only="${LAB_LANE:-}"
+    label='com.docker.compose.project'
+    # read first: a docker failure (daemon down) fails the list instead of listing nothing
+    containers="$(docker ps -a --filter "label=$label" --format "{{.Label \"$label\"}}\t{{.Label \"$label.working_dir\"}}\t{{.Names}}\t{{.State}}" | dashes)"
+    volumes="$(docker volume ls --filter "label=$label" --format "{{.Label \"$label\"}}\t{{.Name}}" | dashes)"
+    known=""   # <stack><TAB><lane or -> per line: the volumes of a stack take the lane of its containers
+    while IFS=$'\t' read -r s wd name state; do
+      case "$s" in ''|-) continue ;; esac
+      l="$(lane_of "$s" "$wd")"; known="$known$s"$'\t'"${l:--}"$'\n'
+      wanted "$l" || continue
+      printf '%s\tcontainer %s (%s)\n' "$l" "$name" "$state"
+    done <<<"$containers"
+    while IFS=$'\t' read -r s name; do
+      case "$s" in ''|-) continue ;; esac
+      l="$(printf '%s' "$known" | awk -F'\t' -v s="$s" '$1 == s { print $2; exit }')"
+      [ -n "$l" ] || l="$(lane_of "$s" -)"
+      wanted "$l" || continue
+      printf '%s\tvolume %s\n' "$l" "$name"
+    done <<<"$volumes"
+    ;;
+  *)
+    echo "usage: $(basename "$0") stop|list" >&2
+    exit 2
+    ;;
+esac

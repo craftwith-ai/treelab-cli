@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "exemple": {
+      "command": "bash",
+      "args": ["-c", "source ~/.secrets/exemple.env && exec npx -y exemple-mcp-server"]
+    }
+  }
+}

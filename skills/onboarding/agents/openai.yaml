@@ -1,0 +1,4 @@
+# Codex: skill reserved to the user ($onboarding) — the model does not pick it on its own from its description.
+# Equivalent of "disable-model-invocation: true" (Claude) in SKILL.md; Claude ignores this subfolder.
+policy:
+  allow_implicit_invocation: false

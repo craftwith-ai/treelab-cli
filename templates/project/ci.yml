@@ -1,0 +1,137 @@
+# Lean CI template (lab): lab new writes it to .github/workflows/ci.yml in a project that has no workflow yet; lab never
+# overwrites an existing workflow. lab doctor warns when one of its guards is missing and measures the CI minutes it costs.
+# Principle: CI runs only when needed, without losing safety. Fill in the four commands below (env); an empty command skips its
+# step with a notice, and the full suite never runs on an ordinary pull request push.
+#   1. fast: every pull request push, drafts included — secrets (gitleaks), then FAST_CMD (lint, types). Seconds, Linux.
+#   2. targeted: a ready pull request without the full-suite label — TARGETED_CMD receives the changed files as arguments.
+#   3. full: once per lane — the pull request carries the full-suite label (set by lab close before acceptance), or it is the
+#      staging → main promotion; FULL_CMD runs the whole suite.
+#   4. night: every night on main, skipped when main has not moved since the last green night — FULL_CMD as a safety net.
+#   5. e2e: at night after the night job, or on a pull request carrying the e2e label — E2E_CMD.
+# push only on main (a branch push without a pull request costs nothing); a new revision cancels the previous run of its pull
+# request; macOS only if a test really needs it (one macOS minute costs ten Linux minutes).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled]
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # the night job reads the previous night runs
+  actions: read
+
+# The night has its own group (a merge never cancels it); a label other than full-suite (e2e included) gets one group per run,
+# so it cancels nothing and nothing cancels it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-night' || '' }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-suite' && format('-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+
+env:
+  FAST_CMD: ''       # e.g. npm run lint && npm run typecheck
+  TARGETED_CMD: ''   # e.g. npx vitest related --run (the changed files are appended as arguments)
+  FULL_CMD: ''       # e.g. npm test
+  E2E_CMD: ''        # e.g. npx playwright test
+
+jobs:
+  fast:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Full history: the secret scan reads every commit, not only the last one.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Secret scan: a committed token or key, even removed later, turns this job red. Pinned gitleaks binary, checked by sha256
+      # before running; --verbose names file and commit, --redact hides the secret. Real false positive: its fingerprint goes in
+      # .gitleaksignore, with the reason in the batch file.
+      - name: Secrets (gitleaks)
+        run: |
+          (cd "$RUNNER_TEMP" && curl -fsSLO https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz &&
+            echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum -c - &&
+            tar -xzf gitleaks_8.30.1_linux_x64.tar.gz gitleaks)
+          "$RUNNER_TEMP/gitleaks" git --redact --verbose --no-banner --log-opts=HEAD .
+      - name: Fast checks (FAST_CMD)
+        shell: bash
+        run: |
+          if [ -z "$FAST_CMD" ]; then echo "::notice::FAST_CMD is empty (top of ci.yml): no fast check declared"; exit 0; fi
+          bash -c "$FAST_CMD"
+
+  targeted:
+    needs: fast
+    # Drafts cannot be merged: tests wait for the pull request to be marked "ready"; the full-suite label replaces them.
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false && github.event.action != 'labeled' && !contains(github.event.pull_request.labels.*.name, 'full-suite')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The head of a pull request is its merge with the base: base..HEAD is the pull request diff.
+      - name: Tests of the changed files (TARGETED_CMD)
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -z "$TARGETED_CMD" ]; then echo "::notice::TARGETED_CMD is empty (top of ci.yml): no targeted test declared"; exit 0; fi
+          mapfile -t files < <(git diff --name-only --diff-filter=d "$BASE" HEAD)
+          if [ "${#files[@]}" -eq 0 ]; then echo "::notice::no changed file: nothing to test"; exit 0; fi
+          bash -c "$TARGETED_CMD"' "$@"' targeted "${files[@]}"
+
+  full:
+    needs: fast
+    if: ${{ !cancelled() && needs.fast.result == 'success' && github.event_name == 'pull_request' && github.event.pull_request.draft == false && (contains(github.event.pull_request.labels.*.name, 'full-suite') && (github.event.action != 'labeled' || github.event.label.name == 'full-suite') || github.head_ref == 'staging' && github.base_ref == 'main' && github.event.action != 'labeled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full suite (FULL_CMD)
+        shell: bash
+        run: |
+          if [ -z "$FULL_CMD" ]; then echo "::notice::FULL_CMD is empty (top of ci.yml): no full suite declared"; exit 0; fi
+          bash -c "$FULL_CMD"
+
+  night:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      play: ${{ steps.moved.outputs.play }}
+    steps:
+      - uses: actions/checkout@v4
+      # Skipped when the last green night tested this same revision (run by hand: always played).
+      - name: Has main moved since the last green night?
+        id: moved
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last="$(gh run list -R "$GITHUB_REPOSITORY" --workflow "$GITHUB_WORKFLOW" --event schedule --status success --branch "$GITHUB_REF_NAME" --limit 1 --json headSha --jq '.[0].headSha // ""' || true)"
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$last" = "$GITHUB_SHA" ]; then
+            echo "::notice::main has not moved since the last green night: suite skipped"; echo 'play=no' >>"$GITHUB_OUTPUT"
+          else echo 'play=yes' >>"$GITHUB_OUTPUT"; fi
+      - name: Full suite (FULL_CMD)
+        if: steps.moved.outputs.play == 'yes'
+        shell: bash
+        run: |
+          if [ -z "$FULL_CMD" ]; then echo "::notice::FULL_CMD is empty (top of ci.yml): no full suite declared"; exit 0; fi
+          bash -c "$FULL_CMD"
+
+  e2e:
+    needs: night
+    if: ${{ !cancelled() && (needs.night.outputs.play == 'yes' || github.event_name == 'pull_request' && github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'e2e') && (github.event.action != 'labeled' || github.event.label.name == 'e2e')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: End-to-end tests (E2E_CMD)
+        shell: bash
+        run: |
+          if [ -z "$E2E_CMD" ]; then echo "::notice::E2E_CMD is empty (top of ci.yml): no end-to-end test declared"; exit 0; fi
+          bash -c "$E2E_CMD"

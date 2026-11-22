@@ -1,0 +1,4 @@
+# .codex/config.toml — project-local Codex config (not versioned). MCP servers mirror .mcp.json.
+[mcp_servers.exemple]
+command = "bash"
+args = ["-c", "source ~/.secrets/exemple.env && exec npx -y exemple-mcp-server"]
