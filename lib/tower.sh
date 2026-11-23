@@ -4,6 +4,7 @@
 # l'utilisateur et ne répond jamais à sa place.
 # Entrée d'attente d'un couloir : <couloir>/.lab/waits-for (kind=question|permission|acceptance|blocked, why=, at=), posée par les
 # crochets Claude (question, autorisation) et par lab next (recette prête, refus) ; dans tous les projets, avec ou sans tour.
+declare -F kv_value >/dev/null || . "${BASH_SOURCE[0]%/*}/kv.sh"
 TOWER_LANE=tower
 lane_role() { wt_meta "$1" role; }
 # la marque role=tower vit dans le couloir, que son agent peut écrire : la tour n'est reconnue que si la marque posée par lab tower
@@ -11,11 +12,13 @@ lane_role() { wt_meta "$1" role; }
 tower_mark_file() { printf '%s/%s/tower\n' "$LAB_STATE" "$P_NAME"; }
 tower_mark() { mkdir -p "$LAB_STATE/$P_NAME"; ( umask 077; printf '%s\n' "$1" >"$(tower_mark_file)" ); }
 lane_is_tower() {
-  [ "$(lane_role "$1")" = tower ] && [ -n "${P_NAME:-}" ] || return 1
-  local m; m="$(head -1 "$(tower_mark_file)" 2>/dev/null || true)"; [ -n "$m" ] && same_path "$m" "$1"
+  local m=''
+  kv_value "$1/.lab/meta" role && [ "$KV_VALUE" = tower ] && [ -n "${P_NAME:-}" ] || return 1
+  { IFS= read -r m <"$LAB_STATE/$P_NAME/tower"; } 2>/dev/null || true
+  [ -n "$m" ] && same_path "$m" "$1"
 }
 waits_file() { printf '%s/.lab/waits-for\n' "$1"; }
-waits_get() { [ -f "$(waits_file "$1")" ] || return 0; sed -n "s/^$2=//p" "$(waits_file "$1")" | head -1; }
+waits_get() { [ -f "$1/.lab/waits-for" ] || return 0; kv_print "$1/.lab/waits-for" "$2"; }
 # waits_set <wt> <kind> <why> [source] : réécriture atomique, motif sur une ligne de 200 octets au plus ; couloir sans .lab : rien.
 # source=idle (lot 09) : l'entrée vient d'une session au repos (idle_prompt), pas d'une vraie question
 waits_set() {
@@ -35,7 +38,12 @@ waits_idle() {
     *) return 1 ;;
   esac
 }
-waits_clear() { rm -f "$(waits_file "$1")" "$(waits_question_file "$1")"; }
+# deux fichiers absents, le cas ordinaire de chaque prompt et de chaque outil : aucun processus
+waits_clear() {
+  local f="$1/.lab/waits-for" q="$1/.lab/waits-question.json"
+  if [ ! -e "$f" ] && [ ! -L "$f" ] && [ ! -e "$q" ] && [ ! -L "$q" ]; then return 0; fi
+  rm -f "$f" "$q"
+}
 # la boîte AskUserQuestion entière (lot 02 de pilotage-voix) : questions, choix, descriptions, multiSelect — lue par lab ginkgo question
 waits_question_file() { printf '%s/.lab/waits-question.json\n' "$1"; }
 # waits_question_set <wt> <json de tool_input.questions> : bornée (4 questions, 6 choix, textes coupés), réécriture atomique ;
@@ -51,16 +59,18 @@ waits_question_set() {
   ( umask 077; printf '%s\n' "$j" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f" )
 }
 # transcript_note <wt> : le transcript de la session (transcript_path de tout crochet Claude) rangé dans <couloir>/.lab/transcript,
-# lu par lab ginkgo question (fin du dernier message) et reply (réponse de la tour) ; PAYLOAD est celui du crochet
+# lu par lab ginkgo question (fin du dernier message) et reply (réponse de la tour) ; PAYLOAD est celui du crochet. [chemin] : déjà
+# lu dans la charge par le chemin court (lib/guard_fast.sh) ; déjà rangé, le cas ordinaire : aucun processus
 transcript_note() {
-  local t f; [ -d "$1/.lab" ] || return 0; f="$1/.lab/transcript"
-  t="$(printf '%s' "${PAYLOAD:-}" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
+  local t f seen=''; [ -d "$1/.lab" ] || return 0; f="$1/.lab/transcript"
+  if [ "$#" -ge 2 ]; then t="$2"; else t="$(printf '%s' "${PAYLOAD:-}" | jq -r '.transcript_path // empty' 2>/dev/null || true)"; fi
   case "$t" in /*) ;; *) return 0 ;; esac
-  [ "$(cat "$f" 2>/dev/null)" = "$t" ] && return 0
+  { IFS= read -r -d '' seen <"$f"; } 2>/dev/null || true
+  case "$seen" in "$t"|"$t"$'\n') return 0 ;; esac
   ( umask 077; printf '%s\n' "$t" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f" )
 }
 # waits_clear_answered <wt> : une question ou une autorisation est réglée dès que la session reprend un outil ou se termine
-waits_clear_answered() { case "$(waits_get "$1" kind)" in question|permission) waits_clear "$1" ;; esac; }
+waits_clear_answered() { kv_value "$1/.lab/waits-for" kind || true; case "$KV_VALUE" in question|permission) waits_clear "$1" ;; esac; }
 waits_label() {
   case "$1" in
     question) echo 'question waiting' ;; permission) echo 'permission requested' ;;

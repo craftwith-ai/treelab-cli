@@ -2,6 +2,16 @@
 
 Release notes of each published version of Treelab, newest first.
 
+## 1.5.0 — 2026-11-22
+
+**Free trial and subscription: the key arrives at once**
+
+- A 14-day free trial, no card: the installer shows the agreement before sending, and the key leaves at once by email, in English or French, with the contract attached.
+- A monthly or yearly subscription, per seat: one email confirms the purchase, its price, its taxes and its contract, then the keys appear. On the payment page, your local currency may be offered.
+- Your trial key becomes the paid key, with nothing to reinstall: from lab subscribe, the installer or the link in the trial email. After a trial request, the installer never opens the new-key page again.
+- The pricing page says it all: price per seat with taxes included, team discount, what stays yours if you stop, licence and readable code.
+- Resuming a session: the input line of a tab is cleared before each typed command, never glued to another one again.
+
 ## 1.4.2 — 2026-11-22
 
 **Accept and close in a few words, nothing to type**

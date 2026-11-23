@@ -1,24 +1,57 @@
 # shellcheck shell=bash
 # git.sh — primitives git partagées par la CLI et les hooks.
 repo_root() { git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null; }
-common_git_dir() {
-  local root raw
-  root="$(repo_root "${1:-$PWD}")" || return 1
-  raw="$(git -C "$root" rev-parse --git-common-dir)"
-  case "$raw" in /*) printf '%s\n' "$raw" ;; *) (cd "$root/$raw" && pwd -P) ;; esac
+# git_places <dossier> : GP_TOP, racine du worktree, GP_COMMON, dossier git commun (absolu), et GP_MAIN, le checkout principal — un
+# seul git pour les trois (lot 01 de charge-processeur) ; rc 1 hors dépôt. La garde, qui vit le temps d'un outil, pose GP_MEMO=1 :
+# le dossier déjà lu ne relance pas git. Une commande longue ne le pose jamais : le dépôt peut y changer
+git_places() {
+  local out dir="$1"
+  if [ "${GP_MEMO:-0}" = 1 ] && [ "${GP_FOR:-}" = "$dir" ]; then return "$GP_RC"; fi
+  GP_FOR="$dir"; GP_RC=1; GP_TOP=''; GP_COMMON=''; GP_MAIN=''
+  out="$(exec git -C "$dir" rev-parse --show-toplevel --git-common-dir 2>/dev/null)" || return 1
+  GP_TOP="${out%%$'\n'*}"; GP_COMMON="${out#*$'\n'}"
+  case "$GP_COMMON" in *$'\n'*)   # un nom de dossier qui porte un retour à la ligne : chaque réponse à part
+    GP_TOP="$(exec git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || { GP_TOP=''; GP_COMMON=''; return 1; }
+    GP_COMMON="$(exec git -C "$dir" rev-parse --git-common-dir 2>/dev/null)" || { GP_TOP=''; GP_COMMON=''; return 1; } ;;
+  esac
+  case "$GP_COMMON" in
+    /*) ;;
+    # relatif au dossier lu : le .git du checkout principal. Jamais un cd dans ce shell (dossier de départ retiré), ni un nom que
+    # CDPATH irait chercher ailleurs (revue du lot 01 de charge-processeur)
+    *) if [ ! -L "$GP_TOP/.git" ] && [ "$GP_TOP/.git" -ef "$dir/$GP_COMMON" ]; then GP_COMMON="$GP_TOP/.git"
+       else GP_COMMON="$(CDPATH=''; cd "$dir" && cd -P "./$GP_COMMON" && printf '%s\n' "$PWD")" || { GP_TOP=''; GP_COMMON=''; return 1; }; fi ;;
+  esac
+  GP_MAIN="${GP_COMMON%/*}"; GP_MAIN="${GP_MAIN:-/}"; GP_RC=0
 }
+common_git_dir() { git_places "${1:-$PWD}" || return 1; printf '%s\n' "$GP_COMMON"; }
 # Checkout principal (celui qui possède le .git) du dépôt contenant $1.
-main_root() { local c; c="$(common_git_dir "${1:-$PWD}")" || return 1; dirname "$c"; }
+main_root() { git_places "${1:-$PWD}" || return 1; printf '%s\n' "$GP_MAIN"; }
 # real_path <chemin> : liens résolus ET casse réelle du disque. Sur macOS (FS insensible à la casse), `pwd -P` de bash 3.2 garde la casse
 # du cwd : lancé depuis le chemin du dépôt tapé en minuscules, install.sh posait liens et hooks Codex en minuscules (hash d'approbation changé — lot 10, 2026-09-03).
 # `stat -f %R` (BSD) rend la casse réelle ; GNU stat (coreutils) prend %R pour un fichier et imprime un bloc statfs sur stdout en
 # échouant : sa sortie n'est gardée que si c'est le même dossier. Un chemin qui n'existe pas est rendu tel quel.
 real_path() {
-  local p r; p="$( (cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1")"
-  r="$(stat -f %R "$p" 2>/dev/null || true)"
+  local p r; p="$(cd "$1" 2>/dev/null && pwd -P)" || p="$1"
+  r="$(exec stat -f %R "$p" 2>/dev/null)" || r=''
   if [ -n "$r" ] && [ -d "$r" ] && [ "$r" -ef "$p" ]; then printf '%s\n' "$r"; else printf '%s\n' "$p"; fi
 }
-same_path() { [ "$(real_path "$1")" = "$(real_path "$2")" ]; }
+# real_path_set <chemin> : REAL_PATH = real_path, sans sous-shell — un seul processus (stat) ; le dossier courant est rendu. Pour la
+# garde seule, qui vit le temps d'un outil (guard_main vide CDPATH) : un dossier de départ retiré ne se retrouve pas
+real_path_set() {
+  local here="$PWD" r
+  if cd "$1" >/dev/null 2>&1; then
+    cd -P . >/dev/null 2>&1 || true
+    REAL_PATH="$PWD"; cd "$here" >/dev/null 2>&1 || true
+  else REAL_PATH="$1"; fi
+  r="$(exec stat -f %R "$REAL_PATH" 2>/dev/null)" || r=''
+  if [ -n "$r" ] && [ -d "$r" ] && [ "$r" -ef "$REAL_PATH" ]; then REAL_PATH="$r"; fi
+}
+# same_path <a> <b> : même texte, ou même dossier (liens et casse du disque compris), sans processus. Deux fichiers ne se comparent
+# que par leur texte, et un chemin vide vaut le dossier courant, comme real_path
+same_path() {
+  local a="${1:-.}" b="${2:-.}"
+  [ "$a" = "$b" ] || { [ -d "$a" ] && [ -d "$b" ] && [ "$a" -ef "$b" ]; }
+}
 # resolve_file <chemin> : cible absolue, éventuellement absente si son parent existe.
 # Parcours composant par composant : le plafond de 40 inclut les liens des parents.
 # Aucun chemin n'est imprimé avant le succès ; aucune écriture, même sur lien cassé.
@@ -52,7 +85,7 @@ resolve_file() {
   [ ! -d "$resolved" ] || return 1
   printf '%s\n' "$resolved"
 }
-is_worktree() { [ "$(real_path "$(repo_root "$1")")" != "$(real_path "$(main_root "$1")")" ]; }
+is_worktree() { git_places "$1" && ! same_path "$GP_TOP" "$GP_MAIN"; }
 branch_name() { git -C "${1:-$PWD}" branch --show-current 2>/dev/null || true; }
 is_clean() { [ -z "$(git -C "$1" status --porcelain --untracked-files=all)" ]; }
 # shellcheck disable=SC2034 # DIRTY_LIST est lu par lib/close.sh et bin/lab

@@ -4,7 +4,7 @@
 # Aucun avancement n'est écrit nulle part : l'état d'un lot vit dans sa seule fiche, lab plan le recalcule (lot 02, 2026-09-06).
 # Lecture : le nouvel emplacement d'abord, l'ancien (docs/lots/lot-NN-<slug>.md) à défaut — jamais réécrit.
 # Fiches françaises ou anglaises : chaque lecteur passe par lang_norm (lib/lang.sh), chaque écrivain suit la langue du document.
-. "$(dirname "${BASH_SOURCE[0]}")/lang.sh"
+. "${BASH_SOURCE[0]%/*}/lang.sh"
 lots_dir() { if [ -n "${2:-}" ]; then printf '%s/lots/%s\n' "$1" "$2"; else printf '%s/lots\n' "$1"; fi; }
 # next_lot_number <docs> <couloir> [plancher] : max des chiffres de tête de lots/<couloir>/lot-*.md + 1
 # (lot-88.md, lot-60d-g.md, lot-03-x.md → 89). La numérotation repart à 01 dans un couloir neuf : chaque couloir a la sienne.

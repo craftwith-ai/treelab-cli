@@ -22,11 +22,11 @@ The lane stays open for trials and fixes. Only an explicit closing removes it. T
 
     curl -fsSL https://treelab.sh/install | bash
 
-The installer asks one question per screen. Its default choice starts a free 14-day trial: enter an email address, and the trial key appears in the terminal and arrives by email. No card is needed; there is one trial per email address and per Mac. No telemetry.
+The installer asks one question per screen. Its default choice starts a free 14-day trial: enter an email address, and the trial key arrives by email; paste it into the terminal. No card is needed; there is one trial per email address and per Mac. No telemetry.
 
 ## Subscription
 
-Treelab is sold as a subscription to updates, monthly or yearly, per seat; prices are on [treelab.sh](https://treelab.sh). Subscribe from the installer or with `lab subscribe`: payment happens in the browser and your trial key becomes a paid key, with nothing to reinstall. If the subscription stops, you keep the installed version and nothing breaks; only new versions (`lab update`) stop.
+Treelab is sold as a subscription to updates, monthly or yearly, per seat; prices are on the [pricing page](https://treelab.sh/en/pricing/). Subscribe from the installer or from the pricing page: payment happens in the browser and you receive a new key. Already on a trial? Use `lab subscribe` or the link in the trial email: your trial key becomes the paid key, with nothing to reinstall. If the subscription stops, you keep the installed version and nothing breaks; only new versions (`lab update`) stop.
 
 ## First steps
 

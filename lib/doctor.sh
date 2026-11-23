@@ -237,8 +237,41 @@ doctor_global() {
     if grep -Fq "[projects.\"$HOME\"]" "$f"; then flag global.codex.trust.home red "trusted" "Codex trust on the whole \$HOME"; else flag global.codex.trust.home ok no; fi
     n="$(grep -Ec '^[[:space:]]*\[mcp_servers\.("[^"]+"|[A-Za-z0-9_-]+)\][[:space:]]*(#.*)?$' "$f" || true)"; check global.codex.mcp.count "$n" - - '' sans-cliquet
   fi
+  doctor_guard
   mcp_doctor   # serveurs d'outils : mémoire au-delà du seuil, versions non figées (lib/mcp.sh) ; avertissements seulement
   doctor_ginkgo
+}
+# doctor_guard (lot 01 de charge-processeur) : le délai, en millisecondes, que la garde posée ajoute avant une action d'agent — le plus
+# long de quatre appels, deux par le chemin court (Bash et Edit ordinaires) et deux par le chemin complet (git, AGENTS.md), chacun la
+# médiane de trois, hors de tout dépôt : aucun verrou pris, rien d'écrit. Avertit au-delà de 1 s (elle en prenait 8 avant un Edit ;
+# Claude la coupe à 5), jamais rouge, hors baseline : une machine chargée la fait varier. Une garde bloquée est arrêtée à 10 s, qui est
+# alors la mesure. LAB_DOCTOR_GUARD_MS impose la mesure (tests).
+doctor_guard() {
+  local ms="${LAB_DOCTOR_GUARD_MS:-}"
+  # shellcheck disable=SC2016 # programme perl littéral
+  [ -n "$ms" ] || ms="$(perl -MTime::HiRes=time -e '
+    my $hook = shift; my $worst = 0;
+    delete @ENV{qw(LAB_FORCE LAB_DRY)}; $ENV{CLAUDE_PROJECT_DIR} = "/"; $SIG{PIPE} = "IGNORE";
+    my $edit = q({"cwd":"/","tool_name":"Edit","tool_input":{"file_path":"/nonexistent/%s","old_string":"a","new_string":"b"}});
+    for my $in (q({"cwd":"/","tool_name":"Bash","tool_input":{"command":"ls"}}), sprintf($edit, "a.txt"),
+                q({"cwd":"/","tool_name":"Bash","tool_input":{"command":"git status"}}), sprintf($edit, "AGENTS.md")) {
+      my @t;
+      for (1 .. 3) {
+        my $s = time; pipe(my $r, my $w) or exit 1; my $pid = fork; defined $pid or exit 1;
+        if (!$pid) { open STDIN, "<&", $r; close $w; open STDOUT, ">", "/dev/null"; open STDERR, ">", "/dev/null"; exec { $hook } $hook or exit 127 }
+        close $r; print $w $in; close $w;
+        my $late = 0; local $SIG{ALRM} = sub { $late = 1; kill "KILL", $pid }; alarm 10; waitpid $pid, 0; alarm 0;
+        $late or $? == 0 or exit 1;
+        push @t, (time - $s) * 1000; last if $t[-1] > 5000;
+      }
+      @t = sort { $a <=> $b } @t; $worst = $t[$#t / 2] if $t[$#t / 2] > $worst;
+      last if $worst > 5000;
+    }
+    printf "%d\n", $worst + 0.5;' "$LAB_INSTALL_ROOT/hooks/guard-tool.sh" 2>/dev/null)" || ms=''
+  case "$ms" in
+    ''|*[!0-9]*) flag global.guard.duration warn 'not measured' "the guard $LAB_INSTALL_ROOT/hooks/guard-tool.sh did not run; treelab setup poses it again" ;;
+    *) check global.guard.duration "$ms" 1000 warn 'Milliseconds the guard adds before an action of an agent (slowest of 4 kinds, median of 3 calls); a busy machine lengthens it' sans-cliquet ;;
+  esac
 }
 # doctor_ginkgo (lot 04 de pilotage-voix) : une ligne toujours, hors baseline ; la clé absente n'est qu'une information. Rouge
 # seulement si l'app livrée par la release installée manque ou si sa signature est cassée ; un checkout la fabrique au premier

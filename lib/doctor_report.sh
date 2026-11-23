@@ -36,7 +36,7 @@ doctor_report_fields() {
     esac
   else
     case "$original" in
-      install.version|install.manifest.ok|install.path|install.lab-cli.conflict|install.license|install.entitlement|install.skills.collisions|global.baseline|global.install.context|global.instructions.lines|global.instructions.bytes|global.skills.count|global.skills.desc_bytes|global.skills.codex.duplicates|global.skills.headers|global.skills.reserved.codex|global.codex.agents.count|global.settings.mcp.count|global.settings|global.hooks.claude|global.hooks.claude.write|global.hooks.codex|global.hooks.codex.write|global.hooks.codex.trust|global.hooks.codex.enabled|global.codex.trust.home|global.codex.mcp.count|global.mcp.rss|global.mcp.unpinned|global.ginkgo|link.claude-md|link.claude-skills|link.claude-agents|link.agents-md|link.agents-skills|link.codex-agents)
+      install.version|install.manifest.ok|install.path|install.lab-cli.conflict|install.license|install.entitlement|install.skills.collisions|global.baseline|global.install.context|global.instructions.lines|global.instructions.bytes|global.skills.count|global.skills.desc_bytes|global.skills.codex.duplicates|global.skills.headers|global.skills.reserved.codex|global.codex.agents.count|global.settings.mcp.count|global.settings|global.hooks.claude|global.hooks.claude.write|global.hooks.codex|global.hooks.codex.write|global.hooks.codex.trust|global.hooks.codex.enabled|global.codex.trust.home|global.codex.mcp.count|global.mcp.rss|global.mcp.unpinned|global.guard.duration|global.ginkgo|link.claude-md|link.claude-skills|link.claude-agents|link.agents-md|link.agents-skills|link.codex-agents)
         DOC_SAFE_NAME="$original" ;;
     esac
   fi
@@ -72,6 +72,7 @@ doctor_report_fields() {
         case "$original" in
           global.skills.count) DOC_SAFE_CAUSE=SKILLS_LIMIT; DOC_SAFE_NOTE='Chosen limit exceeded; adjust this limit if this selection is intended.' ;;
           global.hooks.codex.trust) DOC_SAFE_CAUSE=HOOK_APPROVAL; DOC_SAFE_NOTE='Open Codex and approve the Treelab hooks after reading them.' ;;
+          global.guard.duration) DOC_SAFE_NOTE='The guard is slow before each agent action; the local report gives the milliseconds.' ;;
           link.*|global.hooks.claude*|global.hooks.codex*) DOC_SAFE_CAUSE=INTEGRATION; DOC_SAFE_NOTE='Check the integrations named in the local report before a new installation.' ;;
         esac
         # notes sûres : le bilan local nomme commandes et fiches, le rapport jamais (lot 06 de lab-enhancement)

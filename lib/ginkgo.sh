@@ -175,7 +175,7 @@ ginkgo_send_key() {
 # ginkgo_submit <texte> : un reste non envoyé dans la ligne de saisie est d'abord vidé (ctrl+u, mesuré sur Claude Code 2.1.327 :
 # l'essai réel du lot 02 a remis « core » + l'ordre à la tour), puis collage et Entrée ; jamais forcé (une boîte ouverte fait refuser cmux)
 ginkgo_submit() {
-  cmx send-key --workspace "$GK_WS" --surface "$GK_SURFACE" ctrl+u >/dev/null 2>&1 && cmux_submit "$GK_WS" "$GK_SURFACE" "$1" 2>/dev/null
+  cmux_submit "$GK_WS" "$GK_SURFACE" "$1" 2>/dev/null   # cmux_submit vide la ligne (ctrl+u) avant de coller
 }
 # ginkgo_wait_gone <fichier> : l'effacement par le crochet (PostToolUse, UserPromptSubmit) prouve la réponse reçue
 ginkgo_wait_gone() {
@@ -352,7 +352,7 @@ ginkgo_answer_text() { # <projet> <couloir> <texte> <fichier de boîte>
   local text; text="$(printf '%s' "$3" | words_clean "$GINKGO_TELL_MAX")"
   [ -n "${text// /}" ] || die "empty answer — nothing sent"
   [ "$text" != - ] || die "an answer reduced to - would be read from standard input by cmux — nothing sent"
-  ! words_match "$text" "$2" >/dev/null || die "accepting or closing lane $2 is never a free answer: lab ginkgo close $1 $2 reads it back first — nothing sent"
+  ! WORDS_BARE=1 words_match "$text" "$2" >/dev/null || die "accepting or closing lane $2 is never a free answer: lab ginkgo close $1 $2 reads it back first — nothing sent"
   ginkgo_tab "$GK_WT" "$2"
   ginkgo_submit "$text" || die "cmux refused to type in $2 (a dialog may be open there): nothing delivered"
   kv LANE "$2"; kv SENT "$text"

@@ -12,6 +12,8 @@ case "${1:-} ${2:-}" in
   "account record"|"account relever"|"compte record"|"compte relever")
     { . "$LAB_ROOT/lib/log.sh"; . "$LAB_ROOT/lib/project.sh"; . "$LAB_ROOT/lib/comptes.sh"; COMPTE_SANS_AUTH=1 compte_relever; } >/dev/null 2>&1 || true
     exit 0 ;;
+  # la garde passe avant chaque outil d'un agent : ses bibliothèques seules, comme hooks/guard-tool.sh (lot 01 de charge-processeur)
+  "hook guard-tool"|"hook guard-bash") . "$LAB_ROOT/lib/guard_fast.sh"; guard_main "$2"; exit 0 ;;
 esac
 . "$LAB_ROOT/lib/log.sh"; . "$LAB_ROOT/lib/git.sh"
 LAB_ROOT="$(real_path "$LAB_ROOT")"; export LAB_ROOT   # casse réelle du chemin (lib/git.sh) : liens, hooks Codex et chemins de projet en dépendent
@@ -928,7 +930,7 @@ handoff_or_refuse() {
 # leave_ready <workspace> <surface> <ligne> : la ligne est collée dans l'onglet sans touche Entrée — une touche suffit (lot 10)
 leave_ready() {
   [ -n "$3" ] && [ -n "$2" ] && has_cmux || return 0
-  if cmux_send "$1" "$2" "$3" 2>/dev/null; then kv NEXT_COMMAND "$3"; kv ACTION ready
+  if cmux_clear_line "$1" "$2" 2>/dev/null && cmux_send "$1" "$2" "$3" 2>/dev/null; then kv NEXT_COMMAND "$3"; kv ACTION ready
   else warn "cmux: command not left in the tab $SLUG; to run: $3"; fi
 }
 

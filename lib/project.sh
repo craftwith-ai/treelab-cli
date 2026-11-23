@@ -1,16 +1,18 @@
 # shellcheck shell=bash
 # project.sh — config par projet : projects/<p>/config (KEY=value), notes.md, include.
+declare -F kv_value >/dev/null || . "${BASH_SOURCE[0]%/*}/kv.sh"
 # lab_home_default <racine d'un lab> : le LAB_HOME que ce programme prend sans LAB_HOME — une release vit dans ~/.lab, un checkout
 # dans son propre dossier
 lab_home_default() { if [ -f "$1/.release" ]; then printf '%s\n' "$HOME/.lab"; else printf '%s\n' "$1"; fi; }
-[ -n "${LAB_HOME:-}" ] || LAB_HOME="$(lab_home_default "$LAB_ROOT")"
+# même règle, sans sous-shell : ce fichier est chargé avant chaque outil d'un agent (lib/guard_fast.sh)
+if [ -z "${LAB_HOME:-}" ]; then if [ -f "$LAB_ROOT/.release" ]; then LAB_HOME="$HOME/.lab"; else LAB_HOME="$LAB_ROOT"; fi; fi
 LAB_PROJECTS="${LAB_PROJECTS_DIR:-$LAB_HOME/projects}"
 LAB_STATE="${LAB_STATE_DIR:-$LAB_HOME/state}"
 project_dir() { printf '%s/%s\n' "$LAB_PROJECTS" "$1"; }
-project_exists() { [ -f "$(project_dir "$1")/config" ]; }
-project_names() { local d; for d in "$LAB_PROJECTS"/*/; do [ -f "$d/config" ] && basename "$d"; done; }
-config_get() { sed -n "s/^$2=//p" "$(project_dir "$1")/config" | head -1; }
-memory_file() { printf '%s/projects/%s/memory/MEMORY.md\n' "$(claude_home)" "$(printf '%s' "$1" | sed 's|/|-|g')"; }
+project_exists() { [ -f "$LAB_PROJECTS/$1/config" ]; }
+project_names() { local d; for d in "$LAB_PROJECTS"/*/; do d="${d%/}"; [ -f "$d/config" ] && printf '%s\n' "${d##*/}"; done; }
+config_get() { kv_print "$LAB_PROJECTS/$1/config" "$2"; }
+memory_file() { printf '%s/projects/%s/memory/MEMORY.md\n' "$(claude_home)" "${1//\//-}"; }
 hermetism_forbidden_names() { # <projet> : mêmes exclusions pour le doctor et la garde avant écriture
   local p="$1" o allow
   allow=" $(config_get "$p" hermetisme_allow 2>/dev/null || true) "
@@ -82,41 +84,49 @@ registry_lock_file() {
   key="$(printf '%s/%s' "$(real_path "$LAB_PROJECTS")" "$1" | shasum -a 256 | cut -c1-16)" || return 1
   printf '%s/registre.%s\n' "$dir" "$key"
 }
+# config_into <variable> <clé> : la valeur lue dans $file (load_project), sans processus
+config_into() { kv_value "$file" "$2" || true; printf -v "$1" '%s' "$KV_VALUE"; }
 # Charge la config dans P_* (valeurs par défaut sûres).
 load_project() {
   project_exists "$1" || die "unknown project: $1 (run lab init $1 from its checkout)"
+  local file="$LAB_PROJECTS/$1/config"
   P_NAME="$1"
-  P_ROOT="$(config_get "$1" root)"
-  P_REMOTE="$(config_get "$1" remote)"; P_REMOTE="${P_REMOTE:-origin}"
-  P_OWNER="$(config_get "$1" owner)"; P_OWNER="${P_OWNER:-shared}"
-  P_BASE="$(config_get "$1" base)"; P_BASE="${P_BASE:-main}"
-  P_STAGING="$(config_get "$1" staging)"
-  P_MERGE_METHOD="$(config_get "$1" merge_method)"; P_MERGE_METHOD="${P_MERGE_METHOD:-squash}"
-  P_INSTALL="$(config_get "$1" install)"
-  P_DOCS="$(config_get "$1" docs)"; P_DOCS="${P_DOCS:-local}"
-  P_AGENT="$(config_get "$1" agent)"   # valeur de la config du projet seulement : agent_resolve décide du défaut (lot 03)
-  P_DEV="$(config_get "$1" dev)"
-  P_TEST="$(config_get "$1" test)"
+  config_into P_ROOT root
+  config_into P_REMOTE remote; P_REMOTE="${P_REMOTE:-origin}"
+  config_into P_OWNER owner; P_OWNER="${P_OWNER:-shared}"
+  config_into P_BASE base; P_BASE="${P_BASE:-main}"
+  config_into P_STAGING staging
+  config_into P_MERGE_METHOD merge_method; P_MERGE_METHOD="${P_MERGE_METHOD:-squash}"
+  config_into P_INSTALL install
+  config_into P_DOCS docs; P_DOCS="${P_DOCS:-local}"
+  config_into P_AGENT agent   # valeur de la config du projet seulement : agent_resolve décide du défaut (lot 03)
+  config_into P_DEV dev
+  config_into P_TEST test
   # déclarations du projet (lot 18) : ressources partagées entre couloirs, motifs de fichiers générés et commande qui les refait
-  P_RESOURCES="$(config_get "$1" resources)"; P_GENERATED="$(config_get "$1" generated)"; P_REGEN="$(config_get "$1" regen)"
-  P_MIGRATIONS="$(config_get "$1" migrations)"   # dossiers de migrations numérotées (lot 02 de sans-perte) : collisions refusées
+  config_into P_RESOURCES resources; config_into P_GENERATED generated; config_into P_REGEN regen
+  config_into P_MIGRATIONS migrations   # dossiers de migrations numérotées (lot 02 de sans-perte) : collisions refusées
   [ -d "$P_ROOT" ] || die "main checkout not found: $P_ROOT"
   export P_NAME P_ROOT P_REMOTE P_OWNER P_BASE P_STAGING P_MERGE_METHOD P_INSTALL P_DOCS P_AGENT P_DEV P_TEST P_RESOURCES P_GENERATED P_REGEN P_MIGRATIONS
 }
 # Cible unique des PR : staging lorsqu'elle existe, sinon la branche principale.
 pr_base() { if [ -n "$P_STAGING" ]; then printf '%s\n' "$P_STAGING"; else printf '%s\n' "$P_BASE"; fi; }
-project_by_root() { # project_by_root <chemin de checkout principal>
-  local p r want; want="$(real_path "$1")"
-  for p in $(project_names); do
-    r="$(config_get "$p" root)"; [ -n "$r" ] || continue
-    [ "$(real_path "$r")" = "$want" ] && { printf '%s\n' "$p"; return 0; }
+project_by_root() { project_by_root_set "$1" && printf '%s\n' "$FOUND_PROJECT"; } # project_by_root <chemin de checkout principal>
+# project_by_root_set <checkout principal> : FOUND_PROJECT, sans processus quel que soit le nombre de projets ; rc 1, vide, si aucun
+project_by_root_set() {
+  local d
+  FOUND_PROJECT=''
+  for d in "$LAB_PROJECTS"/*/; do
+    d="${d%/}"
+    if ! kv_value "$d/config" root || [ -z "$KV_VALUE" ]; then continue; fi
+    if same_path "$KV_VALUE" "$1"; then FOUND_PROJECT="${d##*/}"; return 0; fi
   done
   return 1
 }
-project_from_cwd() { local m; m="$(main_root "${1:-$PWD}")" || return 1; project_by_root "$m"; }
+project_from_cwd() { project_from_cwd_set "${1:-$PWD}" && printf '%s\n' "$FOUND_PROJECT"; }
+project_from_cwd_set() { FOUND_PROJECT=''; git_places "$1" && project_by_root_set "$GP_MAIN"; }   # même recherche, dans FOUND_PROJECT
 # ---------- agent par défaut : une seule règle, option > couloir > projet > global > défaut (constat 5 du brief, lot 03) ----------
 # global_config_get <clé> : $LAB_HOME/config, KEY=value comme la config d'un projet ; fichier édité à la main, jamais par lab.
-global_config_get() { local f="$LAB_HOME/config"; [ -f "$f" ] || return 0; sed -n "s/^$1=//p" "$f" | head -1; }
+global_config_get() { [ -f "$LAB_HOME/config" ] || return 0; kv_print "$LAB_HOME/config" "$1"; }
 # agent_resolve <wt|-> [valeur de --agent] → « <agent><TAB><source> » : option, couloir (.lab/meta), projet (projects/<p>/config),
 # global ($LAB_HOME/config) ou défaut (claude). Une lecture ne refuse rien : agent_note dit si la valeur est acceptable.
 agent_resolve() {
@@ -168,7 +178,7 @@ resolve_project() {
 }
 worktree_path() { printf '%s/.worktrees/%s\n' "$P_ROOT" "$1"; }
 # .lab/meta du couloir : kind, base, agent, created, project, start, lane, lot (lot 9 : un worktree = un couloir, une branche par lot)
-wt_meta() { sed -n "s/^$2=//p" "$1/.lab/meta" 2>/dev/null | head -1; }
+wt_meta() { kv_print "$1/.lab/meta" "$2"; }
 meta_set() { # meta_set <wt> <clé> <valeur>
   local f="$1/.lab/meta" tmp; mkdir -p "$1/.lab"; touch "$f"
   if grep -q "^$2=" "$f"; then tmp="$(mktemp)"; sed "s|^$2=.*|$2=$3|" "$f" >"$tmp" && mv "$tmp" "$f"; else printf '%s=%s\n' "$2" "$3" >>"$f"; fi
@@ -180,7 +190,7 @@ meta_unset() { # meta_unset <wt> <clé>
 # lane_permanent <wt> : couloir marqué permanent (lot 01 d'autonomie-tours) — il enchaîne ses lots livrés par PR, n'entre jamais en
 # recette, n'est jamais retiré ni fermé ; posé par lab permanent ou lab new --permanent, dans .lab/meta seulement
 lane_permanent() { [ "$(lang_code "$(wt_meta "$1" permanent)")" = yes ]; }   # « oui » écrit à la main se lit par la table de lib/lang.sh
-wt_lane() { local l; l="$(wt_meta "$1" lane)"; printf '%s\n' "${l:-$(basename "$1")}"; }
+wt_lane() { kv_value "$1/.lab/meta" lane || true; printf '%s\n' "${KV_VALUE:-$(basename "$1")}"; }
 # docs_dir <worktree> : dans le dépôt (docs=repo, posé par lab new dans le worktree) ou local (_lab/projects/<p>/docs). owner ne décide jamais de docs (lot 8).
 docs_dir() { if [ "$P_DOCS" = repo ]; then printf '%s/docs\n' "$1"; else printf '%s/docs\n' "$(project_dir "$P_NAME")"; fi; }
 state_dir() { local d="$LAB_STATE/${1:-}"; mkdir -p "$d"; printf '%s\n' "$d"; }

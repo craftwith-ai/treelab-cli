@@ -6,6 +6,8 @@
 # (700/600, la garde du lot 09 y refuse Write et Edit), liés à la révision du couloir, et valent LAB_WORDS_TTL s (1 h) : lab
 # acceptance --accept les accepte de l'agent du couloir ou de la tour, sans preuve typée, puis lab close ferme sans --confirm.
 
+declare -F kv_value >/dev/null || . "${BASH_SOURCE[0]%/*}/kv.sh"
+
 # ---------- repli du texte, partagé avec Ginkgo (lib/ginkgo.sh) ----------
 # words_clean <octets> : l'entrée en une ligne, sans caractère de contrôle ni DEL, coupée puis rendue à une frontière UTF-8
 words_clean() {
@@ -21,7 +23,8 @@ words_fold() { perl -CSD -MUnicode::Normalize -pe '$_ = NFD($_); s/\p{Mn}//g; s/
 # question (« ? »), plus de WORDS_MAX caractères ou de WORDS_MAX_WORDS mots (un prompt de lab, une consigne), une négation ou une
 # réserve (pas, ne, non, not, mais, attends…), le mot « lab » (une commande tapée), un ordre libre de Ginkgo. Comptent : une
 # recette dite validée, acceptée ou ok, ou un ordre de fermer le couloir — « couloir », « lane » ou le nom d'un couloir donné —, en
-# français ou en anglais ; chacun vaut les deux (décision 2 du grill-me). Avec « malgré », « despite »… et « nuit » ou « night » :
+# français ou en anglais ; chacun vaut les deux (décision 2 du grill-me). Un accord à la première personne sans ces mots (« j'accepte »,
+# « je valide », « c'est validé ») compte dans l'onglet du couloir (WORDS_BARE=1) ou s'il nomme un couloir ; jamais un « oui » seul. Avec « malgré », « despite »… et « nuit » ou « night » :
 # l'accord nuit rouge.
 WORDS_MAX=120
 WORDS_MAX_WORDS=16
@@ -34,7 +37,7 @@ sub flat { my $s = $_[0]; $s =~ s/[^\p{L}\p{N}]+/ /g; $s =~ s/^ +| +$//g; return
 $t = fold($t); $t =~ s/^\s+|\s+$//g;
 my @lanes = grep { length } map { flat(fold($_)) } split /\s+/, ($ENV{WORDS_LANES} // "");
 my $n = flat($t); my @w = split / /, $n;
-exit($n =~ /\b(?:ferm|clo|recette|acceptance)/ ? 0 : 1) if $ENV{WORDS_MODE} eq "maybe";
+exit($n =~ /\b(?:ferm|clo|recette|accept|approuv|approve)|\b(?:je|c est) (?:(?:ne|n|pas) )*valide/ ? 0 : 1) if $ENV{WORDS_MODE} eq "maybe";
 if ($ENV{WORDS_MODE} eq "named") {
   for my $r (split /\s+/, ($ENV{WORDS_LANES} // "")) { my $l = flat(fold($r)); print "$r\n" if length $l && " $n " =~ /\Q $l \E/ }
   exit 0;
@@ -53,6 +56,9 @@ my @accept = (qr/\brecette (?:est |a ete |c est )?(?:validee?s?|acceptee?s?|ok|o
   qr/\b(?:je |j )?(?:valide|accepte|approuve) (?:la |cette |ta |ma )?recette\b/,
   qr/\bacceptance (?:is )?(?:validated|valid|accepted|approved|ok|okay|passed|good|done)\b/,
   qr/\b(?:i )?(?:accept|approve|validate) (?:the |this )?acceptance\b/);
+# an agreement in the first person, without the word acceptance: only in the lane tab, or with the lane named
+push @accept, qr/\b(?:j accepte|je valide|j approuve|c est (?:validee?|acceptee?|approuvee?)|i accept|i approve|it s (?:accepted|approved))\b/
+  if ($ENV{WORDS_BARE} // "") eq "1" || grep { " $n " =~ / \Q$_\E / } @lanes;
 my $close = grep { $n =~ $_ } @close; my $accept = grep { $n =~ $_ } @accept;
 exit 1 unless $close || $accept;
 # the agreement is the whole message: once the recognised spans, the lanes given and quand meme are removed, only link words
@@ -61,7 +67,8 @@ my $rest = " $n "; $rest =~ s/$_/ /g for (@close, @accept, qr/\bquand meme\b/); 
 my %fill = map { $_ => 1 } qw(ok okay oui yes yep yeah c est cest bon bonne tout top parfait super nickel merci thanks thank you
   please stp svp tu peux pouvez vous on peut je j et and the le la les l ce cette this de du pour for alors so go allez vas y
   maintenant now donc enfin good great perfect it is s a au also aussi couloir lane recette acceptance accepter accepte accept
-  valider valide validate approve approuve ferme fermer fermez fermons clore cloture cloturer cloturez close closing nuit night
+  valider valide validate approve approuve moi me it s
+  ferme fermes fermer fermez fermons clore cloture cloturer cloturez close closing nuit night
   rouge red malgre despite regardless nonobstant anyway);
 for (split " ", $rest) { exit 1 unless $fill{$_} }
 my $night = $n =~ /\b(?:nuit|night)\b/ && $n =~ /\b(?:malgre|despite|regardless|nonobstant|anyway)\b|\bquand meme\b/;
@@ -70,10 +77,10 @@ print $night ? "night\n" : "accept\n";
 # words_match <texte> [couloir…] → « accept » ou « night », rc 0 ; rien, rc 1 sinon
 words_match() {
   local t="$1"; shift
-  printf '%s' "$t" | WORDS_LANES="$*" WORDS_MAX="$WORDS_MAX" WORDS_MAX_WORDS="$WORDS_MAX_WORDS" WORDS_MODE=match perl -CSD -e "$WORDS_PERL" 2>/dev/null
+  printf '%s' "$t" | WORDS_LANES="$*" WORDS_BARE="${WORDS_BARE:-0}" WORDS_MAX="$WORDS_MAX" WORDS_MAX_WORDS="$WORDS_MAX_WORDS" WORDS_MODE=match perl -CSD -e "$WORDS_PERL" 2>/dev/null
 }
 # words_maybe <texte> : rc 0 si le texte replié porte l'un des mots sans lesquels words_match ne rend jamais rien (ferm…, clo…,
-# recette, acceptance ; la formule de Ginkgo dit « close ») — le crochet écarte ainsi un prompt ordinaire avant de lire le
+# recette, accept…, approuv…, je valide, c'est validé ; la formule de Ginkgo dit « close ») — le crochet écarte ainsi un prompt ordinaire avant de lire le
 # projet (registre, config : ~0,24 s mesurées par prompt, rapport du lot 10)
 words_maybe() { printf '%s' "$1" | WORDS_MODE=maybe perl -CSD -e "$WORDS_PERL" 2>/dev/null; }
 # words_named <texte> <couloir…> → les couloirs nommés par le texte (mots entiers, repliés), un par ligne, sous leur nom réel
@@ -85,7 +92,7 @@ words_named() {
 # ---------- registre ----------
 words_ttl() { case "${LAB_WORDS_TTL:-}" in ''|*[!0-9]*) echo 3600 ;; *) echo "$LAB_WORDS_TTL" ;; esac; }
 words_file() { printf '%s/%s/words/%s\n' "$LAB_STATE" "$P_NAME" "$1"; }   # <couloir>
-words_get() { [ -f "$1" ] && [ ! -L "$1" ] || return 0; sed -n "s/^$2=//p" "$1" | head -1; }   # <fichier> <champ>
+words_get() { [ -f "$1" ] && [ ! -L "$1" ] || return 0; kv_print "$1" "$2"; }   # <fichier> <champ>
 words_clear() { rm -f "$(words_file "$1")"; }
 # words_lanes → les couloirs du projet, la tour exceptée, un par ligne
 words_lanes() {
@@ -261,7 +268,7 @@ words_on_prompt() {
     else
       lanes="$(words_lanes)"
       # shellcheck disable=SC2086 # noms de couloir : des mots
-      if ! kind="$(words_match "$prompt" $lanes)"; then words_retract_tower "$prompt"
+      if ! kind="$(WORDS_BARE=0 words_match "$prompt" $lanes)"; then words_retract_tower "$prompt"
       elif words_session_ok "$root"; then
         # décision 3 du grill-me : l'accord de nuit rouge ne passe que par le clic du bouton ; écrit, il vaut un accord simple
         [ "$kind" != night ] || kind=accept
@@ -269,7 +276,7 @@ words_on_prompt() {
       else words_not_session "$root"; fi
     fi
   else
-    if ! kind="$(words_match "$prompt" "$(wt_lane "$root")")"; then words_retract "$(wt_lane "$root")"
+    if ! kind="$(WORDS_BARE=1 words_match "$prompt" "$(wt_lane "$root")")"; then words_retract "$(wt_lane "$root")"
     elif words_session_ok "$root"; then
       [ "$kind" != night ] || kind=accept
       words_take "$root" "$kind" "$prompt" lane prompt "$(wt_lane "$root")" ""

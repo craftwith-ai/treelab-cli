@@ -226,6 +226,9 @@ cmux_surface_pids() {
         [(.processes // []) | .. | objects | .pid? // empty]] | flatten | unique
     | if length == 0 then error("no process") else .[] end' 2>/dev/null
 }
-cmux_submit() { # <workspace> <surface> <ligne> : collage puis vraie touche Entrée
-  cmux_send "$1" "$2" "$3" && cmx send-key --workspace "$1" --surface "$2" Return >/dev/null
+# cmux_clear_line <workspace> <surface> : vide la ligne de saisie (ctrl+u) — une ligne laissée prête sans Entrée (leave_ready) ou
+# un reste non envoyé se collait devant la suivante : « --agent claudecd '…' && lab launch … » (mesuré le 2026-11-22)
+cmux_clear_line() { cmx send-key --workspace "$1" --surface "$2" ctrl+u >/dev/null; }
+cmux_submit() { # <workspace> <surface> <ligne> : ligne vidée, collage puis vraie touche Entrée
+  cmux_clear_line "$1" "$2" && cmux_send "$1" "$2" "$3" && cmx send-key --workspace "$1" --surface "$2" Return >/dev/null
 }

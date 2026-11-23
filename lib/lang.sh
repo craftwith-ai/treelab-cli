@@ -24,22 +24,23 @@ lab_lang_detect() {
 LANG_SECTIONS_EN='Goal|Exit criteria|Steps|Waiting|Log|Handoff|Lane acceptance|Batches'
 LANG_FIELDS_EN='State|Execution|Next batch|Intent|Branch|Created|Decision|Tried revision|Docs revision|Evidence|Validated by|Tests removed|Night red agreement'
 LANG_VALUES_EN='planned|in progress|waiting|closed|none|accepted|rejected'
-lang_fr() { # <terme anglais> → terme interne français ; rc 1 si le terme n'est pas dans la table
+lang_fr_set() { # <terme anglais> : LANG_FR, le terme interne français, sans sous-shell ; rc 1, vide, si le terme n'est pas dans la table
   case "$1" in
-    Goal) echo Objectif ;; 'Exit criteria') echo 'Critères de fin' ;; Steps) echo Étapes ;; Waiting) echo 'En attente' ;; Log) echo Journal ;; Handoff) echo Reprise ;;
-    'Lane acceptance') echo 'Recette du couloir' ;; Batches) echo Lots ;; Batch) echo Lot ;;
-    State) echo État ;; Execution) echo Exécution ;; 'Next batch') echo 'Prochain lot' ;; Intent) echo Intention ;; Branch) echo Branche ;; Created) echo Créé ;;
-    Decision) echo Décision ;; Date) echo Date ;; 'Tried revision') echo 'Révision essayée' ;; 'Docs revision') echo 'Révision des documents' ;;
-    Evidence) echo Preuves ;; 'Validated by') echo 'Validé par' ;; 'Tests removed') echo 'Tests retirés' ;; 'Night red agreement') echo 'Accord nuit rouge' ;;
-    planned) echo planifié ;; 'in progress') echo 'en cours' ;; waiting) echo 'en attente' ;; closed) echo clos ;; none) echo aucun ;;
-    accepted) echo validée ;; rejected) echo refusée ;;
-    *) return 1 ;;
+    Goal) LANG_FR=Objectif ;; 'Exit criteria') LANG_FR='Critères de fin' ;; Steps) LANG_FR=Étapes ;; Waiting) LANG_FR='En attente' ;; Log) LANG_FR=Journal ;; Handoff) LANG_FR=Reprise ;;
+    'Lane acceptance') LANG_FR='Recette du couloir' ;; Batches) LANG_FR=Lots ;; Batch) LANG_FR=Lot ;;
+    State) LANG_FR=État ;; Execution) LANG_FR=Exécution ;; 'Next batch') LANG_FR='Prochain lot' ;; Intent) LANG_FR=Intention ;; Branch) LANG_FR=Branche ;; Created) LANG_FR=Créé ;;
+    Decision) LANG_FR=Décision ;; Date) LANG_FR=Date ;; 'Tried revision') LANG_FR='Révision essayée' ;; 'Docs revision') LANG_FR='Révision des documents' ;;
+    Evidence) LANG_FR=Preuves ;; 'Validated by') LANG_FR='Validé par' ;; 'Tests removed') LANG_FR='Tests retirés' ;; 'Night red agreement') LANG_FR='Accord nuit rouge' ;;
+    planned) LANG_FR=planifié ;; 'in progress') LANG_FR='en cours' ;; waiting) LANG_FR='en attente' ;; closed) LANG_FR=clos ;; none) LANG_FR=aucun ;;
+    accepted) LANG_FR=validée ;; rejected) LANG_FR=refusée ;;
+    *) LANG_FR=''; return 1 ;;
   esac
 }
+lang_fr() { lang_fr_set "$1" && printf '%s\n' "$LANG_FR"; }   # le même terme, sur stdout
 # lang_en <terme interne> → sa forme anglaise (le terme lui-même s'il n'est pas dans la table)
 lang_en() {
   local t; local IFS='|'
-  for t in $LANG_SECTIONS_EN Batch $LANG_FIELDS_EN $LANG_VALUES_EN; do [ "$(lang_fr "$t")" != "$1" ] || { printf '%s\n' "$t"; return 0; }; done
+  for t in $LANG_SECTIONS_EN Batch $LANG_FIELDS_EN $LANG_VALUES_EN; do lang_fr_set "$t" || true; [ "$LANG_FR" != "$1" ] || { printf '%s\n' "$t"; return 0; }; done
   printf '%s\n' "$1"
 }
 # lang_word <langue> <terme interne> → le terme dans la langue d'un document (en ou fr)
@@ -55,10 +56,17 @@ lang_value() {
   done
   printf '%s\n' "$2"
 }
-# lang_pairs <liste anglaise> → « anglais<TAB>français » par ligne, pour awk ; calculées une fois au chargement (revue : ~25
-# sous-shells par lecture de fiche sinon)
-lang_pairs() { local t; local IFS='|'; for t in $1; do printf '%s\t%s\n' "$t" "$(lang_fr "$t")"; done; }
-LANG_PAIRS_S="$(lang_pairs "$LANG_SECTIONS_EN")"; LANG_PAIRS_F="$(lang_pairs "$LANG_FIELDS_EN")"; LANG_PAIRS_V="$(lang_pairs "$LANG_VALUES_EN")"
+# lang_pairs_set <liste anglaise> : LANG_PAIRS, « anglais<TAB>français » par ligne, pour awk ; calculées une fois au chargement, sans
+# sous-shell — ce fichier est chargé à chaque commande lab, la trentaine d'alors s'y payait à chaque fois (lot 01 de charge-processeur)
+lang_pairs_set() {
+  local t; local IFS='|'
+  LANG_PAIRS=''
+  for t in $1; do lang_fr_set "$t" || true; LANG_PAIRS="$LANG_PAIRS${LANG_PAIRS:+$'\n'}$t"$'\t'"$LANG_FR"; done
+}
+lang_pairs() { lang_pairs_set "$1"; printf '%s\n' "$LANG_PAIRS"; }
+lang_pairs_set "$LANG_SECTIONS_EN"; LANG_PAIRS_S="$LANG_PAIRS"
+lang_pairs_set "$LANG_FIELDS_EN"; LANG_PAIRS_F="$LANG_PAIRS"
+lang_pairs_set "$LANG_VALUES_EN"; LANG_PAIRS_V="$LANG_PAIRS"
 
 # lang_norm [norm|detect] : document sur stdin. norm (défaut) recopie chaque ligne, marqueurs anglais ramenés à la valeur interne
 # (« ## Handoff » → « ## Reprise », « **State** : closed » → « **État** : clos », « # Batch 3 — » → « # Lot 3 — ») ; le nombre

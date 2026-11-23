@@ -2,10 +2,21 @@
 # hooks.sh — SessionStart / SessionEnd / StopFailure, Notification, UserPromptSubmit (Claude) / PreToolUse(Bash|Write|Edit|apply_patch,
 # AskUserQuestion). Entrée : JSON sur stdin.
 # Mêmes scripts pour Claude Code et Codex. Un hook cassé ne doit jamais bloquer : toute erreur interne → exit 0.
+declare -F guard_fields >/dev/null || . "$LAB_ROOT/lib/guard_fast.sh"   # primitives et pré-filtres communs au chemin court
 PROTECTED_BRANCHES="main master staging prod production"
+CANON_FOR='' HOOK_JOINED=''   # mémoires d'un seul crochet, jamais héritées de l'environnement
 read_payload() {
   PAYLOAD="$(cat 2>/dev/null || true)"
-  HOOK_CWD="$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null || true)"; HOOK_CWD="${HOOK_CWD:-$PWD}"
+  HOOK_CWD="$(payload_get .cwd)"; HOOK_CWD="${HOOK_CWD:-$PWD}"
+}
+payload_get() { printf '%s' "$PAYLOAD" | jq -r "$1 // empty" 2>/dev/null || true; }   # <chemin jq>
+# guard_read : PAYLOAD, HOOK_CWD et HF_* — déjà lus par le chemin court, sinon ici ; une charge que son jq unique refuse (champ d'un
+# autre type, plusieurs objets, JSON illisible) se lit champ par champ, comme avant lui
+guard_read() {
+  guard_fields && return 0
+  HOOK_CWD="$(payload_get .cwd)"; HOOK_CWD="${HOOK_CWD:-$HOOK_HERE}"
+  HF_TOOL="$(payload_get .tool_name)"; HF_PATH="$(payload_get .tool_input.file_path)"; HF_CMD="$(payload_get .tool_input.command)"
+  GUARD_FIELDS=slow
 }
 json_context() { jq -cn --arg c "$1" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}'; }
 json_deny() {
@@ -365,8 +376,21 @@ stop_failure_detache() {
 # les redirections >&, <&, &> restent dans leur segment (« cmd & git … » lance deux commandes).
 # Le marqueur est un caractère de contrôle : un « Q » l'était, et tout chemin portant un Q majuscule devenait non résoluble
 # (bats-run-Q4SsbB : commit après cd vers le checkout principal laissé passer — mesuré le 2026-09-02, lot 8).
-QUOTED=$'\x1f'
-segments() { heredoc_strip "$1" "${2:-0}" | sed -E "s/'[^']*'/$QUOTED/g; s/\"[^\"]*\"/$QUOTED/g" | awk '{ gsub(/&&|\|\||;|\|/, "\n"); gsub(/>&/, "\001"); gsub(/<&/, "\002"); gsub(/&>/, "\003"); gsub(/&/, "\n"); gsub(/\001/, ">\\&"); gsub(/\002/, "<\\&"); gsub(/\003/, "\\&>"); print }'; }
+# QUOTED et segments_line : lib/guard_fast.sh. segments_set <commande> [data] : SEGMENTS, un segment par ligne — par le shell seul pour
+# une commande courte sans here-doc, sinon par un seul awk (heredoc_awk retire les corps, puis découpe) : mêmes lignes des deux façons
+segments_set() {
+  local line
+  SEGMENTS=''
+  case "$1" in *'<<'*|*$'\001'*|*$'\002'*|*$'\003'*) ;; *)   # un octet dont l'awk se sert comme marque : lui seul le lit comme avant
+    if [ "${#1}" -le 2000 ]; then
+      while IFS= read -r line || [ -n "$line" ]; do segments_line "$line"; SEGMENTS="$SEGMENTS$SEG_LINE"$'\n'; done <<<"$1"
+      return 0
+    fi ;;
+  esac
+  SEGMENTS="$(heredoc_awk "${2:-0}" 1 <<<"$1")" && return 0
+  SEGMENTS=''   # awk en échec : la commande entière reste contrôlée
+  while IFS= read -r line || [ -n "$line" ]; do segments_line "$line"; SEGMENTS="$SEGMENTS$SEG_LINE"$'\n'; done <<<"$1"
+}
 # quote_join : une chaîne entre guillemets ouverte en fin de ligne (git commit -m "$(cat <<'EOF' … EOF )" -- a.md) est recollée sur
 # une seule ligne. Sert à la seule règle du commit (commit_joined_ok) : segments() garde ses lignes d'origine, toutes contrôlées,
 # car un recollage mal apparié ($'…\'…') cacherait une commande dans une chaîne (lot-01 de sans-perte).
@@ -399,8 +423,17 @@ heredoc_strip() {
   local out; out="$(printf '%s\n' "$1" | heredoc_awk "${2:-0}")" || out="$1"   # awk en échec : la commande entière reste contrôlée
   printf '%s\n' "$out"
 }
+# Toujours dans un sous-shell (exec). [cut] = 1 : chaque ligne gardée est rendue neutralisée (chaînes citées → QUOTED) et découpée en segments
 heredoc_awk() {
-  awk -v q="'" -v data="${1:-0}" '
+  exec awk -v q="'" -v data="${1:-0}" -v cut="${2:-0}" -v qd="$QUOTED" '
+    function out(l) {
+      if (cut) {
+        gsub(/\047[^\047]*\047/, qd, l); gsub(/"[^"]*"/, qd, l)
+        gsub(/&&|\|\||;|\|/, "\n", l); gsub(/>&/, "\001", l); gsub(/<&/, "\002", l); gsub(/&>/, "\003", l); gsub(/&/, "\n", l)
+        gsub(/\001/, ">\\&", l); gsub(/\002/, "<\\&", l); gsub(/\003/, "\\&>", l)
+      }
+      print l
+    }
     function owner_word(pre,   parts, k, w, i, t) {
       k = split(pre, parts, /&&|\|\||;|\|/); pre = parts[k]
       w = split(pre, t, /[ \t]+/)
@@ -426,15 +459,15 @@ heredoc_awk() {
       if (cur < n) {                                   # dans le corps du here-doc courant
         line = $0; if (dash[cur]) sub(/^\t+/, "", line)
         if (line == mk[cur]) {
-          if (!skip[cur]) print; else print ""         # la ligne de fin reste une ligne (vide) : les segments suivants gardent leur place
+          if (!skip[cur]) out($0); else print ""       # la ligne de fin reste une ligne (vide) : les segments suivants gardent leur place
           cur++; buf = ""; if (cur == n) { n = 0; cur = 0 }
           next
         }
         # marqueur non cité : $(…) et accents graves du corps tournent ici, avant ssh — ces lignes restent contrôlées (revue du lot 17)
-        if (skip[cur] && (quoted[cur] || ($0 !~ /\$\(/ && index($0, "`") == 0))) buf = buf $0 "\n"; else print
+        if (skip[cur] && (quoted[cur] || ($0 !~ /\$\(/ && index($0, "`") == 0))) buf = buf $0 "\n"; else out($0)
         next
       }
-      print
+      out($0)
       rest = $0; pre = ""
       while (match(rest, /<<-?[ \t]*/)) {
         pre = pre substr(rest, 1, RSTART - 1); op = substr(rest, RSTART, RLENGTH); rest = substr(rest, RSTART + RLENGTH)
@@ -449,46 +482,50 @@ heredoc_awk() {
         mk[n] = word; dash[n] = (op ~ /^<<-/); quoted[n] = cited; skip[n] = owner_is_ssh(owner) || (data == 1 && !owner_is_shell(owner)); n++
       }
     }
-    END { if (cur < n && skip[cur]) printf "%s", buf }  # jamais refermé : le corps est contrôlé
+    END {                                              # jamais refermé : le corps est contrôlé
+      if (cur < n && skip[cur]) { if (!cut) printf "%s", buf; else { k = split(buf, bl, "\n"); for (i = 1; i < k; i++) out(bl[i]) } }
+    }
   '
 }
-current_branch_of() { git -C "$1" branch --show-current 2>/dev/null || true; }
-# Normalisation lexicale d'un chemin (sans exiger son existence).
-lexical_path() {
-  local p="$1" out="" seg
-  local IFS='/'
-  for seg in $p; do
-    case "$seg" in ''|.) ;; ..) out="${out%/*}" ;; *) out="$out/$seg" ;; esac
-  done
-  printf '%s\n' "${out:-/}"
-}
+branch_set() { BRANCH="$(exec git -C "$1" branch --show-current 2>/dev/null)" || BRANCH=''; }   # <dossier> : BRANCH, sa branche courante ou vide
 # shellcheck disable=SC2088
-resolve_target() { # <arg> → chemin absolu normalisé, ou vide si non résoluble (variable, glob, quote)
-  local t="$1"
-  case "$t" in *'$'*|*'*'*|*'?'*|*"$QUOTED"*) return 0 ;; esac
-  case "$t" in '~'|'~/'*) t="$HOME${t#'~'}" ;; /*) ;; *) [ "${HOOK_CWD_UNKNOWN:-0}" = 1 ] && return 0; t="$HOOK_CWD/$t" ;; esac
-  t="$(lexical_path "$t")"
-  if [ -d "$t" ]; then real_path "$t"; else printf '%s/%s\n' "$(real_path "$(dirname "$t")")" "$(basename "$t")"; fi
+resolve_target_set() { # <arg> : RESOLVED, chemin absolu normalisé, ou vide si non résoluble (variable, glob, quote)
+  local abs="$1"
+  RESOLVED=''
+  case "$abs" in *'$'*|*'*'*|*'?'*|*"$QUOTED"*) return 0 ;; esac
+  case "$abs" in '~'|'~/'*) abs="$HOME${abs#'~'}" ;; /*) ;; *) [ "${HOOK_CWD_UNKNOWN:-0}" = 1 ] && return 0; abs="$HOOK_CWD/$abs" ;; esac
+  lexical_set "$abs"; abs="$LEXICAL"
+  if [ -d "$abs" ]; then real_path_set "$abs"; RESOLVED="$REAL_PATH"; return 0; fi
+  RESOLVED="${abs%/*}"; real_path_set "${RESOLVED:-/}"; RESOLVED="$REAL_PATH/${abs##*/}"
 }
 # lab_data_repo <dossier> : le dépôt git de ce dossier héberge LAB_HOME ou LAB_PROJECTS (registre, fiches), même s'il est enregistré
 # comme projet. Seule la règle « commit sur branche protégée » l'ignore ; push --force, reset --hard, clean et checkout larges y restent.
 # Jamais le checkout du code lui-même : en mode dev, LAB_HOME vaut LAB_ROOT, et un commit sur main y reste un commit dans un projet (revue, lot 03).
+# Un dépôt n'héberge LAB_HOME ou LAB_PROJECTS que si sa racine est l'un de leurs dossiers parents : sans cela, aucun git n'est lancé.
 lab_data_repo() {
   local root d r
-  root="$(repo_root "$1" 2>/dev/null || true)"; [ -n "$root" ] || return 1
-  root="$(real_path "$root")"
-  [ "$root" != "$(real_path "$(repo_root "$LAB_ROOT" 2>/dev/null || printf '%s' "$LAB_ROOT")")" ] || return 1
+  git_places "$1" || return 1
+  root="$GP_TOP"
   for d in "$LAB_HOME" "$LAB_PROJECTS"; do
-    [ -d "$d" ] || continue
-    r="$(repo_root "$d" 2>/dev/null || true)"; [ -n "$r" ] || continue
-    [ "$(real_path "$r")" = "$root" ] && return 0
+    if [ ! -d "$d" ] || ! dir_above "$root" "$d"; then continue; fi
+    r="$(repo_root "$d" 2>/dev/null || true)"
+    if [ -z "$r" ] || ! same_path "$r" "$root"; then continue; fi
+    if same_path "$root" "$(repo_root "$LAB_ROOT" 2>/dev/null || printf '%s' "$LAB_ROOT")"; then return 1; fi
+    return 0
   done
   return 1
 }
+# dir_above <dossier> <sous-dossier> : rc 0 si le premier est le second, ou l'un de ses parents réels ; sans processus
+dir_above() {
+  local here="$PWD" x
+  cd -P "$2" >/dev/null 2>&1 || return 1
+  x="$PWD"; cd "$here" >/dev/null 2>&1 || true
+  while [ -n "$x" ]; do [ ! "$x" -ef "$1" ] || return 0; x="${x%/*}"; done
+  [ / -ef "$1" ]
+}
 path_allowed_for_rm() { # <chemin absolu> : sous le worktree courant (pas lui-même), jamais le checkout principal ni un autre worktree ; temporaires ok
   local p="$1" wt="" main="" tmp
-  wt="$(repo_root "$HOOK_CWD" 2>/dev/null || true)"; [ -n "$wt" ] && wt="$(real_path "$wt")"
-  main="$(main_root "$HOOK_CWD" 2>/dev/null || true)"; [ -n "$main" ] && main="$(real_path "$main")"
+  if git_places "$HOOK_CWD"; then real_path_set "$GP_TOP"; wt="$REAL_PATH"; real_path_set "$GP_MAIN"; main="$REAL_PATH"; fi
   case "$p" in /|"$HOME"|"$HOME/") return 1 ;; esac
   if [ -n "$wt" ]; then
     case "$p" in "$wt") return 1 ;; "$wt"/*) return 0 ;; esac
@@ -507,7 +544,7 @@ path_allowed_for_rm() { # <chemin absolu> : sous le worktree courant (pas lui-m�
 seg_forced() { # <segment> → 0 si LAB_FORCE=1 vaut pour ce segment
   local -a t=(); local i=0
   [ "${LAB_FORCE:-0}" = 1 ] && return 0
-  read -r -a t <<<"${1//[()]/ }"
+  words_split "${1//[()]/ }"; t=("${WORDS[@]+"${WORDS[@]}"}")
   while [ "$i" -lt "${#t[@]}" ]; do
     case "${t[$i]}" in LAB_FORCE=1) return 0 ;; *=*|sudo|env|nohup|command|exec|time) i=$((i+1)) ;; *) return 1 ;; esac
   done
@@ -526,12 +563,13 @@ stash_message() { # <action> → DENY_REASON d'un stash refusé
 # ---------- index partagé (lot-01 de sans-perte) ----------
 # Le dépôt des fiches et le checkout principal d'un projet n'ont qu'un index pour toutes les sessions : un commit sans chemins
 # (ou -a, ou --amend sans chemins) emporte aussi ce qu'une autre session y a indexé, un git add large y indexe son travail.
-# shared_index <dossier> → « dépôt des fiches » | « checkout principal » (projet enregistré, hors couloir) ; rc 1 sinon.
+# shared_index <dossier> : SHARED_INDEX, dépôt des fiches ou checkout principal (projet enregistré, hors couloir) ; rc 1 sinon.
 shared_index() {
-  if lab_data_repo "$1"; then printf 'batch-file repository\n'; return 0; fi
-  project_from_cwd "$1" >/dev/null 2>&1 || return 1
+  SHARED_INDEX=''
+  if lab_data_repo "$1"; then SHARED_INDEX='batch-file repository'; return 0; fi
+  project_from_cwd_set "$1" 2>/dev/null || return 1
   is_worktree "$1" 2>/dev/null && return 1
-  printf 'main checkout\n'
+  SHARED_INDEX='main checkout'
 }
 # commit_paths_ok <arguments de git commit…> → 0 si le commit nomme ses chemins (après --, positionnels, --pathspec-from-file), sans -a
 # ni -i (tout l'index en plus des chemins), ni chemin qui vaut tout l'arbre (., .., *, :/). Options à valeur (-m, -F, -c, -C, -t,
@@ -567,6 +605,8 @@ commit_joined_ok() {
   local seg="$1" pre line k found="" n=0; local -a t=()
   case "$seg" in *\'*|*'"'*) ;; *) return 1 ;; esac
   pre="${seg%%[\'\"]*}"; pre="${pre#"${pre%%[! ]*}"}"; [ -n "$pre" ] || return 1
+  # recollage fait ici, pour ce seul refus : il coûtait une dizaine de processus à chaque commande contrôlée
+  HOOK_JOINED="$(heredoc_strip "$HF_CMD" | quote_join | sed -E "s/'[^']*'/$QUOTED/g; s/\"[^\"]*\"/$QUOTED/g" | awk '{ m = sub(/^\002/, ""); gsub(/&&|\|\||;|\|/, m ? "\n\002" : "\n"); print (m ? "\002" : "") $0 }')"
   while IFS= read -r line; do
     case "$line" in $'\002'*) line="${line#?}" ;; *) continue ;; esac
     line="${line#"${line%%[! ]*}"}"
@@ -611,18 +651,18 @@ guard_segment() { # → 0 si ok ; sinon écrit DENY_REASON (et DENY_KIND=perte s
 }
 guard_rules() {
   local -a t=(); local seg="$1" i n cmd sub j arg
-  read -r -a t <<<"$seg"; n=${#t[@]}; [ "$n" -gt 0 ] || return 0
+  words_split "$seg"; t=("${WORDS[@]+"${WORDS[@]}"}"); n=${#t[@]}; [ "$n" -gt 0 ] || return 0
   i=0; while [ "$i" -lt "$n" ]; do
     case "${t[$i]}" in *=*) i=$((i+1)) ;; sudo|env|nohup|command|exec|time) i=$((i+1)) ;; *) break ;; esac
   done
   [ "$i" -lt "$n" ] || return 0
-  cmd="$(basename "${t[$i]}")"
+  base_set "${t[$i]}"; cmd="$BASE"
   case "$cmd" in
     git)
       j=$((i+1)); sub=""; local gitcwd="$HOOK_CWD" gitcwd_unknown="${HOOK_CWD_UNKNOWN:-0}" d
       while [ "$j" -lt "$n" ]; do
         case "${t[$j]}" in
-          -C) d="$(resolve_target "${t[$((j+1))]:-}")"; if [ -n "$d" ] && [ -d "$d" ]; then gitcwd="$d"; gitcwd_unknown=0; else gitcwd_unknown=1; fi; j=$((j+2)) ;;
+          -C) resolve_target_set "${t[$((j+1))]:-}"; d="$RESOLVED"; if [ -n "$d" ] && [ -d "$d" ]; then gitcwd="$d"; gitcwd_unknown=0; else gitcwd_unknown=1; fi; j=$((j+2)) ;;
           -c|--git-dir|--work-tree) j=$((j+2)) ;; -*) j=$((j+1)) ;; *) sub="${t[$j]}"; j=$((j+1)); break ;; esac
       done
       local -a a=(); [ "$j" -lt "$n" ] && a=("${t[@]:$j}")
@@ -642,13 +682,13 @@ guard_rules() {
           [ "$del" = 0 ] || return 0
           if [ "${#refs[@]}" = 0 ]; then
             [ "$force" = 1 ] || return 0
-            if [ "$all" = 1 ] || [ "$gitcwd_unknown" = 1 ]; then ref="main"; else ref="$(current_branch_of "$gitcwd")"; fi
+            if [ "$all" = 1 ] || [ "$gitcwd_unknown" = 1 ]; then ref="main"; else branch_set "$gitcwd"; ref="$BRANCH"; fi
             refs=("$ref")
           fi
           for ref in "${refs[@]}"; do
             case "$ref" in +*) ;; *) [ "$force" = 1 ] || continue ;; esac
             dest="${ref#+}"; dest="${dest##*:}"; dest="${dest#refs/heads/}"
-            [ -n "$dest" ] || dest="$(current_branch_of "$gitcwd")"
+            [ -n "$dest" ] || { branch_set "$gitcwd"; dest="$BRANCH"; }
             if is_protected "$dest"; then DENY_REASON="git push --force (or refspec \"+…\", --mirror) to \"$dest\" refused: it rewrites the shared history and erases the commits merged by the other lanes. Alternative: push a batch branch (git push -u origin <branch>) and open a PR."; deny_perte; return 1; fi
           done ;;
         merge|rebase|cherry-pick|pull|revert)
@@ -694,18 +734,20 @@ guard_rules() {
             pop|drop|clear|branch) stash_message "$act"; return 1 ;;   # branch applique puis retire l'entrée la plus récente
             apply)
               for arg in "${a[@]:1}"; do case "$arg" in -*) ;; *) sha="$arg" ;; esac; done
-              if ! printf '%s\n' "$sha" | grep -Eq '^[0-9a-f]{7,40}$'; then stash_message "apply${sha:+ $sha}"; return 1; fi ;;
+              if ! [[ $sha =~ ^[0123456789abcdef]{7,40}$ ]]; then stash_message "apply${sha:+ $sha}"; return 1; fi ;;
           esac ;;
         commit)
           local br where; [ "$gitcwd_unknown" = 1 ] && return 0   # dossier inconnu (cd ou -C non résoluble) : on ne peut pas juger
-          where="$(shared_index "$gitcwd")" || return 0   # couloir ou dépôt non enregistré : libre
+          shared_index "$gitcwd" || return 0   # couloir ou dépôt non enregistré : libre
+          where="$SHARED_INDEX"
           # registre et fiches (LAB_HOME, LAB_PROJECTS) se committent sur main : 277 fichiers jamais enregistrés (constat 3, lot 03)
-          br="$(current_branch_of "$gitcwd")"
+          branch_set "$gitcwd"; br="$BRANCH"
           if [ "$where" = 'main checkout' ] && is_protected "$br"; then DENY_REASON="commit on \"$br\" from the main checkout refused. Alternative: lab new <slug> (worktree + branch + PR)."; return 1; fi
           if ! commit_paths_ok "${a[@]+"${a[@]}"}" && ! commit_joined_ok "$seg"; then DENY_REASON="git commit without paths (or -a, --amend without paths) refused in the $where: its index is shared by every session, this commit would also take what another one staged there. Alternative: git commit -- <files> (with -m <message>), which records only those files."; return 1; fi ;;
         add)
           local where; [ "$gitcwd_unknown" = 1 ] && return 0
-          where="$(shared_index "$gitcwd")" || return 0
+          shared_index "$gitcwd" || return 0
+          where="$SHARED_INDEX"
           [ "$where" = 'main checkout' ] || return 0   # dépôt des fiches : seul le commit nomme ses chemins (périmètre du lot)
           if add_broad "${a[@]+"${a[@]}"}"; then DENY_REASON="git add on the whole tree (-A, -u, ., *, :/) refused in the $where: its index is shared by every session, it would mix your work with theirs. Alternative: git add <named files>."; return 1; fi ;;
       esac ;;
@@ -715,7 +757,7 @@ guard_rules() {
       [ "$rec" = 1 ] && [ "$force" = 1 ] || return 0
       for arg in "${t[@]:$((i+1))}"; do
         case "$arg" in -*) continue ;; esac
-        tgt="$(resolve_target "$arg")"
+        resolve_target_set "$arg"; tgt="$RESOLVED"
         if [ -z "$tgt" ] || ! path_allowed_for_rm "$tgt"; then DENY_REASON="rm -rf \"$arg\" refused: outside the current worktree (or target not resolvable). Alternative: trash <path>, or an explicit path under the worktree."; return 1; fi
       done ;;
   esac
@@ -729,11 +771,11 @@ guard_rules() {
 guard_tower_segment() {
   local -a t=(); local i=0 n cmd j sub what="" arg dest ref all=0 remote="" gitcwd="$HOOK_CWD" d p root tw pid lane r where
   local -a refs=()
-  read -r -a t <<<"$1"; n=${#t[@]}
+  words_split "$1"; t=("${WORDS[@]+"${WORDS[@]}"}"); n=${#t[@]}
   while [ "$i" -lt "$n" ]; do case "${t[$i]}" in LAB_AGENT_SCAN=*) what=scan; break ;; *=*|sudo|env|nohup|command|exec|time) i=$((i+1)) ;; *) break ;; esac; done
   if [ -z "$what" ]; then
     [ "$i" -lt "$n" ] || return 0
-    cmd="$(basename "${t[$i]}")"
+    base_set "${t[$i]}"; cmd="$BASE"
     case "$cmd" in
       gh)   # options de gh (-R <dépôt>, --repo=…) sautées ; gh api vers …/pulls/<n>/merge vaut gh pr merge (revue)
         local -a w=(); j=$((i+1))
@@ -747,25 +789,26 @@ guard_tower_segment() {
         j=$((i+1)); sub=""
         while [ "$j" -lt "$n" ]; do
           case "${t[$j]}" in
-            -C) d="$(resolve_target "${t[$((j+1))]:-}")"; [ -z "$d" ] || [ ! -d "$d" ] || gitcwd="$d"; j=$((j+2)) ;;
+            -C) resolve_target_set "${t[$((j+1))]:-}"; d="$RESOLVED"; [ -z "$d" ] || [ ! -d "$d" ] || gitcwd="$d"; j=$((j+2)) ;;
             -c|--git-dir|--work-tree) j=$((j+2)) ;; -*) j=$((j+1)) ;; *) sub="${t[$j]}"; j=$((j+1)); break ;; esac
         done
         [ "$sub" = push ] || return 0
         for arg in "${t[@]:$j}"; do
           case "$arg" in --all|--mirror) all=1 ;; -*) ;; *) if [ -z "$remote" ]; then remote="$arg"; else refs+=("$arg"); fi ;; esac
         done
-        [ "${#refs[@]}" -gt 0 ] || refs=("$(current_branch_of "$gitcwd")")
+        [ "${#refs[@]}" -gt 0 ] || { branch_set "$gitcwd"; refs=("$BRANCH"); }
         [ "$all" = 0 ] || refs+=(main)
         for ref in "${refs[@]}"; do
           dest="${ref#+}"; dest="${dest##*:}"; dest="${dest#refs/heads/}"
-          case "$dest" in ''|HEAD) dest="$(current_branch_of "$gitcwd")" ;; esac
+          case "$dest" in ''|HEAD) branch_set "$gitcwd"; dest="$BRANCH" ;; esac
           if is_protected "$dest"; then what="push $dest"; break; fi
         done ;;
     esac
   fi
   [ -n "$what" ] || return 0
-  p="$(project_from_cwd "$gitcwd" 2>/dev/null)" && [ -n "$p" ] || return 0
-  root="$(config_get "$p" root 2>/dev/null)"; tw="$root/.worktrees/$TOWER_LANE"
+  project_from_cwd_set "$gitcwd" 2>/dev/null && [ -n "$FOUND_PROJECT" ] || return 0
+  p="$FOUND_PROJECT"; kv_value "$LAB_PROJECTS/$p/config" root || true
+  root="$KV_VALUE"; tw="$root/.worktrees/$TOWER_LANE"
   [ -n "$root" ] && [ -d "$tw" ] && P_NAME="$p" lane_is_tower "$tw" || return 0
   [ "${LAB_AGENT_SCAN:-1}" != 0 ] || [ "$what" = scan ] || return 0
   pid="$(agent_pid_found)" || return 0   # aucun agent : l'utilisateur garde la main
@@ -782,76 +825,21 @@ guard_tower_segment() {
 # ---------- garde des déploiements bruts (lot 02 de mise-en-ligne) ----------
 # Un projet qui déclare une cible (deploy.<cible>= de sa config) ne se met en ligne que par lab deploy : une commande de déploiement
 # connue, ou le début d'une commande deploy.<cible> déclarée, est refusée ; un projet sans cible n'est jamais gêné.
-deploy_words() { # <segment> → ses mots, sans parenthèses de sous-shell ni préfixes VAR=…, sudo, env, nohup, command, exec, time
-  local -a t=(); local i=0
-  read -r -a t <<<"${1//[()]/ }"
-  while [ "$i" -lt "${#t[@]}" ]; do case "${t[$i]}" in *=*|sudo|env|nohup|command|exec|time) i=$((i+1)) ;; *) break ;; esac; done
-  [ "$i" -lt "${#t[@]}" ] || return 0
-  printf '%s\n' "${t[*]:$i}"
-}
-deploy_plain() { # <mots> → sans les options (-x, --long) : « npx --yes wrangler deploy » et « npx wrangler deploy » se valent
-  local w out=""; local -a t=()
-  read -r -a t <<<"$1"
-  for w in "${t[@]+"${t[@]}"}"; do case "$w" in -*) ;; *) out="${out:+$out }$w" ;; esac; done
-  printf '%s\n' "$out"
-}
-# deploy_signature <commande deploy.<cible>> → son début : le segment qui est un déploiement connu (wrangler deploy…) s'il y en a
-# un — un modèle de lab deploy --add installe et prépare avant (npm ci, npm run …), jamais signature ; sinon le premier segment hors
-# cd et hors installation des dépendances (npm ci, pnpm/yarn/bun install…) : les mots avant la première option (trois au plus)
-# s'ils sont deux ou forment un chemin (./scripts/x.sh), sinon trois mots hors options — npx, npm ou bash seuls refuseraient toutes
-# leurs commandes (revue) ; rien si le segment n'a qu'un programme nu
-deploy_signature() {
-  local seg w before=""; local -a t=() p=()
-  while IFS= read -r seg; do
-    seg="$(deploy_words "$seg")"; if [ -z "$seg" ] || ! deploy_builtin "$seg"; then continue; fi
-    read -r -a p <<<"$(deploy_plain "$seg")"; printf '%s\n' "${p[*]:0:3}"; return 0
-  done < <(segments "$1")
-  while IFS= read -r seg; do
-    read -r -a t <<<"$(deploy_words "$seg")"; [ "${#t[@]}" -gt 0 ] && [ "${t[0]}" != cd ] || continue
-    case " $(deploy_plain "${t[*]}") " in " npm ci "*|" npm install "*|" pnpm install "*|" yarn install "*|" bun install "*|" uv sync "*) continue ;; esac
-    for w in "${t[@]}"; do case "$w" in -*) break ;; esac; before="${before:+$before }$w"; done
-    read -r -a p <<<"$before"; before="${p[*]:0:3}"
-    case "${#p[@]}:$before" in 1:*/*|[2-9]:*) printf '%s\n' "$before"; return 0 ;; esac
-    read -r -a p <<<"$(deploy_plain "${t[*]}")"; [ "${#p[@]}" -lt 2 ] || printf '%s\n' "${p[*]:0:3}"
-    return 0
-  done < <(segments "$1")
-}
-deploy_sigs() { # → « projet<TAB>cible<TAB>début » pour chaque deploy.<cible>= déclarée par un projet enregistré
-  local f line sig
-  for f in "$LAB_PROJECTS"/*/config; do
-    [ -f "$f" ] || continue
-    while IFS= read -r line; do
-      sig="$(deploy_signature "${line#*=}")"; line="${line%%=*}"
-      [ -z "$sig" ] || printf '%s\t%s\t%s\n' "$(basename "$(dirname "$f")")" "${line#deploy.}" "$sig"
-    done < <(grep '^deploy\.' "$f" 2>/dev/null || true)
-  done
-}
-deploy_builtin() { # <mots> → 0 si c'est une commande de déploiement connue
-  local a; local -a t=()
-  case " $1 " in
-    *" wrangler deploy "*|*" wrangler publish "*|*" wrangler pages deploy "*) return 0 ;;
-    *" gcloud run deploy "*|*" gcloud app deploy "*|*" gcloud functions deploy "*) return 0 ;;
-    *" trigger deploy "*|*" trigger.dev"*" deploy "*|*" vercel "*"--prod"*|*" netlify deploy "*"--prod"*) return 0 ;;
-    *" fly deploy "*|*" flyctl deploy "*|*" firebase deploy "*|*" supabase functions deploy "*) return 0 ;;
-  esac
-  read -r -a t <<<"$1"; [ "$(basename "${t[0]:-x}")" = rsync ] || return 1
-  local dest=""; for a in "${t[@]:1}"; do case "$a" in -*) ;; *) dest="$a" ;; esac; done
-  case "$dest" in *:*) return 0 ;; esac   # destination (dernier argument) distante hôte:chemin ; une source distante passe
-  return 1
-}
+# Mots, signatures et commandes connues : lib/guard_fast.sh (deploy_*), communs au pré-filtre.
 guard_deploy_segment() { # <segment> → 0 si ok ; sinon écrit DENY_REASON et retourne 1
   local words plain p t s hit="" known=0 targets
-  words="$(deploy_words "$1")"; [ -n "$words" ] || return 0; plain="$(deploy_plain "$words")"
+  deploy_words_set "$1"; words="$DEPLOY_WORDS"; [ -n "$words" ] || return 0; deploy_plain_set "$words"; plain="$DEPLOY_PLAIN"
   # répétition sans envoi : seul wrangler (deploy, publish) est connu pour honorer --dry-run ; un script maison l'ignorerait (revue)
   case " $plain " in *" wrangler deploy "*|*" wrangler publish "*) case " $words " in *" --dry-run "*) return 0 ;; esac ;; esac
-  [ "$(basename "${words%% *}")" != lab ] || return 0
+  base_set "${words%% *}"; [ "$BASE" != lab ] || return 0
   deploy_builtin "$words" && known=1
   if [ "$known" = 0 ]; then
     [ -n "${DEPLOY_SIGS:-}" ] || return 0
     while IFS=$'\t' read -r p t s; do [ -n "$s" ] || continue; case "$plain " in "$s "*) known=1; break ;; esac; done <<<"$DEPLOY_SIGS"
     [ "$known" = 1 ] || return 0
   fi
-  p="$(project_from_cwd "$HOOK_CWD" 2>/dev/null)" && [ -n "$p" ] || return 0
+  project_from_cwd_set "$HOOK_CWD" 2>/dev/null && [ -n "$FOUND_PROJECT" ] || return 0
+  p="$FOUND_PROJECT"
   targets="$(awk -F= '/^deploy\./ { t = $1; sub(/^deploy\./, "", t); printf "%s%s", (n++ ? " " : ""), t }' "$(project_dir "$p")/config" 2>/dev/null)"
   [ -n "$targets" ] || return 0   # garde active seulement pour un projet qui déclare une cible
   hit="$(awk -F'\t' -v p="$p" -v w="$plain " '$1 == p && $3 != "" && index(w, $3 " ") == 1 { print $2; exit }' <<<"${DEPLOY_SIGS:-}")"
@@ -877,7 +865,7 @@ flag_last() { # <mots> <--option> → 1 si l'option booléenne vaut vrai à sa d
 # un projet qui déclare migrations= ; la branche de base passe. → 0 si ok ; sinon DENY_REASON, rc 1 (LAB_FORCE=1 le lève).
 guard_migrations_segment() {
   local words plain p root br base
-  words="$(deploy_words "$1")"; [ -n "$words" ] || return 0; plain="$(deploy_plain "$words")"
+  deploy_words_set "$1"; words="$DEPLOY_WORDS"; [ -n "$words" ] || return 0; deploy_plain_set "$words"; plain="$DEPLOY_PLAIN"
   # les mots de la sous-commande sont cherchés dans l'ordre, pas côte à côte (wrangler d1 --config x migrations apply) ; l'option est
   # lue comme la CLI : la dernière occurrence l'emporte, seules les valeurs fausses explicites (false, 0, no, f) l'éteignent. En cas de
   # doute, distant : un argument entre guillemets ou une expansion ($VAR, $(…)) illisibles ici, ou --db-url, --linked chez supabase (revue de sécurité)
@@ -898,41 +886,36 @@ guard_migrations_segment() {
   return 1
 }
 track_cd() { # <segment> → met à jour HOOK_CWD si c'est un cd ; retourne 0 si c'était un cd
-  local -a t=(); local target
-  read -r -a t <<<"$1"; [ "${t[0]:-}" = cd ] || return 1
-  target="${t[1]:-}"
+  local target
+  words_split "$1"; [ "${WORDS[0]:-}" = cd ] || return 1
+  target="${WORDS[1]:-}"
   case "$target" in ""|-) HOOK_CWD_UNKNOWN=1; return 0 ;; esac
-  target="$(resolve_target "$target")"
+  resolve_target_set "$target"; target="$RESOLVED"
   if [ -n "$target" ] && [ -d "$target" ]; then HOOK_CWD="$target"; HOOK_CWD_UNKNOWN=0; else HOOK_CWD_UNKNOWN=1; fi
   return 0
 }
 hook_guard_bash() {
-  read_payload
+  guard_read
   hook_guard_bash_payload
 }
 hook_guard_bash_payload() {
   HOOK_CWD_UNKNOWN=0
-  local cmd seg
-  cmd="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.command // empty' 2>/dev/null || true)"; [ -n "$cmd" ] || exit 0
-  # pré-filtre : git, rm, une migration distante, ou une commande qui ressemble à un déploiement (connue, ou début d'une deploy.<cible> déclarée)
-  DEPLOY_SIGS="$(deploy_sigs 2>/dev/null || true)"
-  case "$cmd" in
-    *git*|*rm*|*deploy*|*publish*|*rsync*|*vercel*|*migrations*|*supabase*|*"pr merge"*|*/merge*|*mergePullRequest*|*LAB_AGENT_SCAN*|*cmux*|*cmx*) ;;
-    *) local p t s hint=0
-       while IFS=$'\t' read -r p t s; do [ -n "$s" ] || continue; case "$cmd" in *"${s%% *}"*) hint=1; break ;; esac; done <<<"$DEPLOY_SIGS"
-       [ "$hint" = 1 ] || exit 0 ;;
-  esac
+  local cmd="$HF_CMD" seg; [ -n "$cmd" ] || exit 0
+  # pré-filtre (lib/guard_fast.sh) : git, rm, une migration distante, ou une commande qui ressemble à un déploiement (connue, ou début
+  # d'une deploy.<cible> déclarée) ; pose DEPLOY_SIGS
+  ! guard_bash_ordinary "$cmd" || exit 0
   local cwd0="$HOOK_CWD"
-  HOOK_JOINED="$(heredoc_strip "$cmd" | quote_join | sed -E "s/'[^']*'/$QUOTED/g; s/\"[^\"]*\"/$QUOTED/g" | awk '{ m = sub(/^\002/, ""); gsub(/&&|\|\||;|\|/, m ? "\n\002" : "\n"); print (m ? "\002" : "") $0 }')"
+  segments_set "$cmd"
   while IFS= read -r seg; do
-    [ -n "$seg" ] || continue
+    # aucun des mots que cd, guard_rules et guard_tower_segment cherchent : rien à juger (une commande longue a des centaines de segments)
+    case "$seg" in *cd*|*git*|*rm*|*gh*|*export*|*unset*|*LAB_AGENT_SCAN*) ;; *) continue ;; esac
     track_cd "$seg" && continue
     if ! guard_segment "$seg"; then
       if [ "$DENY_KIND" = perte ]; then json_deny "LAB: $DENY_REASON"; else json_deny "LAB: $DENY_REASON If the user explicitly asked for it, run it again with LAB_FORCE=1 before the command."; fi
       exit 0
     fi
     if ! guard_tower_segment "$seg"; then json_deny "LAB: $DENY_REASON"; exit 0; fi   # lot 06 d'autonomie-tours, jamais forcé
-  done < <(segments "$cmd")
+  done <<<"$SEGMENTS"
   # jugés sur la commande brute, même entre guillemets (bash -c "…", URL citée) : LAB_AGENT_SCAN écrit n'importe où, fusion d'une PR
   # par gh api (REST …/pulls/<n>/merge, GraphQL mergePullRequest) — revue de sécurité
   HOOK_CWD="$cwd0"
@@ -940,8 +923,14 @@ hook_guard_bash_payload() {
   case "$cmd" in *"gh api"*/pulls/*/merge*|*"gh api"*mergePullRequest*) guard_tower_segment "gh pr merge" || { json_deny "LAB: $DENY_REASON"; exit 0; } ;; esac
   # lot 10 : l'accord de l'utilisateur est tapé par lui seul — un envoi cmux qui le tape est refusé, jamais forcé (LAB_FORCE sans effet)
   case "$cmd" in *cmux*|*cmx*) guard_words_send "$cmd" || { json_deny "LAB: $DENY_REASON"; exit 0; } ;; esac
-  # déploiements : le corps d'un here-doc donné à cat, python3, git… est du texte, jamais exécuté ici (0.5.1)
+  # déploiements et migrations : seulement si un mot que leurs règles exigent est dans la commande (un segment n'en contient aucun autre)
+  case "$cmd" in
+    *deploy*|*publish*|*vercel*|*rsync*|*migrations*|*supabase*) ;;
+    *) case "$DEPLOY_SIGS" in *"$QUOTED"*) ;; *) deploy_sig_hint "$cmd" || exit 0 ;; esac ;;
+  esac
+  # le corps d'un here-doc donné à cat, python3, git… est du texte, jamais exécuté ici (0.5.1)
   HOOK_CWD="$cwd0"; HOOK_CWD_UNKNOWN=0
+  segments_set "$cmd" 1
   while IFS= read -r seg; do
     [ -n "$seg" ] || continue
     track_cd "$seg" && continue
@@ -949,7 +938,7 @@ hook_guard_bash_payload() {
       json_deny "LAB: $DENY_REASON If the user explicitly asked for it, run it again with LAB_FORCE=1 before the command."
       exit 0
     fi
-  done < <(segments "$cmd" 1)
+  done <<<"$SEGMENTS"
   exit 0
 }
 
@@ -961,68 +950,83 @@ hook_guard_bash_payload() {
 # est aussi jugé seul (revue du lot). Hors de portée, nommé par la fiche : des morceaux
 # envoyés en plusieurs appels, un script qui tape à la place de l'agent — la garde est une défense de plus, pas une preuve.
 guard_words_send() {
-  local cmd="$1" t lanes
+  local cmd="$1" t lanes='' texts
   printf '%s\n' "$cmd" | LC_ALL=C grep -Eq '(^|[^[:alnum:]_.-])(cmux|cmx)([[:space:]][^|;&]*)?[[:space:]](send|paste|send-panel|set-buffer)([[:space:]]|$)' || return 0
+  # un texte sans aucun des mots que les deux règles exigent (replié comme words_fold) n'est pas jugé : un envoi ordinaire coûtait six
+  # processus par texte et par ligne. Un perl en échec n'en trie aucun : il faut aussi à words_match, qui ne jugerait rien non plus
+  texts="$(printf '%s\n' "$cmd" | perl -MEncode -MUnicode::Normalize -e '
+    my (@t, $all); $all = "";
+    while (<STDIN>) {
+      while (/"((?:[^"\\]|\\.)*)"|\x27([^\x27]*)\x27/g) { my $q = defined $1 ? $1 : $2; $all .= $q; push @t, "$q\n"; push @t, "$_\n" for split /\\[nr]|\r/, $q }
+      push @t, $_;
+    }
+    push @t, "$all\n"; push @t, "$_\n" for split /\\[nr]|\r/, $all;
+    for (@t) {
+      s/\\[nrt]/ /g; my $f = NFD(decode("UTF-8", $_)); $f =~ s/\p{Mn}//g; $f =~ s/\p{Cf}//g; $f =~ s/\p{Zs}/ /g;
+      print if lc($f) =~ /ferm|clo|recette|accept|approuv|approve|valide|confirm|voix haute/;
+    }' 2>/dev/null)" || return 0
+  [ -n "$texts" ] || return 0
   lanes="$( { p="$(project_from_cwd "$HOOK_CWD")" && [ -n "$p" ] && load_project "$p" && words_lanes; } 2>/dev/null | tr '\n' ' ')"
   while IFS= read -r t; do
-    t="$(printf '%s' "$t" | sed 's/\\[nrt]/ /g')"
     [ -n "${t// /}" ] || continue
     # shellcheck disable=SC2086 # noms de couloir : des mots (valid_slug)
-    if words_match "$t" $lanes >/dev/null || printf '%s' "$t" | words_fold | LC_ALL=C grep -Eq 'confirm[a-z]*[^a-z]*(aloud|out[^a-z]*loud)|voix haute'; then
+    if WORDS_BARE=1 words_match "$t" $lanes >/dev/null || printf '%s' "$t" | words_fold | LC_ALL=C grep -Eq 'confirm[a-z]*[^a-z]*(aloud|out[^a-z]*loud)|voix haute'; then
       DENY_REASON="the user's agreement is typed by them only: cmux typing \"$(printf '%s' "$t" | words_clean 80)\" refused — they write it in the tab themselves, or answer a question asked with AskUserQuestion."
       return 1
     fi
-  done < <(printf '%s\n' "$cmd" | perl -ne 'while (/"((?:[^"\\]|\\.)*)"|\x27([^\x27]*)\x27/g) { my $q = defined $1 ? $1 : $2; $all .= $q; print $q, "\n"; print "$_\n" for split /\\[nr]|\r/, $q } print; END { print $all, "\n"; print "$_\n" for split /\\[nr]|\r/, $all }' 2>/dev/null)
+  done <<<"$texts"
   return 0
 }
 
 # ---------- PreToolUse Write / Edit / apply_patch ----------
-# Rend la casse réelle du dossier de travail, puis garde le chemin logique sous ce dossier (même à travers un lien symbolique).
-canonical_target() {
-  local p="$1" raw_cwd real_cwd
-  raw_cwd="$(lexical_path "$HOOK_CWD")"; real_cwd="$(real_path "$HOOK_CWD")"
-  case "$p" in
+# CANON ; le dossier de travail n'est résolu qu'une fois par crochet.
+canonical_set() {
+  if [ "${CANON_FOR:-}" != "$HOOK_CWD" ]; then
+    lexical_set "$HOOK_CWD"; CANON_RAW="$LEXICAL"; real_path_set "$HOOK_CWD"; CANON_REAL="$REAL_PATH"; CANON_FOR="$HOOK_CWD"
+  fi
+  case "$1" in
     /*)
-      p="$(lexical_path "$p")"
-      case "$p" in "$raw_cwd") p="$real_cwd" ;; "$raw_cwd"/*) p="$real_cwd/${p#"$raw_cwd"/}" ;; esac ;;
-    *) p="$(lexical_path "$real_cwd/$p")" ;;
+      lexical_set "$1"; CANON="$LEXICAL"
+      case "$CANON" in "$CANON_RAW") CANON="$CANON_REAL" ;; "$CANON_RAW"/*) CANON="$CANON_REAL/${CANON#"$CANON_RAW"/}" ;; esac ;;
+    *) lexical_set "$CANON_REAL/$1"; CANON="$LEXICAL" ;;
   esac
-  printf '%s\n' "$p"
 }
-
-nearest_existing_dir() {
-  local p="$1"
-  [ -d "$p" ] || p="$(dirname "$p")"
-  while [ ! -d "$p" ] && [ "$p" != / ]; do p="$(dirname "$p")"; done
-  printf '%s\n' "$p"
+# parent_set <chemin> : PARENT = dirname du chemin, sans processus (chemin absolu)
+parent_set() { PARENT="${1%/*}"; PARENT="${PARENT:-/}"; }
+nearest_set() { # <chemin> : NEAREST, le dossier existant le plus proche
+  NEAREST="$1"
+  while [ ! -d "$NEAREST" ] && [ "$NEAREST" != / ]; do parent_set "$NEAREST"; NEAREST="$PARENT"; done
 }
 
 # Pose CT_PROJECT et CT_PATH si la cible est l'un des cinq fichiers de contexte protégés.
 context_target() {
-  local target p root wt rel candidate d
+  local target p root rel d
   CT_PROJECT=""; CT_PATH=""
-  target="$(canonical_target "$1")"
+  # nom d'aucun fichier protégé, le cas ordinaire : aucun projet à lire (15 projets × 160 couloirs coûtaient 3 000 processus par Edit)
+  ! target_off_context "$1" || return 1
+  canonical_set "$1"; target="$CANON"
 
   # notes et mémoires sont hors dépôt : on les rattache explicitement à leur projet et à leur checkout/worktree.
-  for p in $(project_names); do
-    candidate="$(canonical_target "$(project_dir "$p")/notes.md")"
-    if [ "$target" = "$candidate" ]; then
-      CT_PROJECT="$p"; CT_PATH="$target"; load_project "$p"; return 0
-    fi
-    root="$(config_get "$p" root 2>/dev/null || true)"; [ -d "$root" ] || continue
-    candidate="$(canonical_target "$(memory_file "$root")")"
-    if [ "$target" = "$candidate" ]; then CT_PROJECT="$p"; CT_PATH="$target"; load_project "$p"; return 0; fi
-    while IFS=$'\t' read -r wt _ _; do
-      [ -n "$wt" ] || continue
-      candidate="$(canonical_target "$(memory_file "$wt")")"
-      if [ "$target" = "$candidate" ]; then CT_PROJECT="$p"; CT_PATH="$target"; load_project "$p"; return 0; fi
-    done < <(worktree_list "$root" 2>/dev/null || true)
-  done
+  case "$target" in
+    */notes.md)
+      for p in $(project_names); do
+        canonical_set "$LAB_PROJECTS/$p/notes.md"
+        if [ "$target" = "$CANON" ]; then CT_PROJECT="$p"; CT_PATH="$target"; load_project "$p"; return 0; fi
+      done ;;
+    */MEMORY.md)   # par son nom seul : un dossier memory atteint par un lien change tout le reste du chemin (revue)
+      for p in $(project_names); do
+        kv_value "$LAB_PROJECTS/$p/config" root || true
+        root="$KV_VALUE"; [ -d "$root" ] || continue
+        if context_memory "$target" "$root"; then CT_PROJECT="$p"; CT_PATH="$target"; load_project "$p"; return 0; fi
+      done ;;
+  esac
 
-  d="$(nearest_existing_dir "$target")"
-  root="$(repo_root "$d" 2>/dev/null || true)"; [ -n "$root" ] || return 1
-  p="$(project_from_cwd "$root" 2>/dev/null || true)"; [ -n "$p" ] || return 1
-  root="$(real_path "$root")"
+  nearest_set "$target"
+  git_places "$NEAREST" || return 1
+  root="$GP_TOP"
+  project_by_root_set "$GP_MAIN" || return 1
+  p="$FOUND_PROJECT"
+  real_path_set "$root"; root="$REAL_PATH"
   case "$target" in
     "$root/AGENTS.md"|"$root/CLAUDE.md") ;;
     "$root"/.claude/rules/*.md)
@@ -1040,16 +1044,43 @@ context_target() {
   return 0
 }
 
-guard_context_content() { # <cible> <contenu> : 0 si autorisé, 1 après avoir posé DENY_REASON
+# context_memory <cible> <checkout principal> : rc 0 si la cible est la mémoire Claude de ce checkout ou de l'un de ses worktrees
+context_memory() {
+  local line home wt
+  home="$(claude_home)"; wt="$2"
+  canonical_set "$home/projects/${wt//\//-}/memory/MEMORY.md"
+  [ "$1" != "$CANON" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in 'worktree '*) wt="${line#worktree }" ;; *) continue ;; esac
+    [ -n "$wt" ] || continue
+    canonical_set "$home/projects/${wt//\//-}/memory/MEMORY.md"
+    [ "$1" != "$CANON" ] || return 0
+  done <<<"$(exec git -C "$2" worktree list --porcelain 2>/dev/null)"
+  return 1
+}
+
+# guard_context_content <cible> <contenu> [champ] : 0 si autorisé, 1 après avoir posé DENY_REASON ; champ : le contenu est ce champ de
+# tool_input, lu dans la charge seulement pour une cible protégée
+guard_context_content() {
   local target="$1" content="$2" name
   context_target "$target" || return 0
+  [ -z "${3:-}" ] || content="$(payload_get ".tool_input.$3")"
   for name in $(hermetism_forbidden_names "$CT_PROJECT"); do
-    if printf '%s' "$content" | project_name_in_text "$name"; then
+    if name_maybe_in "$name" "$content" && printf '%s' "$content" | project_name_in_text "$name"; then
       DENY_REASON="mention of \"$name\" refused in \"$CT_PATH\". Rephrase without naming another project, or explicitly ask for an exceptional write."
       return 1
     fi
   done
   return 0
+}
+
+# name_maybe_in <nom> <texte> : rc 0 si le texte porte le nom, casse ignorée — sur-ensemble sans processus de project_name_in_text
+name_maybe_in() {
+  local rc=1
+  shopt -s nocasematch
+  [[ "$2" != *"$1"* ]] || rc=0
+  shopt -u nocasematch
+  return "$rc"
 }
 
 # guard_state_target <cible> (lot 09 d'autonomie-tours) : 0 si autorisé ; 1 et DENY_REASON si la cible est sous l'état de lab
@@ -1059,12 +1090,13 @@ guard_context_content() { # <cible> <contenu> : 0 si autorisé, 1 après avoir p
 guard_state_target() {
   local t d st
   [ -n "${LAB_STATE:-}" ] || return 0
-  t="$(canonical_target "$1")"; t="$(resolve_file "$t" 2>/dev/null || printf '%s\n' "$t")"
-  st="$(lexical_path "$LAB_STATE")"
+  ! target_off_state "$1" || return 0   # le cas ordinaire, sans processus
+  canonical_set "$1"; t="$CANON"; t="$(resolve_file "$t" 2>/dev/null || printf '%s\n' "$t")"
+  lexical_set "$LAB_STATE"; st="$LEXICAL"
   case "$t" in "$st"|"$st"/*) ;; *)
     [ -d "$LAB_STATE" ] || return 0
-    d="$(nearest_existing_dir "$t")"
-    while [ ! "$d" -ef "$LAB_STATE" ]; do [ "$d" != / ] && [ -n "$d" ] || return 0; d="$(dirname "$d")"; done ;;
+    nearest_set "$t"; d="$NEAREST"
+    while [ ! "$d" -ef "$LAB_STATE" ]; do [ "$d" != / ] && [ -n "$d" ] || return 0; parent_set "$d"; d="$PARENT"; done ;;
   esac
   DENY_REASON="lab's state is written by lab only: \"$1\" refused — the lab command that keeps it writes it (lab acceptance for an agreement)."
   return 1
@@ -1108,10 +1140,11 @@ guard_patch_payload() {
 hook_lock_resume() {
   local tool="$1" target="${2:-}" root lock held res p real t
   [ "${LAB_DRY:-0}" != 1 ] || return 0
-  root="$(repo_root "${CLAUDE_PROJECT_DIR:-$HOOK_CWD}" 2>/dev/null || true)"; [ -n "$root" ] || return 0
+  git_places "${CLAUDE_PROJECT_DIR:-$HOOK_CWD}" || return 0
+  root="$GP_TOP"
   waits_clear_answered "$root" 2>/dev/null || true   # un outil repart : la question ou l'autorisation est réglée (lot 03 d'autonomie-tours)
-  lock="$(lock_file "$root")"
-  held="$(lock_field "$lock" pid 2>/dev/null || true)"
+  lock="$root/.lab/session.lock"
+  kv_value "$lock" pid 2>/dev/null || true; held="$KV_VALUE"
   if [ -n "$held" ] && session_owned_here "$root"; then return 0; fi
   agent_pid_found >/dev/null 2>&1 || return 0
   res="$(claim "$root" 2>/dev/null || true)"
@@ -1123,35 +1156,29 @@ hook_lock_resume() {
   ! same_path "$root" "$P_ROOT" || return 0
   if [ "$tool" != apply_patch ]; then
     [ -n "$target" ] || return 0
-    real="$(real_path "$root" 2>/dev/null || printf '%s' "$root")"; t="$(canonical_target "$target" 2>/dev/null || true)"
+    real_path_set "$root"; real="$REAL_PATH"; canonical_set "$target"; t="$CANON"
     case "$t" in "$real"/*|"$root"/*) ;; *) return 0 ;; esac
   fi
   DENY_REASON="LOCK=ANOTHER LIVE SESSION ($(lock_field "$lock" agent || true) pid $(lock_field "$lock" pid || true) since $(lock_field "$lock" since || true)) in $root: write nothing here; resume that session, or isolate a new topic (lab new)."
   return 1
 }
 hook_guard_tool() {
-  read_payload
-  local tool content target
-  tool="$(printf '%s' "$PAYLOAD" | jq -r '.tool_name // empty' 2>/dev/null || true)"
-  target="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.file_path // empty' 2>/dev/null || true)"
-  if ! hook_lock_resume "$tool" "$target"; then json_deny "LAB: $DENY_REASON"; exit 0; fi
+  local tool target
+  guard_read
+  tool="$HF_TOOL"; target="$HF_PATH"
+  if [ "$GUARD_LOCK" != ok ] && ! hook_lock_resume "$tool" "$target"; then json_deny "LAB: $DENY_REASON"; exit 0; fi
   [ "${LAB_FORCE:-0}" = 1 ] && [ "$tool" != Bash ] && exit 0   # Write, Edit, apply_patch : exemption entière ; Bash : portée par segment
   case "$tool" in
     Bash) hook_guard_bash_payload ;;
     Write)
-      target="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.file_path // empty' 2>/dev/null || true)"
-      content="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.content // empty' 2>/dev/null || true)"
       [ -n "$target" ] || exit 0
-      if ! guard_state_target "$target" || ! guard_context_content "$target" "$content"; then json_deny "LAB: $DENY_REASON"; fi ;;
+      if ! guard_state_target "$target" || ! guard_context_content "$target" '' content; then json_deny "LAB: $DENY_REASON"; fi ;;
     Edit)
-      target="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.file_path // empty' 2>/dev/null || true)"
-      content="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.new_string // empty' 2>/dev/null || true)"
       [ -n "$target" ] || exit 0
-      if ! guard_state_target "$target" || ! guard_context_content "$target" "$content"; then json_deny "LAB: $DENY_REASON"; fi ;;
+      if ! guard_state_target "$target" || ! guard_context_content "$target" '' new_string; then json_deny "LAB: $DENY_REASON"; fi ;;
     apply_patch)
-      content="$(printf '%s' "$PAYLOAD" | jq -r '.tool_input.command // empty' 2>/dev/null || true)"
-      [ -n "$content" ] || exit 0
-      if ! guard_patch_payload "$content"; then json_deny "LAB: $DENY_REASON"; fi ;;
+      [ -n "$HF_CMD" ] || exit 0
+      if ! guard_patch_payload "$HF_CMD"; then json_deny "LAB: $DENY_REASON"; fi ;;
     *) ;;
   esac
   exit 0

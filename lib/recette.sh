@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Recette du couloir : décisions relues dans les fiches, jamais de fichier d’état.
 # Dépend de git.sh, project.sh, docs.sh et deploy.sh ; charge lui-même waiting.sh (phase « waiting », lot 02 d'autonomie-tours).
-declare -F wait_lane_first >/dev/null || . "$(dirname "${BASH_SOURCE[0]}")/waiting.sh"
+declare -F wait_lane_first >/dev/null || . "${BASH_SOURCE[0]%/*}/waiting.sh"
 
 # recette_filter <body|strip|count> : section exacte sur stdin, hors blocs de code.
 recette_filter() {
@@ -482,7 +482,7 @@ cmd_recette() {
   # sont son accord — l'agent du couloir ou la tour acceptent alors, sans preuve typée ; sans eux, rien ne change
   if [ "$decision" = accepted ] && [ "$role" != human ] && words_valid "$WT"; then words=1; fi
   if [ "$decision" = accepted ] && [ "$tower" = 1 ] && [ "$role" = lane-agent ] && [ "$words" = 0 ]; then
-    die "accepting belongs to the tower of $P_NAME or to the user's own words ($WD_WHY): the user says in this tab, or in the tower's, that the acceptance is validated and the lane can be closed; lab records it, then run lab acceptance again — nothing written; --reject stays open to this lane$(tower_session_note)"
+    die "accepting belongs to the tower of $P_NAME or to the user's own words ($WD_WHY): never give them a command to type — ask once with AskUserQuestion, buttons \"Close $SLUG\" and \"Keep $SLUG\" in their language; lab reads the click (or their words, such as \"I accept\", in this tab), then run lab acceptance again — nothing written; --reject stays open to this lane$(tower_session_note)"
   fi
   is_clean "$WT" || { dirty_report "$WT" || true; die "uncommitted or untracked changes ($DIRTY_LIST): commit or remove them, then try again — the tried revision must be the repository's"; }
   [ "$decision" = rejected ] || [ "${#proofs[@]}" -gt 0 ] || [ "$words" = 1 ] || die "agreement without evidence: add --evidence <path tried, agreement received> (repeatable)"

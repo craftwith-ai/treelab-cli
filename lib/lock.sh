@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # lock.sh — verrou de session par worktree : <wt>/.lab/session.lock (pid, agent, since).
+declare -F kv_value >/dev/null || . "${BASH_SOURCE[0]%/*}/kv.sh"
 lock_file() { printf '%s/.lab/session.lock\n' "$1"; }
-lock_field() { [ -f "$1" ] && sed -n "s/^$2=//p" "$1" | head -1; }
+lock_field() { kv_print "$1" "$2"; }
 # pid_state <pid> → vivant | mort | incertain. kill -0 seul ne prouve rien : sous sandbox il répond « Operation not permitted » sur un
 # processus vivant d'un autre arbre, et lab status supprimait alors un verrou de session vivante (retour 4, 2026-09-14). Mort seulement
 # si ps, exécuté sans erreur, ne trouve rien (rc 1, aucune sortie) ; ps refusé ou en erreur = incertain. Un pid absent ou non numérique
@@ -31,17 +32,18 @@ agent_pid_found() {
     # arrête la recherche sans attribuer le verrou à un autre processus.
     case "$seen" in *" $pid "*) break ;; esac
     seen="$seen$pid "
-    comm="$(basename -- "$(ps -o comm= -p "$pid" 2>/dev/null)")"
-    case "$comm" in claude|codex|claude-code) printf '%s\n' "$pid"; return 0 ;; esac
-    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || comm=''
+    case "${comm##*/}" in claude|codex|claude-code) printf '%s\n' "$pid"; return 0 ;; esac
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null)" || pid=''
+    pid="${pid// /}"
   done
   printf '%s\n' "${1:-$PPID}"
   return 1
 }
 # detect_agent [pid de l'agent] : le pid déjà trouvé évite une seconde remontée des ancêtres (claim, lot 01 de reprise-apres-migration)
 detect_agent() {
-  local comm; comm="$(basename -- "$(ps -o comm= -p "${1:-$(agent_pid)}" 2>/dev/null)")"
-  case "$comm" in claude*) echo claude ;; codex*) echo codex ;;
+  local comm; comm="$(ps -o comm= -p "${1:-$(agent_pid)}" 2>/dev/null)" || comm=''
+  case "${comm##*/}" in claude*) echo claude ;; codex*) echo codex ;;
     *) if [ -n "${CLAUDE_PROJECT_DIR:-}${CLAUDE_CODE_ENTRYPOINT:-}" ]; then echo claude
        elif [ -n "${CODEX_HOME:-}${CODEX_SANDBOX:-}" ]; then echo codex; else echo unknown; fi ;;
   esac
@@ -112,13 +114,7 @@ operation_session_check() {
   [ "$(stat -f %u "$dir")" = "$(id -u)" ] && [ "$(stat -f %Lp "$dir")" = 700 ]
 }
 # lock_value <fichier> <clé> : LOCK_VALUE = première valeur « clé=… », lue sans aucun processus (section critique de claim)
-lock_value() {
-  local line; LOCK_VALUE=''
-  [ -f "$1" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in "$2="*) LOCK_VALUE="${line#"$2="}"; return 0 ;; esac
-  done <"$1" 2>/dev/null || true
-}
+lock_value() { kv_value "$1" "$2" 2>/dev/null || true; LOCK_VALUE="$KV_VALUE"; }
 # Un verrou tenu par un processus vivant est réessayé LAB_OPERATION_WAIT secondes (2 par défaut, sous les 5 s d'un hook) : deux
 # SessionStart simultanés le tiennent chacun une fraction de seconde, et le perdant annonçait à tort « mise à jour en cours » à sa
 # session, qui refusait de travailler (essai réel du lot 12). Une vraie opération le tient bien plus longtemps : refus inchangé.
@@ -269,12 +265,13 @@ handoff_wait() {
 # de ses parents. Un PID vivant ailleurs ne donne jamais le droit de le remplacer.
 session_owned_here() {
   local held pid parent
-  held="$(lock_field "$(lock_file "$1")" pid 2>/dev/null || true)"
-  [ -n "$held" ] || return 1
+  kv_value "$1/.lab/session.lock" pid 2>/dev/null || return 1
+  held="$KV_VALUE"; [ -n "$held" ] || return 1
   pid=$$
   while [ -n "$pid" ] && [ "$pid" != 1 ]; do
     [ "$pid" != "$held" ] || return 0
-    parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    # le parent direct est connu du shell : un ps de moins, et le cas ordinaire (l'agent lance le crochet) n'en coûte aucun
+    if [ "$pid" = "$$" ]; then parent="$PPID"; else parent="$(ps -o ppid= -p "$pid" 2>/dev/null)" || parent=''; parent="${parent// /}"; fi
     [ "$parent" != "$pid" ] || break
     pid="$parent"
   done
