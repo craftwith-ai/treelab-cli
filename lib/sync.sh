@@ -95,7 +95,9 @@ sync_recette_note() {
   local lot
   [ "$2" = 'acceptance passed' ] || return 0
   lot="$(wt_lot_file "$1")"
-  if [ "$(recette_status "$1" "$lot")" = valid ]; then SYNC_RECETTE="valid (no lane file in this merge)"
+  if [ "$(recette_status "$1" "$lot")" = valid ]; then
+    if [ -n "$(recette_stale_files "$1" "$lot")" ]; then SYNC_RECETTE="valid (kept by the user's words)"   # lot 04 d'onglet-tower
+    else SYNC_RECETTE="valid (no lane file in this merge)"; fi
   else SYNC_RECETTE="expired — lane files changed: $(recette_stale_files "$1" "$lot")"; fi
 }
 # sync_generated <chemin> : le chemin correspond à un motif de generated= (motifs séparés par des espaces ; * traverse les dossiers)
@@ -141,9 +143,17 @@ sync_regen() {
 # 2 non vérifiable ; lab promote essaie staging sur main (ours = <remote>/main) depuis le checkout principal (lot 16)
 sync_dry() {
   local wt="$1" ref="${2:-$(sync_ref)}" ours="${3:-HEAD}" out rc=0
-  SYNC_FILES=""
-  git -C "$wt" rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 || return 2
-  out="$(git -C "$wt" merge-tree --write-tree -z --name-only --no-messages "$ours" "$ref" 2>/dev/null | tr '\0' '\n')" || rc=$?
+  SYNC_FILES=""; SYNC_TREE=""; SYNC_TREE_FOR=""
+  # un seul programme sans conflit (lot 05 de charge-processeur : rev-parse, sous-shell et tr avant) : merge-tree rend 128 sur une
+  # référence absente comme rev-parse --verify, 129 sur un git < 2.38 ; son arbre, seule ligne d'une fusion propre, est gardé pour
+  # merge_regression, qui suit sur les mêmes révisions
+  out="$(exec git -C "$wt" merge-tree --write-tree --no-messages "$ours" "$ref" 2>/dev/null)" || rc=$?
+  case "$rc" in
+    0) SYNC_TREE="$out"; SYNC_TREE_FOR="$wt|$ours|$ref"; return 0 ;;
+    1) ;;
+    *) return 2 ;;
+  esac
+  rc=0; out="$(git -C "$wt" merge-tree --write-tree -z --name-only --no-messages "$ours" "$ref" 2>/dev/null | tr '\0' '\n')" || rc=$?
   case "$rc" in
     0) return 0 ;;
     1) SYNC_FILES="$(printf '%s\n' "$out" | tail -n +2 | sed '/^$/d')"; return 1 ;;
@@ -174,80 +184,198 @@ lane_files() {
   } | sed '/^$/d' | sort -u
 }
 # lane_rank <wt> [gh=1] → « <rang><TAB><libellé> » : 0 PR armée ou prête, 1 brouillon, 2 sans PR ; sans gh (hook), seul le veilleur compte
-lane_rank() {
-  local wt="$1" br lane f info num draft s; local -a rargs=()
-  br="$(branch_name "$wt")"; lane="$(wt_lane "$wt")"; f="$(watch_file "$br" "$lane")"
-  case "$(watch_state "$f" 2>/dev/null)" in armed|waiting) printf '0\tPR armed\n'; return ;; esac
+lane_rank() { lane_rank_set "$@"; printf '%s\n' "$LANE_RANK"; }
+lane_rank_set() { # les mêmes arguments : LANE_RANK ; sans processus quand la demande groupée a lu la PR
+  local wt="$1" draft s; local -a rargs=()
+  head_branch_set "$wt"; wt_lane_set "$wt"
+  watch_state_set "$LAB_STATE/watch/$P_NAME/$WT_LANE/${HEAD_BRANCH//\//+}"
+  case "$WATCH_STATE" in armed|waiting) LANE_RANK=$'0\tPR armed'; return 0 ;; esac
   if [ "${2:-1}" = 1 ] && has_gh; then
-    info="$(pr_info "$P_ROOT" "$br")"
-    if [ "$(printf '%s' "$info" | cut -f2)" = OPEN ]; then
-      num="$(printf '%s' "$info" | cut -f1)"
-      s="$(repo_slug "$P_ROOT" "$P_REMOTE" 2>/dev/null)" && rargs=(-R "$s")
-      draft="$(with_timeout 20 gh pr view "${rargs[@]+"${rargs[@]}"}" "$num" --json isDraft --jq .isDraft 2>/dev/null)" || draft=""
-      if [ "$draft" = true ]; then printf '1\tdraft PR #%s\n' "$num"; else printf '0\tready PR #%s\n' "$num"; fi
-      return
+    pr_info_set "$P_ROOT" "$HEAD_BRANCH"
+    if [ "$PR_STATE" = OPEN ]; then
+      draft="$PR_DRAFT"
+      if [ -z "$draft" ]; then
+        s="$(repo_slug "$P_ROOT" "$P_REMOTE" 2>/dev/null)" && rargs=(-R "$s")
+        draft="$(with_timeout 20 gh pr view "${rargs[@]+"${rargs[@]}"}" "$PR_NUM" --json isDraft --jq .isDraft 2>/dev/null)" || draft=""
+      fi
+      if [ "$draft" = true ]; then LANE_RANK=$'1\tdraft PR #'"$PR_NUM"; else LANE_RANK=$'0\tready PR #'"$PR_NUM"; fi
+      return 0
     fi
   fi
-  printf '2\tno PR\n'
+  LANE_RANK=$'2\tno PR'
 }
 # lane_since <wt> → date de création du couloir (méta created), sinon date de son premier commit propre ; « 9999 » si inconnue
-lane_since() {
-  local c; c="$(wt_meta "$1" created)"
-  if [ -z "$c" ]; then
-    c="$(git -C "$1" log --reverse --format=%cd --date=format:%Y-%m-%dT%H:%M "$(sync_ref)..HEAD" 2>/dev/null | head -1 || true)"
-  fi
-  printf '%s\n' "${c:-9999}"
+lane_since() { lane_since_set "$1"; printf '%s\n' "$LANE_SINCE"; }
+lane_since_set() { # <wt> : LANE_SINCE ; git seulement pour un couloir sans date de création
+  kv_value "$1/.lab/meta" created || true; LANE_SINCE="$KV_VALUE"
+  [ -n "$LANE_SINCE" ] || LANE_SINCE="$(git -C "$1" log --reverse --format=%cd --date=format:%Y-%m-%dT%H:%M "$(sync_ref)..HEAD" 2>/dev/null | head -1 || true)"
+  LANE_SINCE="${LANE_SINCE:-9999}"
 }
 # live_lanes → chemins des couloirs vivants du projet (worktrees de $P_ROOT/.worktrees)
 live_lanes() { local d; for d in "$P_ROOT"/.worktrees/*/; do [ -f "$d.git" ] && printf '%s\n' "${d%/}"; done; return 0; }
+# ---------- les fichiers de tous les couloirs, lus en une fois (lot 02 de charge-processeur) ----------
+# Comparer chaque couloir aux autres relisait les fichiers de tous les couloirs pour chacun : 2 500 relectures à 50 couloirs. Deux git
+# par couloir (status, merge-base), puis deux pour tout le projet — les arbres, et tous les écarts d'un seul diff-tree —, et un tri.
+# lane_status_set <wt> : LANE_STATUS, git status du couloir (forme v2) ; gardé pour les chevauchements quand LANE_STATUS_KEEP=1
+LANE_STATUS_KEEP=0; LK_WT=() LK_ST=()
+lane_status_set() {
+  # --no-optional-locks : git status ne rafraîchit pas l'index sous index.lock — l'agent du couloir lu peut committer en même temps
+  LANE_STATUS="$(exec git --no-optional-locks -C "$1" status --porcelain=v2 --branch --no-ahead-behind --untracked-files=all)" || true
+  if [ "$LANE_STATUS_KEEP" = 1 ]; then LK_WT+=("$1"); LK_ST+=("$LANE_STATUS"); fi
+}
+lane_status_keep() { LANE_STATUS_KEEP=1; LK_WT=() LK_ST=(); }
+lane_status_forget() { LANE_STATUS_KEEP=0; LK_WT=() LK_ST=(); }
+lane_status_clean() { # LANE_STATUS ne montre aucun fichier : seules des lignes d'en-tête « # … »
+  case "$LANE_STATUS" in ''|'#'*) ;; *) return 1 ;; esac
+  case "$LANE_STATUS" in *$'\n'[!#]*) return 1 ;; esac
+}
+# shellcheck disable=SC2016 # programme awk, rien à développer
+OVERLAP_FILES_AWK='
+  function add(i, p) { if (p != "" && !((i, p) in S)) { S[i, p] = 1; print p "\t" i } }
+  function path(line, n) { while (n-- > 0) line = substr(line, index(line, " ") + 1); return line }
+  substr($0, 1, 1) == "\035" {
+    sect = substr($0, 2, 1); split(substr($0, 3), a, " ")
+    if (sect == "S") { i = a[1]; old = a[2]; if (a[3] != "-") { E[++ne] = a[3] " " a[4]; EI[ne] = i; E[++ne] = a[5] " " a[4]; EI[ne] = i } }
+    next
+  }
+  sect == "S" { if ($0 ~ /^\? /) add(i, substr($0, 3)); else if (!old && $0 ~ /^1 /) add(i, path($0, 8)); next }
+  sect == "R" { add(i, $0); next }
+  sect == "D" { if (q < ne && $0 == E[q + 1]) { q++; next }
+    if (q % 2) A[EI[q], $0] = 1; else if ((EI[q], $0) in A) add(EI[q], $0) }'
+# shellcheck disable=SC2016 # programme awk, rien à développer
+OVERLAP_PAIRS_AWK='
+  { t = index($0, "\t"); p = substr($0, 1, t - 1); i = substr($0, t + 1)
+    if (!(p in L)) { O[++n] = p; L[p] = i } else L[p] = L[p] " " i }
+  END {
+    for (k = 1; k <= n; k++) {
+      m = split(L[O[k]], g, " ")
+      for (x = 1; x <= m; x++) for (y = 1; y <= m; y++) {
+        if (only == "" ? g[x] + 0 >= g[y] + 0 : (g[x] != only || x == y)) continue
+        # valeur lue puis écrite en deux temps : mawk crée F[clé] avant de calculer la droite (sinon « , » en tête)
+        key = g[x] SUBSEP g[y]; v = (key in F) ? F[key] ", " : ""; F[key] = v O[k]
+      }
+    }
+    for (x = 0; x < lanes; x++) for (y = 0; y < lanes; y++) if ((x, y) in F) print x "\t" y "\t" F[x, y]
+  }'
+# overlaps_load [wt] : OV_WT, les couloirs vivants, et OV_ROWS, une ligne « <i><TAB><j><TAB><fichier, fichier…> » par paire i < j qui
+# touche les mêmes fichiers (avec <wt> : OV_SELF, son rang, et les seules paires dont il est le premier) ; même réponse que lane_files
+overlaps_load() {
+  local wt="${1:-}" d ref base i=0 n k mb oid st old plain=0 feed='' batch='' trees; local -a mbs=() oids=() sts=()
+  OV_WT=() OV_ROWS='' OV_SELF=''
+  for d in "$P_ROOT"/.worktrees/*/; do if [ -f "$d.git" ]; then OV_WT+=("${d%/}"); fi; done
+  if [ -n "$wt" ]; then
+    for ((i = 0; i < ${#OV_WT[@]}; i++)); do if same_path "${OV_WT[$i]}" "$wt"; then OV_SELF="$i"; break; fi; done
+    [ -n "$OV_SELF" ] || { OV_SELF="${#OV_WT[@]}"; OV_WT+=("$wt"); }
+  fi
+  n="${#OV_WT[@]}"; [ "$n" -ge 2 ] || return 0
+  base="${P_STAGING:-$P_BASE}"; ref="$P_REMOTE/$base"
+  git -C "$P_ROOT" rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 || ref="$base"
+  # renommages ou sous-modules réglés à la main : git diff suit ces réglages, diff-tree non — l'ancienne lecture, couloir par couloir
+  ! git -C "$P_ROOT" config --get-regexp '^diff\.(renames|ignoresubmodules|relative)$' >/dev/null 2>&1 || plain=1
+  for ((i = 0; i < n; i++)); do
+    wt="${OV_WT[$i]}"
+    if [ "$plain" = 1 ]; then feed="$feed"$'\035'"S $i 1 -"$'\n'$'\035R\n'"$(lane_files "$wt")"$'\n'; continue; fi
+    st=''; old=1
+    for ((k = 0; k < ${#LK_WT[@]}; k++)); do if [ "${LK_WT[$k]}" = "$wt" ]; then st="${LK_ST[$k]}"; old=0; break; fi; done
+    if [ "$old" = 1 ]; then LANE_STATUS_KEEP=0 lane_status_set "$wt" 2>/dev/null; st="$LANE_STATUS"; fi
+    oid="${st#*\# branch.oid }"; [ "$oid" != "$st" ] || oid='-'; oid="${oid%%$'\n'*}"
+    mb="$(exec git -C "$wt" merge-base "$ref" HEAD 2>/dev/null)" || mb=''
+    case "$oid" in *[!0-9a-f]*) mb='' ;; esac
+    mbs[i]="$mb"; oids[i]="$oid"; sts[i]="$st"
+    [ -z "$mb" ] || batch="$batch$mb^{tree}"$'\n'"$oid^{tree}"$'\n'
+  done
+  if [ "$plain" = 0 ]; then
+    trees=''
+    if [ -n "$batch" ]; then
+      trees="$(exec git -C "$P_ROOT" cat-file --batch-check='%(objectname)' <<<"$ref^{tree}"$'\n'"${batch%$'\n'}" 2>/dev/null)" || true
+      base="${trees%%$'\n'*}"; trees="${trees#*$'\n'}"$'\n'
+    fi
+    batch=''
+    for ((i = 0; i < n; i++)); do
+      wt="${OV_WT[$i]}"; st="${sts[$i]}"; old=0; mb='-' oid='-'
+      if [ -n "${mbs[$i]}" ]; then
+        mb="${trees%%$'\n'*}"; trees="${trees#*$'\n'}"; oid="${trees%%$'\n'*}"; trees="${trees#*$'\n'}"
+        case "$mb$oid$base" in *[!0-9a-f]*) mb='-' ;; *) batch="$batch$mb $oid"$'\n'"$base $oid"$'\n' ;; esac
+      fi
+      # indexé et modifié à la fois, renommé, en conflit, ajout à venir, sous-module, ajout et suppression ensemble : git diff HEAD seul
+      # sait ce qui diffère encore de HEAD
+      case $'\n'"$st" in
+        *$'\n2 '*|*$'\nu '*|*$'\n1 '[!.][!.]' '*|*$'\n1 .A '*|*$'\n1 '??' S'*) old=1 ;;
+        *$'\n1 A'*) case $'\n'"$st" in *$'\n1 D'*|*$'\n1 .D'*) old=1 ;; esac ;;
+      esac
+      feed="$feed"$'\035'"S $i $old $mb $oid $base"$'\n'"$st"$'\n'
+      if [ "$old" = 1 ]; then feed="$feed"$'\035R\n'"$(exec git -C "$wt" diff --name-only HEAD 2>/dev/null)"$'\n'; fi
+    done
+    if [ -n "$batch" ]; then
+      feed="$feed"$'\035D\n'"$(exec git -C "$P_ROOT" diff-tree --stdin -r -M --name-only <<<"${batch%$'\n'}" 2>/dev/null)"$'\n' || true
+    fi
+  fi
+  # triés dans la langue du terminal, comme avant : l'ordre des fichiers affichés ne change pas
+  OV_ROWS="$(LC_ALL=C awk "$OVERLAP_FILES_AWK" <<<"$feed" | sort -t "$(printf '\t')" -k1,1 -k2,2n | LC_ALL=C awk -v lanes="$n" -v only="$OV_SELF" "$OVERLAP_PAIRS_AWK")"
+}
 # overlaps <wt> → une ligne par autre couloir vivant qui touche les mêmes fichiers : « <couloir><TAB><fichier, fichier…> »
 overlaps() {
-  local wt="$1" mine other common
-  mine="$(lane_files "$wt")"; [ -n "$mine" ] || return 0
-  while IFS= read -r other; do
-    if [ -z "$other" ] || same_path "$other" "$wt"; then continue; fi
-    common="$(comm -12 <(printf '%s\n' "$mine") <(lane_files "$other") | sed '/^$/d')"
-    [ -z "$common" ] || printf '%s\t%s\n' "$(wt_lane "$other")" "$(printf '%s\n' "$common" | sync_join)"
-  done < <(live_lanes)
+  local i j files
+  overlaps_load "$1"
+  while IFS=$'\t' read -r i j files; do
+    if [ -z "$i" ] || same_path "${OV_WT[$j]}" "$1"; then continue; fi
+    wt_lane_set "${OV_WT[$j]}"; printf '%s\t%s\n' "$WT_LANE" "$files"
+  done <<<"$OV_ROWS"
 }
 # overlap_order <wt> <wt> [gh=1] → « premier<TAB>second<TAB>libellé lisible » : PR armée/prête > brouillon > sans PR, puis le plus ancien
-overlap_order() {
-  local a="$1" b="$2" ra rb ka kb la lb
-  ra="$(lane_rank "$a" "${3:-1}")"; rb="$(lane_rank "$b" "${3:-1}")"
-  ka="${ra%%$'\t'*}|$(lane_since "$a")"; kb="${rb%%$'\t'*}|$(lane_since "$b")"
-  la="$(wt_lane "$a") (${ra#*$'\t'})"; lb="$(wt_lane "$b") (${rb#*$'\t'})"
-  if [ "$kb" \< "$ka" ]; then
-    printf '%s\t%s\t%s then %s\n' "$(wt_lane "$b")" "$(wt_lane "$a")" "$lb" "$la"
-  else
-    printf '%s\t%s\t%s then %s\n' "$(wt_lane "$a")" "$(wt_lane "$b")" "$la" "$lb"
+overlap_order() { overlap_order_set "$@"; printf '%s\t%s\t%s\n' "$OV_FIRST" "$OV_SECOND" "$OV_LABEL"; }
+overlap_order_set() { # les mêmes arguments : OV_FIRST, OV_SECOND, OV_LABEL
+  local ra rb ka kb na nb
+  overlap_lane "$1" "${3:-1}"; ra="$OL_RANK"; ka="${ra%%$'\t'*}|$OL_SINCE"; na="$OL_NAME"
+  overlap_lane "$2" "${3:-1}"; rb="$OL_RANK"; kb="${rb%%$'\t'*}|$OL_SINCE"; nb="$OL_NAME"
+  if [ "$kb" \< "$ka" ]; then OV_FIRST="$nb"; OV_SECOND="$na"; OV_LABEL="$nb (${rb#*$'\t'}) then $na (${ra#*$'\t'})"
+  else OV_FIRST="$na"; OV_SECOND="$nb"; OV_LABEL="$na (${ra#*$'\t'}) then $nb (${rb#*$'\t'})"; fi
+}
+# overlap_lane <wt> <gh> : OL_NAME, OL_RANK, OL_SINCE, lus une fois par couloir dans un même affichage (OL_WT, posé par overlap_status_kv)
+OL_WT=() OL_N=() OL_R=() OL_S=() OL_MEMO=0
+overlap_lane() {
+  local k
+  if [ "$OL_MEMO" = 1 ]; then
+    for ((k = 0; k < ${#OL_WT[@]}; k++)); do
+      if [ "${OL_WT[$k]}" = "$1" ]; then OL_NAME="${OL_N[$k]}"; OL_RANK="${OL_R[$k]}"; OL_SINCE="${OL_S[$k]}"; return 0; fi
+    done
   fi
+  lane_rank_set "$1" "$2"; OL_RANK="$LANE_RANK"; lane_since_set "$1"; OL_SINCE="$LANE_SINCE"; wt_lane_set "$1"; OL_NAME="$WT_LANE"
+  if [ "$OL_MEMO" = 1 ]; then OL_WT+=("$1"); OL_N+=("$OL_NAME"); OL_R+=("$OL_RANK"); OL_S+=("$OL_SINCE"); fi
 }
 # overlap_hook_line <wt> → « CHEVAUCHEMENT=… » pour le contexte de démarrage (git local seul, trois fichiers au plus), ou rien
 overlap_hook_line() {
-  local lane files n shown out=""
+  local lane files one shown n out=""
   while IFS=$'\t' read -r lane files; do
     [ -n "$lane" ] || continue
-    n="$(printf '%s\n' "$files" | awk -F', ' '{print NF}')"
-    shown="$(printf '%s\n' "$files" | awk -F', ' '{for (i = 1; i <= NF && i <= 3; i++) printf "%s%s", (i > 1 ? ", " : ""), $i}')"
-    [ "$n" -le 3 ] || shown="$shown, …"
+    n=0; shown=''; files="$files, "
+    while [ -n "$files" ]; do
+      one="${files%%, *}"; files="${files#*, }"; n=$((n + 1))
+      if [ "$n" -gt 3 ]; then shown="$shown, …"; break; fi
+      shown="$shown${shown:+, }$one"
+    done
     out="${out:+$out ; }$lane ($shown)"
   done < <(overlaps "$1")
   [ -z "$out" ] || printf 'OVERLAP=%s — merge order: lab status %s.\n' "$out" "$P_NAME"
 }
-# overlap_status_kv : un bloc par paire de couloirs qui se chevauchent (lab status), chaque paire une seule fois
+# overlap_status_kv [wt] : un bloc par paire de couloirs qui se chevauchent (lab status), chaque paire une seule fois ; avec <wt>, les
+# seules paires de ce couloir (lab status <projet> <couloir>)
 overlap_status_kv() {
-  local wt lane files other order seen=" "
-  while IFS= read -r wt; do
-    while IFS=$'\t' read -r lane files; do
-      [ -n "$lane" ] || continue
-      case "$seen" in *" $lane:$(wt_lane "$wt") "*) continue ;; esac
-      seen="$seen$(wt_lane "$wt"):$lane "
-      other="$(worktree_path "$lane")"; order="$(overlap_order "$wt" "$other")"
-      kv OVERLAP "$(wt_lane "$wt") ↔ $lane"; kv FILES "$files"
-      kv ORDER "$(printf '%s' "$order" | cut -f3) — $(printf '%s' "$order" | cut -f2) resyncs after $(printf '%s' "$order" | cut -f1) is merged (lab sync $P_NAME $(printf '%s' "$order" | cut -f2))"
-      sep
-    done < <(overlaps "$wt")
-  done < <(live_lanes)
+  local i j files wt me lane seen=" "
+  overlaps_load; OL_MEMO=1
+  while IFS=$'\t' read -r i j files; do
+    [ -n "$i" ] || continue
+    wt="${OV_WT[$i]}"; if same_path "${OV_WT[$j]}" "$wt"; then continue; fi
+    wt_lane_set "${OV_WT[$j]}"; lane="$WT_LANE"; wt_lane_set "$wt"; me="$WT_LANE"
+    case "$seen" in *" $lane:$me "*) continue ;; esac
+    seen="$seen$me:$lane "
+    if [ -n "${1:-}" ] && ! same_path "$wt" "$1" && ! same_path "${OV_WT[$j]}" "$1"; then continue; fi
+    overlap_order_set "$wt" "$P_ROOT/.worktrees/$lane"
+    kv OVERLAP "$me ↔ $lane"; kv FILES "$files"
+    kv ORDER "$OV_LABEL — $OV_SECOND resyncs after $OV_FIRST is merged (lab sync $P_NAME $OV_SECOND)"
+    sep
+  done <<<"$OV_ROWS"
+  OL_MEMO=0 OL_WT=() OL_N=() OL_R=() OL_S=()
 }
 # overlap_merge_warn <wt> : avertissement non bloquant de lab merge — les couloirs à resynchroniser après cette fusion
 overlap_merge_warn() {

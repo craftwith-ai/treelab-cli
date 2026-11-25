@@ -33,7 +33,7 @@ Treelab is sold as a subscription to updates, monthly or yearly, per seat; price
     lab setup      install, after agreement in the terminal
     lab doctor     check the installation
     cd <repository>
-    lab onboard    three screens, repository registered, agent opened in the main tab
+    lab onboard    three screens, repository registered, agent opened in a welcome tab
 
 `lab onboard` runs inside a git repository. It presents the words (project, lane, batch), the cycle and the guarantees, registers the repository without touching its files, then opens an agent that guides you to your first batch delivered as a pull request. Running it again creates nothing twice; without cmux, it prints the command to run (`NEXT_COMMAND`).
 

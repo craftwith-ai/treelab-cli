@@ -4,20 +4,77 @@
 set -euo pipefail
 
 self="${BASH_SOURCE[0]}"
-while [ -L "$self" ]; do t="$(readlink "$self")"; case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac; done
-LAB_ROOT="$(cd "$(dirname "$self")/.." && pwd -P)"
+# dossier d'un chemin par expansion, jamais dirname : deux processus de moins à chaque appel (lot 04 de charge-processeur)
+while [ -L "$self" ]; do
+  t="$(readlink "$self")"
+  case "$t" in /*) self="$t" ;; *) case "$self" in */*) self="${self%/*}/$t" ;; *) self="$t" ;; esac ;; esac
+done
+case "$self" in */*) LAB_ROOT="${self%/*}/.." ;; *) LAB_ROOT=.. ;; esac
 # lab account record tourne à chaque rafraîchissement de la statusline : chemin court (trois bibliothèques au lieu de vingt), muet,
-# toujours 0 (couloir comptes-complets, lot 01)
+# toujours 0 (couloir comptes-complets, lot 01) ; un appel de la même session dans la minute s'arrête après un seul jq, sans même
+# résoudre LAB_ROOT (lot 04 de charge-processeur) : aucune lecture relative au dossier courant n'y a lieu
 case "${1:-} ${2:-}" in
   "account record"|"account relever"|"compte record"|"compte relever")
-    { . "$LAB_ROOT/lib/log.sh"; . "$LAB_ROOT/lib/project.sh"; . "$LAB_ROOT/lib/comptes.sh"; COMPTE_SANS_AUTH=1 compte_relever; } >/dev/null 2>&1 || true
+    { . "$LAB_ROOT/lib/log.sh"; . "$LAB_ROOT/lib/project.sh"; . "$LAB_ROOT/lib/comptes.sh"; COMPTE_SANS_AUTH=1 compte_releve_court; } >/dev/null 2>&1 || true
     exit 0 ;;
+esac
+LAB_ROOT="$(cd "$LAB_ROOT" && pwd -P)"
+case "${1:-} ${2:-}" in
   # la garde passe avant chaque outil d'un agent : ses bibliothèques seules, comme hooks/guard-tool.sh (lot 01 de charge-processeur)
   "hook guard-tool"|"hook guard-bash") . "$LAB_ROOT/lib/guard_fast.sh"; guard_main "$2"; exit 0 ;;
+  # une session qui démarre : ses bibliothèques seules, comme hooks/session-start.sh (lot 02 de charge-processeur)
+  "hook session-start") . "$LAB_ROOT/lib/guard_fast.sh"; session_main; exit 0 ;;
+  # l'écrivain de l'instantané (lot 03 d'app-treelab), lancé à chaque changement d'un couloir quand Treelab.app lit : ses bibliothèques
+  # seules (16 ms au lieu de 47) ; tout réécrire (lab app snapshot sans couloir, autre version) passe par le lab complet
+  "app snapshot")
+    # le chemin court sert pending et des couloirs nommés (projet et au moins un couloir, après --reader <pid>)
+    case "${3:-}" in --pending) snap_fast=1 ;; --reader) snap_fast=$(($# >= 6)) ;; *) snap_fast=$(($# >= 4)) ;; esac
+    if [ "${LAB_SNAP_FULL:-0}" != 1 ] && [ "$snap_fast" = 1 ]; then
+      for f in log git kv lang project facts docs lock recette words watch waiting merge tower ressource rdv sync close snapshot app; do
+        . "$LAB_ROOT/lib/$f.sh"
+      done
+      shift 2; app_snapshot "$@"; exit 0
+    fi ;;
 esac
 . "$LAB_ROOT/lib/log.sh"; . "$LAB_ROOT/lib/git.sh"
-LAB_ROOT="$(real_path "$LAB_ROOT")"; export LAB_ROOT   # casse réelle du chemin (lib/git.sh) : liens, hooks Codex et chemins de projet en dépendent
-for f in project lock cmux docs recette merge migrations codex close services rdv words proof watch sync promote ressource deploy onboard guide comptes cloud night ci_measure tower entitlement; do . "$LAB_ROOT/lib/$f.sh"; done
+# casse réelle du chemin (real_path de lib/git.sh, sans son cd : LAB_ROOT est déjà physique) : liens, hooks Codex et chemins de projet
+# en dépendent ; un processus au lieu de trois (lot 04 de charge-processeur)
+root_case="$(exec stat -f %R "$LAB_ROOT" 2>/dev/null)" || root_case=''
+if [ -n "$root_case" ] && [ -d "$root_case" ] && [ "$root_case" -ef "$LAB_ROOT" ]; then LAB_ROOT="$root_case"; fi
+unset root_case
+export LAB_ROOT
+# un module par ligne, ordre alphabétique : deux couloirs qui en ajoutent chacun un ne se heurtent plus ; l'ordre est sans effet
+# (declare -f et set identiques, lot 01 de conflits-repetes) ; log et git, chargés plus haut, restent à part
+LAB_MODULES=(
+  ci_measure
+  close
+  cloud
+  cmux
+  codex
+  comptes
+  deploy
+  docs
+  entitlement
+  guide
+  lock
+  merge
+  migrations
+  night
+  onboard
+  project
+  promote
+  proof
+  rdv
+  recette
+  ressource
+  services
+  snapshot
+  sync
+  tower
+  watch
+  words
+)
+for f in "${LAB_MODULES[@]}"; do . "$LAB_ROOT/lib/$f.sh"; done
 unset NEW_ROLE   # rôle du couloir créé : posé par lab tower seul, jamais hérité de l'environnement (revue du lot 03 d'autonomie-tours)
 
 # usage : l'usage technique sur stderr, code 2. Pour une commande connue (refus de syntaxe), seules ses lignes, puis sa page d'aide ;
@@ -30,8 +87,8 @@ usage() {
 usage: lab <command> [options]
   help   [command]           the help: commands by moment, then the details of one command
   onboard [--agent claude|codex]   guided tour in a git repository: three screens, repository registered without touching its
-         files, tower of a new project created (TOWER=), agent opened in the project's main tab with the onboarding skill;
-         without cmux, NEXT_COMMAND
+         files, tower of a new project created (TOWER=), agent opened in the project's welcome tab with the onboarding skill,
+         closed by itself once the first lane is open (WELCOME=closing); without cmux, NEXT_COMMAND
   init   [name] [--root <path>] [--docs repo|local] [--owner shared|other] [--agent claude|codex]
          recette=production written by hand in the config (kept): without a deploy. target, lab next opens the acceptance
          with NOTE=acceptance-production — merge the PR, wait for the deployment of its target branch (staging if it
@@ -50,11 +107,22 @@ usage: lab <command> [options]
          opens a free session (LANE_PHASE=permanent). PERMANENT=yes|no ; lab status and lab list show PERMANENT=yes
   tower  [project] [--no-install]   creates the tower of the project (permanent lane tower, Claude in bypassPermissions),
          TOWER=created; then TOWER=present and one block per lane: LANE, WAITS_FOR=you|merge|acceptance|close|date|ci|nothing, WHY,
-         SESSION; PROPOSE=lift-deny <rules> while the user has not answered; lab onboard creates it for a new project
+         SESSION; PROPOSE=lift-deny <rules> while the user has not answered; lab onboard creates it for a new project;
+         MAIN_TAB=, MAIN_TAB_ACTION= and HANDOVER= while an old main tab or a handover to read is left (nothing otherwise);
+         run by the tower, its check hands that tab over alone; TOWER_SKILL=told: an older tower session asked to reread its skill
   tower  [project] --lift-deny [--yes|--no]   push and merge deny rules of the shared .claude/settings.json (DENY_RULE=);
          --yes removes them only, in the tower, commit pushed (LIFTED=); --no keeps them; the answer is written once
   tower  --all   offers a tower to each project without one: CANDIDATE=, SKIPPED=<p> <cause>; terminal: [y/N] per
          project (CREATED=, DECLINED=, FAILED=); without a terminal nothing created, CONFIRM=needed
+  tower  [project] --main-tab [--yes|--no]   the old main tab, tower or user only, nothing asked: MAIN_TAB=absent|shell|agent|
+         busy|unreadable, MAIN_TAB_ACTION=started|running|closed|waiting|deferred|invite|kept; an idle terminal closed
+         (MAIN_TAB_CLOSE=closed|deferred|last|changed); a resting claude session copied without a screen into its handover
+         (never saved, 10 min and 2 dollars at most, else its last 10 messages), then its tab closed; a codex session invited
+         once (INVITE=sent), its handover written by lab 24 h after; --no keeps the tab for good
+  tower  [project] --handover   run by the session of the main tab, or by the same conversation resumed elsewhere, text on
+         stdin (three headings, 8 KB at most): stored (HANDOVER=), the tower told (TOWER_TOLD=), the tab closed after its turn
+  tower  [project] --handover-done <file>   tower only: the handover is read, no longer shown
+  tower  --all --main-tab   under main_tab=handover only: the tower of each project with a main tab and none (CREATED=, SKIPPED=)
   open   [project] <lane> [--agent claude|codex] [--prompt <text>|-]
   launch [project] <lane> [--agent claude|codex] [--goal <addition>]     rebuilds the Goal and becomes the agent
   launch [project] <lane> --resume <conversation> [--account <label>]   resumes the Claude conversation (chosen account)
@@ -113,12 +181,26 @@ usage: lab <command> [options]
          sends the close, confirmed aloud, to the tower (CLOSE=ordered)
   ginkgo reply <project> [--since <utc-time>]   the last answer of the tower: REPLY=, TURN=done|running, or REPLY=none
   ginkgo news <project> --open yes|no [--forget <key>]...   what waits for you and was not said yet, and how to say
-         it (read by Ginkgo every 10 s): SPEAK=, QUIET=yes|no, CHANNEL=voice|notify|hold|none, NEW=, NEW_n_LANE=,
+         it (read by Ginkgo every 30 s): SPEAK=, QUIET=yes|no, CHANNEL=voice|notify|hold|none, NEW=, NEW_n_LANE=,
          NEW_n_KIND=, NEW_n_TEXT=, NEW_n_KEY=, RECAP=, RECAP_n_LANE=, RECAP_n_KEY= ; --forget: a spoken news the app
          could not say is new again ; ginkgo_speak= and ginkgo_quiet= in ~/.lab/config
   ginkgo news <project> --baseline   what waits now is seen and never announced (Ginkgo at launch)
+  app lanes [project [lane…]]   read only, for Treelab.app: per lane outside the tower PROJECT=, LANE=, WAITS_FOR=,
+         WHY=, SESSION=, BATCH=, BATCH_STATE=, FOR_YOU=yes|no and its paths to watch (WATCH=, WATCH_ENTRIES=); per
+         project ROOT=, LANES=, WAITING=, TERMINAL_APP=, TERMINAL_SOURCE=project|global|cmux|fork|none; then
+         WAITING_FOR_YOU=, LANG=, IGNORE=, TERMINAL_FOUND= per terminal app installed ; no network, no tower, nothing written.
+         Per lane also WATCH_PID= (session, watchers), WAKE_AT= (epoch) and WRITTEN= (paths lab keeps in the snapshot)
+  app snapshot [--reader <pid>] [project [lane…]]   for Treelab.app: rewrites its snapshot of the lanes (the blocks of
+         app lanes, one file each, in the state folder) — everything, one project or some lanes; --reader first marks
+         the app as a live reader. Without a live reader nothing is written (READER=none). SNAPSHOT=, WRITTEN=,
+         UNCHANGED=, REMOVED= ; a file is rewritten only when its content changes
+  app focus <project> <lane>   brings the lane's cmux tab to the front (ACTION=tab), otherwise its project's workspace
+         (ACTION=workspace), through the cmux socket or, when it refuses the caller, the cmux AppleScript: WAY=socket or
+         WAY=applescript, and APP= the driven app; never starts an agent, a session or a tab. terminal_app= (path of a
+         .app) in the project config, else in ~/.lab/config, makes lab drive that app (the Treelab fork of cmux) instead
   plan   [project]           overview of the lanes, recomputed at display
-  list   [project]           status
+  list   [project]
+  status [project] [lane]    with a lane: the project, that lane and its overlaps only
   sweep  [project] [--dry-run]
   top    [--fast] [--cut|--wake|--explain <target>]  snapshot of the machine, then the cut chosen with one click:
          sessions tied to project, lane and cmux tab (BLOCK=SESSION), memory state (BLOCK=MACHINE), families outside
@@ -136,7 +218,7 @@ usage: lab <command> [options]
          --yes = agreement already given), saves each file first; --undo: restores the last save. MCP_CHANGE=,
          MCP_SKIP= (with its reason), MCP_ACTION=applied|declined|preview|none
   widget install|remove   the lab top dot (every 60 s) plus six system modules (processor, memory, disks, network,
-         battery, temperatures via macmon) every 10 s, each a bar item with its menu; install poses macmon through brew
+         battery, temperatures via macmon) every 30 s, each a bar item with its menu; install poses macmon through brew
          and SwiftBar is shown if missing (its brew command): WIDGET=, PLUGIN=, MODULES=, MACMON=, LOGIN_ITEM= ; remove
          takes the dot and the six modules away, keeps macmon and the user preferences
   widget modules [list|on <module>|off <module>]   the active bar modules, persisted: MODULES=
@@ -163,6 +245,14 @@ usage: lab <command> [options]
   services [project] list [<lane>]            verb list of the hook (15 s max): LANE=, ORPHAN=yes|no, SERVICE=<lane> <resource>;
          lab sweep and lab doctor name the closed lanes it lists, never stopping anything
   services [project] stop --orphans           stop once per closed lane that list names; goes on after a failure. STOPPED=, FAILED=
+  docker [project]           reads the free space of the Docker machine (DOCKER=ok|missing|down, FREE_GB=, USED_PCT=,
+         ROOM=ok|short: 10 GB free and under 85% used) and counts the leftovers labelled sh.treelab.project=<project>
+         (CONTAINERS=, IMAGES=, CACHE=, UNLABELED=); Docker missing or silent: rc 0, nothing read
+  docker clean [project]     removes the stopped containers and the images older than LAB_DOCKER_IMAGE_DAYS (7) of the project,
+         one identifier at a time, and the old cache of its builder lab-<project>; never a resource of another project nor
+         without label. CONTAINERS_REMOVED=, IMAGES_REMOVED=, IMAGES_KEPT=, CACHE_FREED=
+  docker prepare [project]   creates the builder lab-<project> once and fetches the small image that reads the free space
+         (BUILDER=, BUILDER_STATE=created|inactive|running|stopped, PROBE=present|pulled|failed)
   deploy [project] <target> [--with <lane>…] [--retire <lane>…] [--record] [--dry-run]   deploys a declared target
          (deploy.<target>=, probe.<target>=) from <remote>/<base> + lanes (serve/<target>); refuses to erase a served
          unmerged lane; TARGET=, REV=, BASE=, INCLUDED=, RETIRED=, VERIFIED= ; --dry-run: PART=, LOST=, FILES=
@@ -234,7 +324,7 @@ usage: lab <command> [options]
 USAGE
 )"
   [ -z "${CMD:-}" ] || part="$(printf '%s\n' "$all" | awk -v c="$CMD" 'NR == 1 {next} /^  [^ ]/ {keep = ($1 == c)} keep')"
-  if [ -n "$part" ]; then printf '%s\n%s\n\nDetails: lab help %s\n' "$(printf '%s\n' "$all" | head -1)" "$part" "$CMD"
+  if [ -n "$part" ]; then printf '%s\n%s\n\nDetails: lab help %s\n' "$(head -1 <<<"$all")" "$part" "$CMD"
   else printf '%s\n' "$all"; fi | onboard_wrap "$(onboard_cols)" >&2
   exit 2
 }
@@ -264,10 +354,14 @@ lane_agent() {
   # la tour tourne sous Claude seul, en bypassPermissions (lot 03 d'autonomie-tours) : Codex n'a ni ce mode ni ses crochets
   [ "$1" = - ] || [ "$AGENT" = claude ] || ! lane_is_tower "$1" || die "lane $(wt_lane "$1") is the tower: it runs under Claude only (agent $AGENT refused) — lab next $P_NAME $(wt_lane "$1") --agent claude"
 }
-agent_display() { # <wt|-> → « <agent> (<source> <fichier>) » pour AGENT= ; la note d'une valeur inconnue part sur stderr, sans arrêt
-  local r a src note; r="$(agent_resolve "$1")"; a="${r%%$'\t'*}"; src="${r#*$'\t'}"
-  note="$(agent_note "$a" "$src" "$1")"; [ -z "$note" ] || warn "$note"
-  case "$src" in default) printf '%s (%s)\n' "$a" "$src" ;; *) printf '%s (%s %s)\n' "$a" "$src" "$(agent_source_file "$src" "$1")" ;; esac
+# agent_display <wt|-> → « <agent> (<source> <fichier>) » pour AGENT= ; la note d'une valeur inconnue part sur stderr, sans arrêt
+agent_display() { agent_display_set "$1"; printf '%s\n' "$AGENT_DISPLAY"; }
+agent_display_set() { # <wt|-> : AGENT_DISPLAY, sans processus pour un agent connu
+  local f=''
+  agent_resolve_set "$1"
+  case "$AGENT_NAME" in claude|codex) ;; *) warn "$(agent_note "$AGENT_NAME" "$AGENT_SOURCE" "$1")" ;; esac
+  case "$AGENT_SOURCE" in lane) f=" $1/.lab/meta" ;; project) f=" $LAB_PROJECTS/$P_NAME/config" ;; global) f=" $LAB_HOME/config" ;; esac
+  AGENT_DISPLAY="$AGENT_NAME ($AGENT_SOURCE$f)"
 }
 # session_name <dossier> → nom d'affichage de la session : le couloir, ou <projet>-main dans le checkout principal (plusieurs
 # projets ont chacun leur « main »)
@@ -318,45 +412,94 @@ copy_include() { # <root> <wt> : copie les fichiers locaux listés dans projects
     if [ -L "$2/$rel" ] && [ ! -e "$2/$rel" ]; then warn "include: $rel is a link to $(readlink "$2/$rel"), missing from the worktree"; fi
   done <"$inc"
 }
-wt_cmux_value() { # <worktree> <layout|workspace|surface> — relit aussi l'ancien fichier contenant seulement le workspace
-  local file="$1/.lab/cmux" first
-  [ -f "$file" ] || return 0
-  first="$(head -1 "$file" 2>/dev/null || true)"
+wt_cmux_value() { wt_cmux_set "$1" "$2"; [ -z "$WT_CMUX" ] || printf '%s\n' "$WT_CMUX"; } # <worktree> <layout|workspace|surface> — relit aussi l'ancien fichier contenant seulement le workspace
+wt_cmux_set() { # les mêmes arguments : WT_CMUX, sans processus
+  local first=''
+  WT_CMUX=''
+  [ -f "$1/.lab/cmux" ] && [ -r "$1/.lab/cmux" ] || return 0
+  IFS= read -r first <"$1/.lab/cmux" || true
   case "$first" in
-    *=*) sed -n "s/^$2=//p" "$file" | head -1 ;;
-    *) [ "$2" = workspace ] && printf '%s\n' "$first"; return 0 ;;
+    *=*) kv_value "$1/.lab/cmux" "$2" || true; WT_CMUX="$KV_VALUE" ;;
+    *) if [ "$2" = workspace ]; then WT_CMUX="$first"; fi ;;
   esac
+  # lot 02 d'app-treelab : les références d'une autre app que celle pilotée (app= du fichier, absente pour cmux) ne désignent jamais
+  # un espace ni un onglet de celle-ci — cmux et le fork numérotent les leurs chacun de leur côté
+  case "$2" in workspace|surface) ;; *) return 0 ;; esac
+  [ -n "$WT_CMUX" ] || return 0
+  terminal_resolve; kv_value "$1/.lab/cmux" app || true
+  [ "$KV_VALUE" = "$TA_APP" ] || WT_CMUX=''
 }
 wt_ws() { wt_cmux_value "$1" workspace; }
 wt_surface() { wt_cmux_value "$1" surface; }
 wt_cmux_layout() { wt_cmux_value "$1" layout; }
-write_cmux_target() { # <worktree> <workspace> <surface>
-  mkdir -p "$1/.lab"
-  printf 'layout=project-tabs\nworkspace=%s\nsurface=%s\nname=%s\n' "$2" "$3" "$(basename "$1")" >"$1/.lab/cmux"
+write_cmux_target() { # <worktree> <workspace> <surface> — app= : le paquet de l'app pilotée, sauf cmux (fichier d'avant inchangé)
+  mkdir -p "$1/.lab"; terminal_resolve
+  { printf 'layout=project-tabs\nworkspace=%s\nsurface=%s\nname=%s\n' "$2" "$3" "$(basename "$1")"
+    [ -z "$TA_APP" ] || printf 'app=%s\n' "$TA_APP"; } >"$1/.lab/cmux"
 }
-# Contexte d'un worktree en KEY=value (utilisé par list, status, hooks)
+# Contexte d'un worktree en KEY=value (utilisé par list et status, dans une lecture groupée : reads_open a lu les fiches et les PR)
 describe_wt() {
-  local wt="$1" slug br lot st pr ws surface
-  slug="$(basename "$wt")"; br="$(branch_name "$wt")"
-  lot="$(wt_lot_file "$wt")"; st="$(lot_state "$lot")"
-  kv SLUG "$slug"; kv LANE "$(wt_lane "$wt")"; kv PATH "$wt"; kv BRANCH "${br:-detached-HEAD}"; kv KIND "$(wt_meta "$wt" kind)"; kv BASE "$(wt_meta "$wt" base)"
-  kv BATCH "${lot:+$(basename "$lot" .md)}"; kv BATCH_STATE "${st:-}"
-  kv LANE_PHASE "$(lane_phase "$wt")"; kv LAST_BATCH "$(lane_last_lot "$wt" "$lot")"
-  local w; w="$(wait_lane_first "$wt")"; [ -z "$w" ] || kv WAITING "$(wait_summary "$w")"   # lot 02 d'autonomie-tours
+  local wt="$1" meta="$1/.lab/meta" br lot lane name
+  head_branch_set "$wt"; br="$HEAD_BRANCH"; wt_lot_set "$wt"; lot="$WT_LOT"; name="${lot##*/}"; wt_lane_set "$wt"; lane="$WT_LANE"
+  kv SLUG "${wt##*/}"; kv LANE "$lane"; kv PATH "$wt"; kv BRANCH "${br:-detached-HEAD}"
+  kv_value "$meta" kind || true; kv KIND "$KV_VALUE"; kv_value "$meta" base || true; kv BASE "$KV_VALUE"
+  lot_state_set "$lot"; kv BATCH "${name%.md}"
+  # shellcheck disable=SC2153 # posée par lib/docs.sh
+  kv BATCH_STATE "$LOT_STATE"
+  lane_phase_set "$wt"; kv LANE_PHASE "$LANE_PHASE"; lane_last_set "$wt" "$lot"; kv LAST_BATCH "$LANE_LAST"
+  wait_first_set "$wt"; if [ -n "$WAIT_FIRST" ]; then wait_summary_set "$WAIT_FIRST"; kv WAITING "$WAIT_SUMMARY"; fi   # lot 02 d'autonomie-tours
   ! lane_permanent "$wt" || kv PERMANENT yes   # jamais candidat au retrait ni à la recette (lot 01 d'autonomie-tours)
-  kv AGENT "$(agent_display "$wt")"
-  ! has_cmux || kv CLOUD "$(cloud_display "$P_NAME" "$wt")"   # règle cloud du couloir, sans cmux rien (lot 03 de cmux-pro)
+  agent_display_set "$wt"; kv AGENT "$AGENT_DISPLAY"
+  if has_cmux; then cloud_display_set "$P_NAME" "$wt"; kv CLOUD "$CLOUD_DISPLAY"; fi   # règle cloud du couloir, sans cmux rien (lot 03 de cmux-pro)
   if cloud_live "$wt" || cloud_paused "$wt"; then kv CLOUD_BATCH "$(cloud_session_line "$wt")"; fi   # depuis quand, dernier push, attente ou pause (lot 09)
-  if is_clean "$wt"; then kv CLEAN yes; else kv CLEAN no; fi
-  pr="$(pr_info "$P_ROOT" "$br")"; kv PR "${pr:+#$(printf '%s' "$pr" | cut -f1) $(printf '%s' "$pr" | cut -f2) → $(printf '%s' "$pr" | cut -f3)}"
-  local lock; lock="$(lock_status "$wt")"
+  lane_status_set "$wt"; if lane_status_clean; then kv CLEAN yes; else kv CLEAN no; fi
+  pr_info_set "$P_ROOT" "$br"; kv PR "${PR_NUM:+#$PR_NUM $PR_STATE → $PR_TARGET}"
+  lock_status_set "$wt"
   # session vivante dans le couloir sans verrou (relance en masse, lot 01 de reprise-apres-migration) : nommée au lieu de « free »
   # verrou mort compris (session tuée sans SessionEnd, relayée par une session restée sans verrou : revue du lot)
-  case "$lock" in free|dead:*) if lane_unlocked_live "$wt"; then lock="unlocked-live:$UNLOCKED_LIVE"; fi ;; esac
-  kv LOCK "$lock"
-  watch_status_kv "$(wt_lane "$wt")"   # issue des veilleurs de livraison du couloir (lot 14)
-  ws="$(wt_ws "$wt")"; surface="$(wt_surface "$wt")"; kv WORKSPACE "$ws"; kv SURFACE "$surface"
+  case "$LOCK_STATE" in free|dead:*) if lane_unlocked_live "$wt" '' locked-checked; then LOCK_STATE="unlocked-live:$UNLOCKED_LIVE"; fi ;; esac
+  kv LOCK "$LOCK_STATE"
+  watch_status_kv "$lane"   # issue des veilleurs de livraison du couloir (lot 14)
+  wt_cmux_set "$wt" workspace; kv WORKSPACE "$WT_CMUX"; wt_cmux_set "$wt" surface; kv SURFACE "$WT_CMUX"
 }
+# ---------- lecture groupée d'un projet (lot 02 de charge-processeur) ----------
+# reads_open <gh|local> [couloir] [documents] : les fiches et treeplans de tous les couloirs (ou du seul couloir) lus en un awk, avec les
+# documents donnés (lignes de facts_load) ; gh : la PR de chaque branche et celles des veilleurs en échec — couloirs affichés, promotion
+# et READS_WATCH — en une demande. Le temps d'un affichage : reads_close oublie tout, aucune commande qui écrit ne s'en sert
+READS_WATCH=()
+reads_open() {
+  local wt f list="${3:-}" brs='' first=1
+  facts_begin; watch_forget
+  for wt in "$P_ROOT"/.worktrees/*/; do
+    [ -d "$wt" ] || continue; wt="${wt%/}"
+    head_branch_set "$wt"
+    if [ "$first" = 1 ]; then first=0; else brs="$brs"$'
+'; fi
+    brs="$brs$HEAD_BRANCH"
+    if [ -n "${2:-}" ] && [ "${wt##*/}" != "$2" ]; then continue; fi
+    docs_dir_set "$wt"; lot_slug_set "$wt"; wt_lane_set "$wt"
+    # shellcheck disable=SC2153 # posée par lib/docs.sh
+    current_lot_set "$DOCS_DIR" "$LOT_SLUG" "$WT_LANE"; [ -n "$CURRENT_LOT" ] || current_lot_set "$DOCS_DIR" "${wt##*/}" "$WT_LANE"
+    case "$CURRENT_LOT" in
+      "$DOCS_DIR/lots/$WT_LANE"/*) ;;
+      *) if [ -f "$CURRENT_LOT" ] && [ -r "$CURRENT_LOT" ]; then list="$list${list:+$'
+'}"$'F	'"$CURRENT_LOT"; fi ;;
+    esac
+    for f in "$DOCS_DIR/lots/$WT_LANE"/lot-[0-9]*.md "$DOCS_DIR/treeplans/$WT_LANE.md"; do
+      [ -f "$f" ] && [ -r "$f" ] || continue
+      case "$f" in */treeplans/"$WT_LANE.md") list="$list${list:+$'
+'}"$'T	'"$f" ;; *) list="$list${list:+$'
+'}"$'F	'"$f" ;; esac
+    done
+    if [ "$1" = gh ]; then watch_prepare "$LAB_STATE/watch/$P_NAME/$WT_LANE"; fi
+  done
+  facts_load "$list"
+  [ "$1" = gh ] || return 0
+  for f in "${READS_WATCH[@]+"${READS_WATCH[@]}"}"; do watch_prepare "$LAB_STATE/watch/$P_NAME/$f"; done
+  [ "$first" = 0 ] || [ -n "$READS_PRS" ] || return 0
+  reads_gh_load "$first" "$brs" "$READS_PRS"
+}
+reads_close() { facts_end; reads_gh_end; watch_forget; lane_status_forget; READS_WATCH=(); }
 
 # ---------- init ----------
 # init_config_replace <config> <neuve> : sous le verrou du registre — lignes non gérées par lab init recopiées, diff, remplacement
@@ -436,13 +579,13 @@ CFG
 }
 
 # ---------- onboard : de l'installation au premier couloir (lot 11) ----------
-# onboard_main_tab <projet> → « <workspace>⇥<surface> » de l'onglet main déjà présent dans l'ancre du projet, vide sinon : lu avant
-# cmux_prepare_project, il dit si l'onglet existait avant cette exécution
-onboard_main_tab() {
+# onboard_welcome_tab <projet> → « <workspace>⇥<surface> » de l'onglet d'accueil déjà présent dans l'ancre du projet, vide sinon : lu
+# avant son ouverture, il dit si l'onglet existait avant cette exécution
+onboard_welcome_tab() {
   local ws surface
   ws="$(cmux_group_anchor "$1")"; [ -n "$ws" ] || return 0
   ws="$(cmux_ws_uuid "$ws")"; [ -n "$ws" ] && [ "$(cmux_ws_title "$ws")" = "$1" ] || return 0
-  surface="$(cmux_named_surface "$ws" main)"; [ -z "$surface" ] || printf '%s\t%s\n' "$ws" "$surface"
+  surface="$(cmux_named_surface "$ws" "$ONBOARD_TAB")"; [ -z "$surface" ] || printf '%s\t%s\n' "$ws" "$surface"
 }
 # onboard_tab_busy <workspace> <surface> → ce qui empêche de taper dans un onglet qui existait déjà : « illisible » si cmux ne sait
 # pas dire ce qui y tourne (un doute, jamais une absence), sinon le nom du premier programme qui n'est pas un shell au repos —
@@ -452,16 +595,17 @@ onboard_tab_busy() {
   pids="$(cmux_surface_pids "$1" "$2")" || { printf 'unreadable\n'; return 0; }
   for p in $pids; do
     comm="$(ps -o comm= -p "$p" 2>/dev/null || true)"; comm="${comm##*/}"; comm="${comm#-}"
-    case "$comm" in ''|zsh|bash|sh|fish|login|cmux*) ;; *) printf '%s\n' "$comm"; return 0 ;; esac
+    case "$comm" in ''|zsh|bash|sh|fish|login|cmux*|'<defunct>') ;; *) printf '%s\n' "$comm"; return 0 ;; esac
   done
 }
 # onboard_name_ok <nom> : lettres sans accent, chiffres, point, tiret, tiret bas, sans point ni tiret en tête — jugé en locale C,
 # où une lettre accentuée n'entre dans aucun intervalle
 onboard_name_ok() { (LC_ALL=C; case "$1" in ''|*[!A-Za-z0-9._-]*|.*|-*) exit 1 ;; esac); }
 # lab onboard [--agent claude|codex] : trois écrans (lib/onboard.sh), puis le dépôt courant enregistré sans rien y écrire (lab init,
-# docs=local) et l'agent ouvert dans l'onglet main du projet avec le skill onboarding. Tout refus précède la première écriture ;
-# une relance n'enregistre rien en double. Sans cmux, ou si l'onglet main existait déjà et porte autre chose qu'un shell au repos,
-# la ligne sort en NEXT_COMMAND et rien n'est tapé.
+# docs=local), sa tour, et l'agent ouvert dans l'onglet welcome du projet avec le skill onboarding (lot 01 d'onglet-tower : plus
+# d'onglet main ; un main déjà là n'est jamais touché). Tout refus précède la première écriture ; une relance n'enregistre rien en
+# double. Sans cmux, ou si l'onglet welcome existait déjà et porte autre chose qu'un shell au repos, la ligne sort en NEXT_COMMAND et
+# rien n'est tapé.
 # Les messages sont repliés à la largeur du terminal (onboard_say, onboard_die) ; la commande à relancer reste entière sur stdout.
 cmd_onboard() {
   local agent="" root name new=0 known
@@ -503,42 +647,48 @@ cmd_onboard() {
   if [ "$new" = 1 ]; then kv REGISTERED new; else kv REGISTERED already; fi
   kv DOCS "$(docs_dir "$P_ROOT")"; kv CONFIG "$(project_dir "$P_NAME")/config"
   kv AGENT "$AGENT"
-  local prompt bytes target group ws surface before busy
+  local prompt bytes target group ws surface before busy initial
   prompt="$(onboard_prompt "$AGENT" "$P_NAME")"
   ONBOARD_LINE="cd $(shell_quote "$P_ROOT") && $(agent_command "$AGENT" "$(session_name "$P_ROOT")" "$prompt")"; bytes="$(byte_len "$ONBOARD_LINE")"
   if ! has_cmux; then
     [ "$new" = 0 ] || onboard_tower   # lot 04 d'autonomie-tours : seul un projet neuf reçoit sa tour, ici TOWER=skipped
     kv NEXT_COMMAND "$ONBOARD_LINE"; onboard_say "cmux not found: to open the agent, copy the command shown after NEXT_COMMAND= and run it."; return 0
   fi
-  before="$(onboard_main_tab "$P_NAME")"   # lu avant la tour : son ouverture crée l'onglet main du projet
-  # avant l'agent, chemin sur place compris ; le focus revient à main juste après. Un chemin trop long pour être tapé l'est aussi pour
-  # la tour : sautée avec cette cause, jamais un accueil sans TOWER= (revue)
+  before="$(onboard_welcome_tab "$P_NAME")"
+  # avant l'agent, chemin sur place compris ; le focus revient à welcome juste après. Un chemin trop long pour être tapé l'est aussi
+  # pour la tour : sautée avec cette cause, jamais un accueil sans TOWER= (revue)
   if [ "$new" = 1 ]; then
     if [ "$bytes" -le "$LAB_LINE_MAX" ]; then onboard_tower; else onboard_tower "the repository path is too long to be typed in a tab"; fi
   fi
-  [ "$bytes" -le "$LAB_LINE_MAX" ] || onboard_manual "the launch line is $bytes bytes (maximum $LAB_LINE_MAX): the repository path is too long to be typed in a tab"
-  target="$(cmux_prepare_project "$P_NAME" "$P_ROOT")" || onboard_manual "cmux: group or main tab of $P_NAME not found"
-  IFS=$'\t' read -r group ws <<<"$target"
-  surface="$(cmux_named_surface "$ws" main)"; [ -n "$surface" ] || onboard_manual "cmux: main tab of $P_NAME not found"
-  cmux_focus "$ws" "$surface" || onboard_manual "cmux: selecting the main tab failed"
+  [ ! -e "$(worktree_path "$ONBOARD_TAB")" ] || onboard_manual "a lane named $ONBOARD_TAB already exists in $P_NAME: its tab is not the onboarding tab, nothing was typed there"
+  target="$(cmux_prepare_project "$P_NAME" "$P_ROOT")" || onboard_manual "cmux: group or workspace of $P_NAME not found"
+  IFS=$'\t' read -r group ws initial <<<"$target"
+  surface="$(cmux_named_surface "$ws" "$ONBOARD_TAB")"
+  if [ -z "$surface" ]; then
+    surface="$(cmux_create_surface "$ws" "$ONBOARD_TAB" "$P_ROOT" false)" || onboard_manual "cmux: creating the $ONBOARD_TAB tab of $P_NAME failed"
+    cmux_drop_initial "$ws" "$initial" "$surface" "$P_NAME"
+  fi
+  cmux_focus "$ws" "$surface" || onboard_manual "cmux: selecting the $ONBOARD_TAB tab failed"
   kv GROUP "$group"; kv WORKSPACE "$ws"; kv SURFACE "$surface"
   if cmux_is_current_surface "$ws" "$surface"; then
-    # lab tourne déjà dans l'onglet main : depuis un vrai terminal l'agent y prend la place ; sans terminal (l'outil d'un agent), rien
+    # lab tourne déjà dans l'onglet welcome : depuis un vrai terminal l'agent y prend la place ; sans terminal (l'outil d'un agent), rien
     # n'est tapé dans la session qui appelle
     if [ "${LAB_TTY:-0}" = 1 ]; then kv ACTION in-place; WT="$P_ROOT"; exec_agent "$AGENT" "$prompt"; return 0; fi
-    kv ACTION ready; kv NEXT_COMMAND "$ONBOARD_LINE"; onboard_say "no terminal here: in the main tab, copy the command shown after NEXT_COMMAND= and run it."
+    kv ACTION ready; kv NEXT_COMMAND "$ONBOARD_LINE"; onboard_say "no terminal here: in the $ONBOARD_TAB tab, copy the command shown after NEXT_COMMAND= and run it."
   elif [ "$before" = "$ws"$'\t'"$surface" ] && busy="$(onboard_tab_busy "$ws" "$surface")" && [ -n "$busy" ]; then
-    # l'onglet main existait avant cette exécution : la ligne n'y est tapée que s'il ne porte que des shells au repos
+    # l'onglet welcome existait avant cette exécution : la ligne n'y est tapée que s'il ne porte que des shells au repos
     kv ACTION focused; kv NEXT_COMMAND "$ONBOARD_LINE"
     case "$busy" in
-      unreadable) onboard_say "cannot tell what runs in the main tab of $P_NAME: nothing was typed there. To open the agent, copy the command shown after NEXT_COMMAND= and run it." ;;
-      claude*|codex*) onboard_say "an agent already runs in the main tab of $P_NAME: nothing was typed there. Tell it your need, or close it then run lab onboard again." ;;
-      *) onboard_say "the main tab of $P_NAME is busy with $busy: nothing was typed there. Quit this program then run lab onboard again, or copy the command shown after NEXT_COMMAND= and run it." ;;
+      unreadable) onboard_say "cannot tell what runs in the $ONBOARD_TAB tab of $P_NAME: nothing was typed there. To open the agent, copy the command shown after NEXT_COMMAND= and run it." ;;
+      claude*|codex*) onboard_say "an agent already runs in the $ONBOARD_TAB tab of $P_NAME: nothing was typed there. Tell it your need, or close it then run lab onboard again." ;;
+      *) onboard_say "the $ONBOARD_TAB tab of $P_NAME is busy with $busy: nothing was typed there. Quit this program then run lab onboard again, or copy the command shown after NEXT_COMMAND= and run it." ;;
     esac
   else
-    cmux_submit "$ws" "$surface" "$ONBOARD_LINE" || onboard_manual "cmux: starting the agent in the main tab failed"
+    # trop long pour être tapé : welcome seul, ouvert dans le dépôt, la ligne à y copier
+    [ "$bytes" -le "$LAB_LINE_MAX" ] || onboard_manual "the launch line is $bytes bytes (maximum $LAB_LINE_MAX): the repository path is too long to be typed in a tab"
+    cmux_submit "$ws" "$surface" "$ONBOARD_LINE" || onboard_manual "cmux: starting the agent in the $ONBOARD_TAB tab failed"
     kv ACTION submitted; kv LINE_BYTES "$bytes"
-    onboard_say "agent opened in the main tab of $P_NAME: tell it your need, it opens your first lane."
+    onboard_say "agent opened in the $ONBOARD_TAB tab of $P_NAME: tell it your need, it opens your first lane, then this tab closes by itself."
   fi
 }
 # onboard_manual <cause> : cmux n'a pas pu ouvrir l'agent — le dépôt reste enregistré, la ligne sort entière en NEXT_COMMAND, code 1
@@ -563,6 +713,7 @@ cmd_new() {
   done
   [ "${#pos[@]}" -ge 1 ] || usage
   split_project_slug "${pos[@]}"; load_project "$PROJECT"; SLUG="$(normalize_slug "$SLUG")"
+  [ "$SLUG" != "$ONBOARD_TAB" ] || die "lane name $SLUG refused: it is the name of the onboarding tab — choose another name"
   lot_slug="$(normalize_slug "${lot_slug:-$SLUG}")"
   ! lot_slug_reserved "$lot_slug" || die "batch slug $lot_slug refused: a .c<number> ending is reserved for reopening a waiting batch (chore/<slug>.c<n>) — choose another name"
   case "$kind" in feat|fix|chore) ;; *) die "kind expected: feat, fix or chore" ;; esac
@@ -579,7 +730,9 @@ cmd_new() {
   [ -z "$(git -C "$P_ROOT" remote 2>/dev/null)" ] || git -C "$P_ROOT" fetch --quiet --prune "$P_REMOTE" "$base" 2>/dev/null || warn "fetch $P_REMOTE/$base impossible (offline?)"
   if has_remote_branch "$P_ROOT" "$base" "$P_REMOTE"; then start="$P_REMOTE/$base"; else start="$base"; fi
   ensure_local_ignores "$P_ROOT"; mkdir -p "$P_ROOT/.worktrees"
+  watch_prune_gone   # l'ancien couloir du même nom part avant que le nouveau existe : aucun veilleur hérité (lot 01 de restes-cloud)
   git -C "$P_ROOT" worktree add --quiet -b "$branch" "$wt" "$start"
+  rm -f "$LAB_STATE/$P_NAME/retire/$SLUG"   # lot 04 d'onglet-tower : aucun --retire hérité d'un couloir homonyme
   mkdir -p "$wt/.lab"; chmod 700 "$wt/.lab"
   printf 'kind=%s\nbase=%s\nagent=%s\ncreated=%s\nproject=%s\nstart=%s\nlane=%s\nlot=%s\nsession=grill\n' "$kind" "$base" "$agent" "$(date +%Y-%m-%dT%H:%M)" "$P_NAME" "$(git -C "$wt" rev-parse HEAD)" "$SLUG" "$lot_slug" >"$wt/.lab/meta"
   [ "$permanent" = 0 ] || printf 'permanent=yes\n' >>"$wt/.lab/meta"   # lot 01 d'autonomie-tours : même marque que lab permanent
@@ -610,7 +763,9 @@ cmd_new() {
   [ "$guided" = 0 ] || guide_show --no-lane   # lot 07 de refonte-onboarding : la ligne d'étapes et GitHub, dès la création
   flat_lots_kv "${title:-$lot_slug}"
   kv LAST_BATCH "$(lane_last_lot "$WT" "$lot")"
-  if [ "$open" = 1 ]; then open_fresh_session "$agent" "$(lot_session "$WT" "$lot")" "$lot"   # grill, ou tower pour la tour
+  if [ "$open" = 1 ]; then
+    open_fresh_session "$agent" "$(lot_session "$WT" "$lot")" "$lot"   # grill, ou tower pour la tour
+    [ "${NEW_ROLE:-}" = tower ] || welcome_close_later "${CMUX_OPEN_WS:-}" "${CMUX_OPEN_SURFACE:-}"   # lot 01 d'onglet-tower
   else
     [ -z "$(last_lot_notice "$WT" "$lot")" ] || log_wrap "$(last_lot_notice "$WT" "$lot")"
     local line; line="$(launch_line)"; kv NEXT_COMMAND "$line"; kv BATCH "$lot"
@@ -628,10 +783,16 @@ cmd_guide() {
 }
 
 # ---------- open ----------
+# tower_pin <workspace> <onglet> : la tour, seul onglet épinglé, en première position, ouverte ou relancée (lot 01 d'onglet-tower) ; un
+# refus de cmux n'arrête rien
+tower_pin() {
+  lane_is_tower "$WT" || return 0
+  cmux_pin_first "$1" "$2" || warn "cmux: the tower tab is not pinned first (cmux refused): pin it yourself, or its next relaunch tries again"
+}
 open_cmux_lane() { # <ligne à taper> — prépare ou réutilise l'onglet du couloir ; renseigne CMUX_OPEN_*
   # L'onglet se retrouve par sa référence, sinon par son nom unique dans l'ancre du projet : cmux renumérote ses références, un second
   # onglet du même nom naissait (retour 3 du lot 01, lot 06) ; deux onglets du même nom → refus, rien créé ni tapé.
-  local cmd="$1" old_ws old_surface old_name project_target group uuid surface action tab way
+  local cmd="$1" old_ws old_surface old_name project_target group uuid surface action tab way initial
   old_ws="$(wt_ws "$WT")"; old_surface="$(wt_surface "$WT")"; old_name="$(wt_cmux_value "$WT" name)"
   tab="$(cmux_lane_tab "$old_ws" "$old_surface" "${old_name:-$SLUG}")"; way="$(cmux_tab_field "$tab" way)"
   uuid="$(cmux_tab_field "$tab" workspace)"; surface="$(cmux_tab_field "$tab" surface)"
@@ -643,10 +804,11 @@ open_cmux_lane() { # <ligne à taper> — prépare ou réutilise l'onglet du cou
       log "cmux: tab $SLUG found by its name (${old_surface:-no reference} → $surface)"
     fi
   else
-    project_target="$(cmux_prepare_project "$P_NAME" "$P_ROOT")" || die "cmux: group or main tab of $P_NAME not found"
-    IFS=$'\t' read -r group uuid <<<"$project_target"
+    project_target="$(cmux_prepare_project "$P_NAME" "$P_ROOT")" || die "cmux: group or workspace of $P_NAME not found"
+    IFS=$'\t' read -r group uuid initial <<<"$project_target"
     surface="$(cmux_create_surface "$uuid" "$SLUG" "$WT" true)" || die "cmux: creating the tab $SLUG failed"
     write_cmux_target "$WT" "$uuid" "$surface"
+    cmux_drop_initial "$uuid" "$initial" "$surface" "$P_NAME"
     action=created
     [ -z "$old_surface" ] || log "cmux: tab $SLUG not found ($old_surface) — recreated and recorded ($surface)"
     if [ -n "$old_ws" ] && [ "$old_ws" != "$uuid" ] && cmux_ws_exists "$old_ws"; then
@@ -655,6 +817,7 @@ open_cmux_lane() { # <ligne à taper> — prépare ou réutilise l'onglet du cou
     fi
   fi
   cmux_lane_indicator "$uuid" "$SLUG" "$(lane_phase "$WT")" "$(lane_last_lot "$WT")" || warn "cmux: indicator of $SLUG unavailable"
+  tower_pin "$uuid" "$surface"
   cmux_focus "$uuid" "$surface" || die "cmux: selecting the tab $SLUG failed"
   # auto-ciblage : lab tourne déjà dans cet onglet — rien n'est tapé, l'agent y remplacera le processus en place (lot 01), mais
   # seulement depuis un vrai terminal : sans lui (l'outil d'un agent), exec lançait l'agent dans un tuyau ; l'onglet est alors
@@ -677,8 +840,10 @@ open_cmux_lane() { # <ligne à taper> — prépare ou réutilise l'onglet du cou
 # zsh de connexion (profils de connexion, pas ~/.zshrc). Si elle échoue — refus de lab, agent introuvable —, elle est déposée sans
 # Entrée dans ce même onglet (cmux send vise $CMUX_SURFACE_ID), puis le shell de secours, interactif, l'offre à une touche.
 respawn_command() {
-  local q; q="$(shell_quote "$1")"
-  printf '/bin/zsh -lc %s || cmux send -- %s; exec /bin/zsh -l' "$q" "$q"
+  local q c=cmux; q="$(shell_quote "$1")"
+  # lot 02 d'app-treelab : la commande de l'app pilotée (le fork), par son chemin ; cmux du PATH, par son nom comme avant
+  terminal_resolve; [ "${TA_CLI:-cmux}" = cmux ] || c="$(shell_quote "$TA_CLI")"
+  printf '/bin/zsh -lc %s || %s send -- %s; exec /bin/zsh -l' "$q" "$c" "$q"
 }
 
 refresh_lane_indicator() { # ouverture/reprise seulement : plan et status restent des lectures
@@ -1128,8 +1293,9 @@ replace_session() {
     write_cmux_target "$WT" "$REPLACE_WS" "$REPLACE_SURFACE"
   fi
   # la preuve « disparue de son onglet » n'a de sens que pour une session qu'on y a vue avant l'ordre
-  if pids="$(cmux_surface_pids "$REPLACE_WS" "$REPLACE_SURFACE")" && printf '%s\n' "$pids" | grep -qx "$held"; then seen=1; fi
+  if pids="$(cmux_surface_pids "$REPLACE_WS" "$REPLACE_SURFACE")" && grep -qx "$held" <<<"$pids"; then seen=1; fi
   handoff_write "$WT" "$held" "$REPLACE_WS" "$REPLACE_SURFACE" "$seen" "$line"
+  tower_pin "$REPLACE_WS" "$REPLACE_SURFACE"
   log "Resume: this session (pid $held) is replaced in the tab $SLUG; the next one waits for it to disappear, ${LAB_HANDOFF_WAIT:-30} s at most."
   if ! cmux_restart_session "$REPLACE_WS" "$REPLACE_SURFACE" "$(respawn_command "$line")"; then
     rm -f "$(handoff_file "$WT")"
@@ -1203,10 +1369,13 @@ cmd_next() {
       --title) title="$2"; title_set=1; shift 2 ;; --auto) shift ;; --local) NEXT_LOCAL=1; shift ;; -*) usage ;; *) pos+=("$1"); shift ;;   # --auto : synonyme conservé (lot 10)
     esac
   done
-  split_project_slug "${pos[@]+"${pos[@]}"}"; load_project "$PROJECT"; require_wt
+  split_project_slug "${pos[@]+"${pos[@]}"}"; load_project "$PROJECT"
+  watch_prune_gone   # dossiers de veilleurs des couloirs retirés, sans veilleur vivant (lot 01 de restes-cloud) ; muet
+  require_wt
   # lot 03 d'autonomie-tours : un refus de lab next pose l'entrée « blocked » du couloir et notifie son onglet ; un nouvel essai
   # efface l'ancienne
   [ "$(waits_get "$WT" kind)" != blocked ] || waits_clear "$WT"
+  # shellcheck disable=SC2034 # DIE_HOOK est lu par die (lib/log.sh)
   DIE_HOOK=next_blocked_note
   lane_agent "$WT" "$agent"; agent="$AGENT"
   ! has_cmux || kv CLOUD "$(cloud_display "$P_NAME" "$WT")"   # la session d'exécution suit cette règle (open_fresh_session, lot 04)
@@ -1255,7 +1424,7 @@ cmd_next() {
   if [ "$NEXT_LOCAL" != 1 ] && [ "$(lang_code "$(cloud_get state)")" = failed ]; then   # 40 colonnes
     log "Previous Cloud session failed:"
     local l; while IFS= read -r l; do log "$l"; done < <(cloud_get detail | cut -c1-160 | fold -s -w 34)
-    log "Default: again on the lane VM;"; log "on the Mac: --local; closing"; log "the VM: cmux vm rm $(cloud_get machine)."
+    log "Default: again on the lane VM;"; log "on the Mac: --local. The VM goes"; log "with lab close or Cloud cleanup."   # lot 01 de restes-cloud
   fi
   [ "$NEXT_LOCAL" != 1 ] || [ -z "$(cloud_queue_pos "$SLUG")" ] || { cloud_queue_rm "$SLUG"; log "Lane removed from the Cloud queue."; }   # lot 05
   if cloud_paused; then         # lot 09 de cmux-pro : la session attend sa réponse, VM en pause après LAB_CLOUD_IDLE_MAX
@@ -1460,43 +1629,43 @@ cmd_permanent() {
 }
 
 # ---------- plan : aucune écriture, les fiches sont la seule source d'état ----------
-plan_source() { # <couloir> <docs principal> : propriétaire, principal, puis semis non encore fusionné
-  local lane="$1" main_docs="$2" wt docs
-  wt="$(worktree_path "$lane")"; docs="$(docs_dir "$wt")"
-  if [ -d "$wt" ] && [ -e "$(treeplan_file "$docs" "$lane")" ]; then printf '%s\n' "$docs"; return; fi
-  if [ -e "$(treeplan_file "$main_docs" "$lane")" ]; then printf '%s\n' "$main_docs"; return; fi
+plan_source_set() { # <couloir> <docs principal> : PLAN_DOCS — propriétaire, principal, puis semis non encore fusionné
+  local wt="$P_ROOT/.worktrees/$1"
+  docs_dir_set "$wt"; PLAN_DOCS="$DOCS_DIR"
+  if [ -d "$wt" ] && [ -e "$PLAN_DOCS/treeplans/$1.md" ]; then return 0; fi
+  PLAN_DOCS="$2"; [ ! -e "$PLAN_DOCS/treeplans/$1.md" ] || return 0
   for wt in "$P_ROOT"/.worktrees/*/; do
-    [ -d "$wt" ] || continue; docs="$(docs_dir "${wt%/}")"
-    if [ -e "$(treeplan_file "$docs" "$lane")" ]; then printf '%s\n' "$docs"; return; fi
+    [ -d "$wt" ] || continue; docs_dir_set "${wt%/}"; PLAN_DOCS="$DOCS_DIR"
+    if [ -e "$PLAN_DOCS/treeplans/$1.md" ]; then return 0; fi
   done
-  printf '%s\n' "$main_docs"
+  PLAN_DOCS="$2"
 }
 plan_lane() { # <couloir> <docs principal>
   local lane="$1" main_docs="$2" wt docs tp layout=treeplan presence=seeded
   local entries name title file state total=0 done=0 current="" current_title="" current_state="" priority=0 rank
-  wt="$(worktree_path "$lane")"; docs="$(plan_source "$lane" "$main_docs")"
+  wt="$P_ROOT/.worktrees/$lane"; plan_source_set "$lane" "$main_docs"; docs="$PLAN_DOCS"
   [ ! -d "$wt" ] || presence=alive
-  tp="$(treeplan_file "$docs" "$lane")"
+  tp="$docs/treeplans/$lane.md"
   if [ -f "$tp" ] && [ -r "$tp" ]; then
-    entries="$(treeplan_lots "$tp")"
+    plan_lots_set "$tp"; entries="$PLAN_LOTS"
   else
     layout=absent
-    [ "$presence" != alive ] || docs="$(docs_dir "$wt")"
-    tp="$(treeplan_file "$docs" "$lane")"
+    if [ "$presence" = alive ]; then docs_dir_set "$wt"; docs="$DOCS_DIR"; fi
+    tp="$docs/treeplans/$lane.md"
     entries=""
     # Ancien layout : seule la fiche du couloir est attribuable avec certitude.
-    if [ ! -d "$(treeplans_dir "$docs")" ]; then
+    if [ ! -d "$docs/treeplans" ]; then
       layout=legacy; file=""
-      [ "$presence" != alive ] || file="$(wt_lot_file "$wt")"
-      [ -z "$file" ] || entries="$(basename "$file" .md)"$'\t'"$(lot_title_of "$file")"
+      if [ "$presence" = alive ]; then wt_lot_set "$wt"; file="$WT_LOT"; fi
+      if [ -n "$file" ]; then name="${file##*/}"; lot_title_set "$file"; entries="${name%.md}"$'\t'"$LOT_TITLE"; fi
     fi
     warn "$tp missing or unreadable (layout $layout): complete this lane's treeplan with the batch-plan skill; no document rewritten."
   fi
   while IFS=$'\t' read -r name title; do
     [ -n "$name" ] || continue
-    file="$(lots_dir "$docs" "$lane")/$name.md"
-    [ -e "$file" ] || file="$(lots_dir "$docs")/$name.md"
-    state="$(lot_state "$file")"
+    file="$docs/lots/$lane/$name.md"
+    [ -e "$file" ] || file="$docs/lots/$name.md"
+    lot_state_set "$file"; state="$LOT_STATE"
     if [ -e "$file" ]; then
       if [ ! -r "$file" ] || [ -z "$state" ]; then
         state=unknown; warn "$file: unreadable state; restore read access and the state line in this batch file."
@@ -1512,55 +1681,73 @@ plan_lane() { # <couloir> <docs principal>
     esac
     if [ "$rank" -gt "$priority" ]; then
       priority="$rank"; current="$name"; current_title="$title"; current_state="$state"
-      title="$(lot_title_of "$file")"; [ -z "$title" ] || current_title="$title"
+      lot_title_set "$file"; [ -z "$LOT_TITLE" ] || current_title="$LOT_TITLE"
     fi
   done <<<"$entries"
   if [ "$presence" != alive ] && [ "$done" -gt 0 ]; then presence=merged; fi
   # lot parti sur une VM : la fiche locale reste « planifié », la VM pousse sur la branche distante — la marque Cloud dit l'état
   # (cloud-agent-mort), lue sans réseau
-  local cloud_lot="" mark_lot=""
-  [ "$presence" != alive ] || mark_lot=$(cloud_get lot "$wt")
+  local cloud_lot="" mark_lot="" machine
+  if [ "$presence" = alive ]; then cloud_get_set lot "$wt"; mark_lot="$CLOUD_GET"; fi
   if [ -n "$current" ] && [ "$mark_lot" = "$current" ]; then
-    case "$(lang_code "$(cloud_get state "$wt")")" in
-      alive) cloud_lot="on VM $(cloud_get machine "$wt") since $(cloud_get since "$wt")"; current_state="in progress — $cloud_lot" ;;
-      idle-paused) cloud_lot="paused on VM $(cloud_get machine "$wt"), no answer: lab next wakes it"; current_state="in progress — $cloud_lot" ;;
-      failed) cloud_lot="Cloud failure: $(cloud_get detail "$wt")"; current_state="in progress — $cloud_lot" ;;
+    cloud_get_set machine "$wt"; machine="$CLOUD_GET"; cloud_get_set state "$wt"; lang_code_set "$CLOUD_GET"
+    case "$LANG_CODE" in
+      alive) cloud_get_set since "$wt"; cloud_lot="on VM $machine since $CLOUD_GET"; current_state="in progress — $cloud_lot" ;;
+      idle-paused) cloud_lot="paused on VM $machine, no answer: lab next wakes it"; current_state="in progress — $cloud_lot" ;;
+      failed) cloud_get_set detail "$wt"; cloud_lot="Cloud failure: $CLOUD_GET"; current_state="in progress — $cloud_lot" ;;
     esac
   fi
   kv PROJECT "$P_NAME"; kv LANE "$lane"; kv PRESENCE "$presence"; kv LAYOUT "$layout"
-  if [ "$presence" = alive ]; then kv LANE_PHASE "$(lane_phase "$wt")"; else kv LANE_PHASE ""; fi
+  if [ "$presence" = alive ]; then lane_phase_set "$wt"; kv LANE_PHASE "$LANE_PHASE"; else kv LANE_PHASE ""; fi
   [ "$presence" != alive ] || ! lane_permanent "$wt" || kv PERMANENT yes
-  kv TREEPLAN "$tp"; kv INTENT "$(treeplan_intent "$tp")"
+  plan_intent_set "$tp"; kv TREEPLAN "$tp"; kv INTENT "$PLAN_INTENT"
   kv BATCH "$current"; kv BATCH_TITLE "$current_title"; kv BATCH_STATE "$current_state"
   kv DONE "$done"; kv CLOUD_BATCH "$cloud_lot"
-  local w=""; [ "$presence" != alive ] || w="$(wait_lane_first "$wt")"; kv WAITING "${w:+$(wait_summary "$w")}"
+  WAIT_SUMMARY=''; if [ "$presence" = alive ]; then wait_first_set "$wt"; if [ -n "$WAIT_FIRST" ]; then wait_summary_set "$WAIT_FIRST"; fi; fi
+  kv WAITING "$WAIT_SUMMARY"
   if [ "$layout" = treeplan ]; then kv TOTAL "$total"; else kv TOTAL unknown; fi
   sep
 }
 cmd_plan() {
   [ "$#" -le 1 ] || usage
-  local p docs lanes lane tp wt rows count
-  p="$(resolve_project "${1:-}")"; load_project "$p"; docs="$(docs_dir "$P_ROOT")"
-  lanes="$(
-    for wt in "$P_ROOT"/.worktrees/*/; do
-      [ -d "$wt" ] || continue; basename "$wt"
-      for tp in "$(treeplans_dir "$(docs_dir "${wt%/}")")"/*.md; do [ ! -e "$tp" ] || basename "$tp" .md; done
-    done
-    for tp in "$(treeplans_dir "$docs")"/*.md; do [ ! -e "$tp" ] || basename "$tp" .md; done
-  )"
-  lanes="$(printf '%s\n' "$lanes" | LC_ALL=C sort -u | sed '/^$/d')"
+  local p docs lanes lane tp wt rows count list='' name; local -a names=()
+  p="$(resolve_project "${1:-}")"; load_project "$p"; docs_dir_set "$P_ROOT"; docs="$DOCS_DIR"
+  for wt in "$P_ROOT"/.worktrees/*/; do
+    [ -d "$wt" ] || continue; wt="${wt%/}"; names+=("${wt##*/}"); docs_dir_set "$wt"
+    for tp in "$DOCS_DIR/treeplans"/*.md; do if [ -e "$tp" ]; then tp="${tp##*/}"; names+=("${tp%.md}"); fi; done
+  done
+  for tp in "$docs/treeplans"/*.md; do if [ -e "$tp" ]; then tp="${tp##*/}"; names+=("${tp%.md}"); fi; done
+  lanes="$(printf '%s\n' "${names[@]+"${names[@]}"}" | LC_ALL=C sort -u | sed '/^$/d')"
   if [ -z "$lanes" ]; then
     kv PROJECT "$p"; kv LANES 0
     log "Overview: the batches of each lane, computed from their batch files."
-    if [ ! -d "$(treeplans_dir "$docs")" ] && [ -d "$(lots_dir "$docs")" ]; then
+    if [ ! -d "$docs/treeplans" ] && [ -d "$docs/lots" ]; then
       warn "$docs/treeplans/ missing (old layout): the batch files stay readable; complete the treeplan at the next planning."
     fi
     log "To start: lab new $p <lane>"
     return
   fi
+  # tous les treeplans en une lecture, avec les documents des couloirs vivants ; puis l'état des fiches que les treeplans nomment
+  while IFS= read -r lane; do
+    plan_source_set "$lane" "$docs"; tp="$PLAN_DOCS/treeplans/$lane.md"
+    if [ -f "$tp" ] && [ -r "$tp" ] && [ "$tp" != "$P_ROOT/.worktrees/$lane/docs/treeplans/$lane.md" ]; then list="$list${list:+$'\n'}"$'T\t'"$tp"; fi
+  done <<<"$lanes"
+  reads_open local '' "$list"; list=''
+  while IFS= read -r lane; do
+    plan_source_set "$lane" "$docs"; plan_lots_set "$PLAN_DOCS/treeplans/$lane.md"
+    [ -n "$PLAN_LOTS" ] || continue
+    while IFS=$'\t' read -r name _; do
+      tp="$PLAN_DOCS/lots/$lane/$name.md"
+      if [ ! -e "$tp" ]; then tp="$PLAN_DOCS/lots/$name.md"
+      elif [ "$PLAN_DOCS" = "$P_ROOT/.worktrees/$lane/docs" ]; then continue; fi   # fiche d'un couloir vivant : lue par reads_open
+      if [ -f "$tp" ] && [ -r "$tp" ]; then list="$list${list:+$'\n'}"$'S\t'"$tp"; fi
+    done <<<"$PLAN_LOTS"
+  done <<<"$lanes"
+  facts_load "$list"
   rows="$(while IFS= read -r lane; do plan_lane "$lane" "$docs"; done <<<"$lanes")"
+  reads_close
   printf '%s\n' "$rows"
-  count="$(printf '%s\n' "$lanes" | wc -l | tr -d ' ')"
+  count=0; while IFS= read -r lane; do count=$((count + 1)); done <<<"$lanes"
   if [ "$count" = 1 ]; then log '1 lane'; else log "$count lanes"; fi
   # jq compte les caractères Unicode : accents alignés, même sous LC_ALL=C.
   # Largeur totale : 78 colonnes. Les valeurs complètes restent sur stdout et en JSON.
@@ -1591,37 +1778,60 @@ cmd_plan() {
 }
 
 # ---------- list / status ----------
+# list_lanes [couloir] : le bloc de chaque couloir du projet chargé, ou du seul couloir — dans une lecture ouverte par reads_open
+list_lanes() {
+  local wt
+  for wt in "$P_ROOT"/.worktrees/*/; do
+    [ -d "$wt" ] || continue; wt="${wt%/}"
+    if [ -n "${1:-}" ] && [ "${wt##*/}" != "$1" ]; then continue; fi
+    kv PROJECT "$P_NAME"; describe_wt "$wt"; sep
+  done
+}
 cmd_list() {
   local p; local -a ps=()
   if [ "$#" -ge 1 ]; then ps=("$(resolve_project "$1")"); else while IFS= read -r p; do ps+=("$p"); done < <(project_names); fi
-  for p in "${ps[@]}"; do
-    load_project "$p"
-    local wt
-    for wt in "$P_ROOT"/.worktrees/*/; do
-      [ -d "$wt" ] || continue; wt="${wt%/}"
-      kv PROJECT "$p"; describe_wt "$wt"; sep
-    done
-  done
+  for p in "${ps[@]}"; do load_project "$p"; reads_open gh; list_lanes; reads_close; done
 }
-cmd_status() {
-  local p; p="$(resolve_project "${1:-}")"; load_project "$p"
-  kv PROJECT "$p"; kv ROOT "$P_ROOT"; kv ROOT_BRANCH "$(branch_name "$P_ROOT")"
-  if is_clean "$P_ROOT"; then kv ROOT_CLEAN yes; else kv ROOT_CLEAN no; fi
-  kv MERGE_TARGET "$(pr_base)"; kv PR_BASE "$(pr_base)"; kv AGENT "$(agent_display -)"
+# lanes_gone_set : GONE, les couloirs retirés dont un veilleur reste à montrer — une issue de moins d'un jour, ou un échec, jusqu'au
+# lab next ou au passage de la tour suivant, qui retirent le dossier (watch_prune_gone) ; deux programmes pour tous les dossiers
+lanes_gone_set() {
+  local d lane seen; local -a dirs=()
+  GONE=()
+  for d in "$LAB_STATE/watch/$P_NAME"/*/; do
+    [ -d "$d" ] || continue; d="${d%/}"; lane="${d##*/}"
+    if [ "$lane" = "$PROMOTE_LANE" ] || [ -d "$P_ROOT/.worktrees/$lane" ]; then continue; fi
+    dirs+=("$d")
+  done
+  [ "${#dirs[@]}" -gt 0 ] || return 0
+  # un fichier récent suffit ; les autres passent à grep, en une fois
+  seen=$'\n'"$(exec find -H "${dirs[@]}" -type f \( ! -name '*.log' -mtime -1 -print -o -exec grep -lE '^issue=(failed|red|conflict|changed|échec|rouge|conflit|changée)$' {} + \) 2>/dev/null)" || true
+  for d in "${dirs[@]}"; do case "$seen" in *$'\n'"$d/"*) GONE+=("${d##*/}") ;; esac; done
+}
+cmd_status() { # [projet] [couloir] : avec un couloir, l'en-tête du projet, son bloc et ses chevauchements
+  local p lane="${2:-}" d; local -a names=()
+  [ "$#" -le 2 ] || usage
+  p="$(resolve_project "${1:-}")"; load_project "$p"; GONE=()
+  if [ "$#" = 2 ]; then
+    for d in "$P_ROOT"/.worktrees/*/; do if [ -d "$d" ]; then d="${d%/}"; names+=("${d##*/}"); fi; done
+    [ "${#names[@]}" -gt 0 ] || die "no lane in $p: lab new $p <lane> opens one"
+    in_words "$lane" "${names[@]}" || die_wrap "unknown lane: $lane — lanes of $p: $(printf '%s\n' "${names[@]}" | sync_join)"
+  else lanes_gone_set; fi
+  head_branch_set "$P_ROOT"
+  kv PROJECT "$p"; kv ROOT "$P_ROOT"; kv ROOT_BRANCH "$HEAD_BRANCH"
+  lane_status_set "$P_ROOT"; if lane_status_clean; then kv ROOT_CLEAN yes; else kv ROOT_CLEAN no; fi
+  agent_display_set -; kv MERGE_TARGET "${P_STAGING:-$P_BASE}"; kv PR_BASE "${P_STAGING:-$P_BASE}"; kv AGENT "$AGENT_DISPLAY"
   entitlement_status_kv   # fin des droits aux mises à jour, cache local seul (lot 05 de refonte-onboarding) ; rien sans cache
-  if has_cmux; then kv CLOUD "$(cloud_display "$p" -)"; cloud_queue_status_kv; cloud_wake_guard; cloud_shared_status_kv; fi   # file, réveils, VM partagées (lot 05)
+  if has_cmux; then cloud_display_set "$p" -; kv CLOUD "$CLOUD_DISPLAY"; cloud_queue_status_kv; cloud_wake_guard; cloud_shared_status_kv; fi   # file, réveils, VM partagées (lot 05)
   deploy_status_kv   # ce qui est en ligne, registre seul (lot 02 de mise-en-ligne)
   deploy_queue_status_kv   # file de prod par cible (lot 05 d'autonomie-tours)
+  READS_WATCH=("$PROMOTE_LANE" "${GONE[@]+"${GONE[@]}"}"); reads_open gh "$lane"
   watch_status_kv "$PROMOTE_LANE"; sep   # veilleur de promotion staging → main (lot 16)
-  cmd_list "$p"
-  overlap_status_kv   # fichiers touchés par deux couloirs vivants, avec l'ordre de passage (lot 15)
-  # un couloir retiré par son veilleur (lab close) n'a plus de worktree : son issue reste lisible un jour, un échec jusqu'à relance
-  local d lane
-  for d in "$LAB_STATE/watch/$p"/*/; do
-    [ -d "$d" ] || continue; lane="$(basename "$d")"; [ "$lane" != "$PROMOTE_LANE" ] || continue; [ ! -d "$(worktree_path "$lane")" ] || continue
-    [ -n "$(find "$d" -type f ! -name '*.log' -mtime -1 2>/dev/null | head -1)" ] || [ -n "$(grep -lE '^issue=(failed|red|conflict|changed|échec|rouge|conflit|changée)$' "$d"* 2>/dev/null | head -1)" ] || continue
-    kv PROJECT "$p"; kv LANE "$lane"; kv PATH "(removed)"; watch_status_kv "$lane"; sep
-  done
+  lane_status_keep; list_lanes "$lane"
+  overlap_status_kv "${lane:+$P_ROOT/.worktrees/$lane}"   # fichiers touchés par deux couloirs vivants, avec l'ordre de passage (lot 15)
+  # un couloir retiré par son veilleur (lab close) n'a plus de worktree : son issue reste lisible jusqu'au lab next ou au passage de la
+  # tour suivant, qui retirent son dossier (lot 01 de restes-cloud)
+  for d in "${GONE[@]+"${GONE[@]}"}"; do kv PROJECT "$p"; kv LANE "$d"; kv PATH "(removed)"; watch_status_kv "$d"; sep; done
+  reads_close
 }
 
 # ---------- sweep ----------
@@ -1720,18 +1930,27 @@ cmd_sweep() {
 # [révision] : celle qui sera livrée (la tour, révision inscrite) ; la tête du couloir par défaut.
 delivery_guard() {
   local report rc=0 reds red now poste proof
-  # LAB_DOCTOR_NO_SERVICES : les services des couloirs fermés ne disent rien du code livré, et list coûterait jusqu'à 15 s
-  report="$(LAB_DOCTOR_NO_SERVICES=1 "$LAB_ROOT/bin/lab" doctor "$P_NAME" --root "$WT" 2>/dev/null)" || rc=$?
+  # LAB_DOCTOR_NO_SERVICES : les services des couloirs fermés ne disent rien du code livré, et list coûterait jusqu'à 15 s ;
+  # LAB_DOCTOR_NO_PROBES : les sondes en ligne non plus, jusqu'à 15 s (lot 03 de charge-processeur)
+  # sa sortie d'erreur avec : la dernière ligne dit s'il est allé au bout (revue du lot 03 : un code 1 en route n'est pas un bilan)
+  report="$(LAB_DOCTOR_NO_SERVICES=1 LAB_DOCTOR_NO_PROBES=1 "$LAB_ROOT/bin/lab" doctor "$P_NAME" --root "$WT" 2>&1)" || rc=$?
   [ "$rc" -eq 0 ] && return
   reds="$(printf '%s\n' "$report" | awk -F= '$1=="CHECK"{check=$2} $1=="STATUS" && $2=="RED"{print check}')"
   poste="$(printf '%s\n' "$reds" | awk -v p="$P_NAME." 'NF && index($0, p) != 1')"
   if [ -n "$reds" ] && [ "$reds" = "$poste" ]; then   # rien du projet dans le bilan complet : le bilan du seul projet tranche
-    rc=0; report="$(LAB_DOCTOR_NO_SERVICES=1 "$LAB_ROOT/bin/lab" doctor "$P_NAME" --root "$WT" --project-only 2>/dev/null)" || rc=$?
+    if [ "$rc" -eq 1 ] && [ "${report##*$'\n'}" = 'lab: RED: at least one check is red' ]; then
+      # bilan allé au bout, lu tel quel (lot 03 de charge-processeur : un doctor par livraison) : ses contrôles du projet y voient le
+      # contexte de l'installation, comme le bilan complet qui livrait déjà sans rouge du poste ; --project-only ne rougit de plus
+      # que la baseline illisible, sous le nom du projet
+      case $'\n'"$poste"$'\n' in *$'\n'global.baseline$'\n'*) reds="$P_NAME.baseline" ;; *) rc=0 ;; esac
+    else   # bilan arrêté en route (code 2, ou code 1 sans sa ligne finale) : le bilan du seul projet tranche, comme avant
+      rc=0; report="$(LAB_DOCTOR_NO_SERVICES=1 LAB_DOCTOR_NO_PROBES=1 "$LAB_ROOT/bin/lab" doctor "$P_NAME" --root "$WT" --project-only 2>/dev/null)" || rc=$?
+      [ "$rc" -eq 0 ] || reds="$(printf '%s\n' "$report" | awk -F= '$1=="CHECK"{check=$2} $1=="STATUS" && $2=="RED"{print check}')"
+    fi
     if [ "$rc" -eq 0 ]; then
       warn "machine red(s), outside the project — delivery continued: $(printf '%s\n' "$poste" | sync_join) ; diagnosis: lab doctor"
       kv DOCTOR_MACHINE "$(printf '%s\n' "$poste" | sync_join)"; return 0
     fi
-    reds="$(printf '%s\n' "$report" | awk -F= '$1=="CHECK"{check=$2} $1=="STATUS" && $2=="RED"{print check}')"
   else
     reds="$(printf '%s\n' "$reds" | awk -v p="$P_NAME." 'index($0, p) == 1')"
   fi
@@ -1990,7 +2209,7 @@ compte_liste() {
 # /login sur le Mac, ou sous CLAUDE_CONFIG_DIR, l'étape est sautée avec sa commande. 2/3 jeton : claude setup-token, jeton collé
 # rangé au trousseau. 3/3 CodeRouter : le jeton rejoint les comptes de l'équipe ; un refus garde le compte et nomme la reprise.
 compte_ajouter() {
-  local l="$1" tok cur e r avant rc=0 garde="nothing stored" reserve="${2:-}"
+  local l="$1" tok cur e r avant rc=0 garde="nothing stored" reserve="${2:-}" ident
   compte_label_ok "$l" || die "invalid label: \"$l\" — letters, digits, . _ -, 24 characters at most"
   [ "$l" != "$COMPTE_PRINCIPAL" ] || die "\"$COMPTE_PRINCIPAL\" designates the /login account: choose another label"
   ! compte_connu "$l" || die "the account $l is already stored: lab account remove $l, then add it again"
@@ -2001,7 +2220,7 @@ compte_ajouter() {
   else
     avant=""
     if [ -t 0 ]; then
-      compte_identite_de "$COMPTE_PRINCIPAL" | grep -q . \
+      { ident="$(compte_identite_de "$COMPTE_PRINCIPAL")" && grep -q . <<<"$ident"; } \
         || die "step 1/3: a /login cannot be told from the principal's: nothing stored — lab account identify principal <its e-mail> first"
       compte_badge_suivi   # la connexion posée est rangée avant que le /login ne l'écrase
       [ -n "$(compte_badge_actif)" ] || ! cur="$(compte_connexion)" || ! compte_connexion_complete "$cur" \
@@ -2014,7 +2233,7 @@ compte_ajouter() {
       kv BADGE skipped; log_wrap "Step 1/3: no /login on this Mac, no badge. Later: /login with $l, then lab account badge $l"
     else
       # un /login relié à aucun compte n'est reconnu que si le principal l'est : sinon ce serait peut-être le sien
-      compte_identite_de "$COMPTE_PRINCIPAL" | grep -q . \
+      { ident="$(compte_identite_de "$COMPTE_PRINCIPAL")" && grep -q . <<<"$ident"; } \
         || die "step 1/3: the /login cannot be told from the principal's: nothing stored — lab account identify principal <its e-mail>, then lab account add $l again"
       [ -z "$avant" ] || [ "$(compte_empreinte "$cur")" != "$avant" ] \
         || die "step 1/3: the /login did not change: nothing stored — /login with $l, then lab account add $l again"
@@ -2069,9 +2288,9 @@ compte_coderouter() {
 }
 # compte_coderouter_cmd <étiquette> : le jeton déjà rangé au trousseau envoyé à CodeRouter (migration, reprise d'un ajout)
 compte_coderouter_cmd() {
-  local l="$1" tok rc=0
+  local l="$1" tok rc=0 toks
   compte_connu "$l" || die "unknown account: $l — lab account lists the accounts"
-  comptes_jetons | grep -qxF "$l" || die "no stored token for $l (the /login account has none): lab account add <label>"
+  { toks="$(comptes_jetons)" && grep -qxF "$l" <<<"$toks"; } || die "no stored token for $l (the /login account has none): lab account add <label>"
   tok="$(compte_jeton "$l")" || tok=""
   compte_jeton_ok "$tok" || die "no token for $l in the keychain: lab account remove $l, then lab account add $l"
   kv ACCOUNT "$l"
@@ -2080,9 +2299,9 @@ compte_coderouter_cmd() {
   return "$rc"
 }
 compte_retirer() {
-  local l="$1" f tmp
+  local l="$1" f tmp toks
   [ "$l" != "$COMPTE_PRINCIPAL" ] || die "\"$COMPTE_PRINCIPAL\" is the /login account: it cannot be removed"
-  comptes_jetons | grep -qxF "$l" || die "unknown account: $l — lab account lists the stored accounts"
+  { toks="$(comptes_jetons)" && grep -qxF "$l" <<<"$toks"; } || die "unknown account: $l — lab account lists the stored accounts"
   compte_effacer "$l" || warn "token of $l already missing from the keychain"
   security delete-generic-password -s "$COMPTE_BADGE_SERVICE" -a "$l" >/dev/null 2>&1 || true; rm -f "$(comptes_badges_dir)/$l.json"
   f="$(comptes_file)"; tmp="$(mktemp "$f.XXXXXX")"; grep -vxF "$l" "$f" >"$tmp" || true; mv "$tmp" "$f"
@@ -2155,6 +2374,7 @@ compte_run() {
   done
   [ -z "$sid" ] || compte_conversation_ok "$sid" || die "invalid conversation id"   # jamais recopié : 40 colonnes, rien de forgé
   command -v claude >/dev/null 2>&1 || die "claude not found in PATH"
+  # shellcheck disable=SC2034 # COMPTE_CONVERSATION est lu par compte_attendre (lib/comptes.sh)
   COMPTE_CONVERSATION="${sid:--}"   # lu par le registre d'attente de compte_attendre
   compte_appliquer
   [ -z "$sid" ] || opts+=(--resume "$sid" "$COMPTE_PROMPT")
@@ -2393,6 +2613,8 @@ run() {
     plan) cmd_plan "$@" ;; guide) cmd_guide "$@" ;; permanent) cmd_permanent "$@" ;; tower) cmd_tower "$@" ;; list) cmd_list "$@" ;; status) cmd_status "$@" ;; sweep) cmd_sweep "$@" ;; close) cmd_close "$@" ;; acceptance) cmd_recette "$@" ;; merge) cmd_merge "$@" ;;
     batch) cmd_lot "$@" ;; account) cmd_compte "$@" ;; cloud) cmd_cloud "$@" ;; sync) cmd_sync "$@" ;; lock) cmd_lock "$@" ;; unlock) cmd_unlock "$@" ;; served) cmd_served "$@" ;; services) cmd_services "$@" ;; deploy) cmd_deploy "$@" ;; watch) cmd_watch "$@" ;; handoff) cmd_handoff "$@" ;; wake) cmd_wake "$@" ;; now) cmd_now "$@" ;; due) cmd_rdv "$@" ;; proof) cmd_proof "$@" ;; promote) cmd_promote "$@" ;;
     ginkgo) . "$LAB_ROOT/lib/ginkgo.sh"; cmd_ginkgo "$@" ;;
+    app) . "$LAB_ROOT/lib/app.sh"; cmd_app "$@" ;;
+    docker) . "$LAB_ROOT/lib/docker.sh"; cmd_docker "$@" ;;
     top) cmd_top "$@" ;; sysmon) cmd_sysmon "$@" ;; widget) cmd_widget "$@" ;; mcp) cmd_mcp "$@" ;;
     --version) cmd_version ;;
     setup|uninstall|update) . "$LAB_ROOT/lib/install.sh"; . "$LAB_ROOT/lib/install_merge.sh"; . "$LAB_ROOT/lib/preflight.sh"; . "$LAB_ROOT/lib/setup.sh"; . "$LAB_ROOT/lib/update.sh"; . "$LAB_ROOT/lib/import.sh"; "cmd_$CMD" "$@" ;;
@@ -2402,6 +2624,7 @@ run() {
       # shellcheck disable=SC2030,SC2031 # Présentation isolée volontairement, état et trap dans le même sous-shell.
       if [ "$report" = 1 ]; then
         (
+          # shellcheck disable=SC2034 # DOC_REPORT est lu par lib/doctor.sh et lib/doctor_report.sh
           DOC_REPORT=1; DOC_DONE=no
           . "$LAB_ROOT/lib/doctor.sh"
           trap 'rc=$?; if [ "$DOC_DONE" != yes ]; then doctor_error INTERNAL || true; fi; exit "$rc"' EXIT

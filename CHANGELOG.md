@@ -2,6 +2,26 @@
 
 Release notes of each published version of Treelab, newest first.
 
+## 1.6.1 — 2026-11-25
+
+**The tower first: the main tab hands over to it**
+
+- A main tab left by an older version hands over to the tower then closes, by itself, with nothing ever typed in it nor asked: an idle terminal closes, a Claude session at rest is summed up by a headless copy of its conversation, never saved.
+- The tower sums the handover up in three lines and asks you, with one checkbox question, which needs open a lane; a tower already open is told once to read its skill again.
+- Your “yes, close” is given once: it also covers a red night and the fixes that follow it, and neither a mere question nor a message from another session takes it back.
+- Never closed: the tab you are looking at, the last one of its workspace, or one where another program runs.
+- While a pull request waits for its checks, its watcher launches ten times fewer programs per minute, with exactly the same decisions.
+
+## 1.5.1 — 2026-11-24
+
+**Close as soon as the checks are green**
+
+- Once you accept the result, the lane is delivered and closed as soon as the checks of its pull request are green: no label posted and no wait for the full suite, which runs every night.
+- Leftovers of lanes already closed disappear on their own, with no gesture or button, and no longer show in the project status.
+- The project status, the list, the plan, a session start and the health check give the same answers with up to 780 times fewer processes.
+- The tower is the only pinned tab, and the first; a new project is welcomed in a tab of its own that closes by itself.
+- The tower reads production health at each pass: a red one waits for you with its numbers and alerts you once, nothing blocked.
+
 ## 1.5.0 — 2026-11-22
 
 **Free trial and subscription: the key arrives at once**

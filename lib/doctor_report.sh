@@ -8,21 +8,29 @@ doctor_greater() {
   while [ "${#right}" -gt 1 ] && [ "${right:0:1}" = 0 ]; do right="${right#0}"; done
   [ "${#left}" -gt "${#right}" ] || { [ "${#left}" -eq "${#right}" ] && [[ "$left" > "$right" ]]; }
 }
-doctor_text() { printf '%s' "$1" | LC_ALL=C tr '\000-\037\177' '?'; }
+# doctor_text_set <texte> : DOC_TEXT, chaque octet de contrôle (0x01 à 0x1F, 0x7F) remplacé par « ? », comme
+# LC_ALL=C tr '\000-\037\177' '?' — sans programme (lot 03 de charge-processeur : trois tr par ligne du bilan)
+DOC_CTL=$'\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037\177'
+doctor_text_set() { local LC_ALL=C; DOC_TEXT="${1//[$DOC_CTL]/?}"; }
+doctor_text() { doctor_text_set "$1"; printf '%s' "$DOC_TEXT"; }
 # doctor_say <texte> : lignes humaines du doctor (lot 05 du couloir anglais), repliées au mot à la largeur mesurée (40 à 80 colonnes,
 # onboard_cols) ; un mot plus long que la largeur (un chemin) est coupé, jamais une ligne au-delà. Les blocs KEY=value ne passent pas ici.
 doctor_say() {
   local w line
-  # mode rapport : stderr est fermé, la sortie humaine part sur le descripteur 3 — sa largeur se lit là
-  if [ "$DOC_REPORT" = 1 ]; then w="$(onboard_cols 2>&3)"; else w="$(onboard_cols)"; fi
   # hors terminal et sans COLUMNS (un agent par un tube) : intacte, comme lab_say (revue du lot 05)
   if [ -z "${COLUMNS:-}" ] && { { [ "$DOC_REPORT" = 1 ] && [ ! -t 3 ]; } || { [ "$DOC_REPORT" != 1 ] && [ ! -t 2 ]; }; }; then
     printf '%s\n' "$1"; return
   fi
-  printf '%s\n' "$1" | onboard_wrap "$w" | while IFS= read -r line || [ -n "$line" ]; do
+  # largeur mesurée une fois par bilan (lot 03 de charge-processeur) ; mode rapport : stderr est fermé, la sortie humaine part
+  # sur le descripteur 3 — sa largeur se lit là
+  if [ -z "${DOC_SAY_W:-}" ]; then
+    if [ "$DOC_REPORT" = 1 ]; then DOC_SAY_W="$(onboard_cols 2>&3)"; else DOC_SAY_W="$(onboard_cols)"; fi
+  fi
+  w="$DOC_SAY_W"
+  while IFS= read -r line || [ -n "$line" ]; do
     while [ "${#line}" -gt "$w" ]; do printf '%s\n' "${line:0:$w}"; line="${line:$w}"; done
     printf '%s\n' "$line"
-  done
+  done < <(onboard_wrap "$w" <<<"$1")
 }
 doctor_report_fields() {
   local original="$1" suffix
@@ -98,7 +106,7 @@ doctor_emit() {
     case "${DOC_MANIFEST_CAUSE:-}:$note" in
       TRANSACTION_PENDING:*treelab\ setup*|REMOVAL_PENDING:*treelab\ setup*) note='Finish treelab uninstall --resume before a new installation; keep the backups.' ;;
     esac
-    name="$(doctor_text "$name")"; value="$(doctor_text "$value")"; note="$(doctor_text "$note")"
+    doctor_text_set "$name"; name="$DOC_TEXT"; doctor_text_set "$value"; value="$DOC_TEXT"; doctor_text_set "$note"; note="$DOC_TEXT"
   fi
   kv CHECK "$name"; kv STATUS "$status"; kv VALUE "$value"; kv LIMIT "$limit"
   [ -z "$base" ] || kv BASELINE "$base"

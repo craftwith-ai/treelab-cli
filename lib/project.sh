@@ -129,13 +129,14 @@ project_from_cwd_set() { FOUND_PROJECT=''; git_places "$1" && project_by_root_se
 global_config_get() { [ -f "$LAB_HOME/config" ] || return 0; kv_print "$LAB_HOME/config" "$1"; }
 # agent_resolve <wt|-> [valeur de --agent] → « <agent><TAB><source> » : option, couloir (.lab/meta), projet (projects/<p>/config),
 # global ($LAB_HOME/config) ou défaut (claude). Une lecture ne refuse rien : agent_note dit si la valeur est acceptable.
-agent_resolve() {
-  local wt="${1:-}" a
-  if [ -n "${2:-}" ]; then printf '%s\toption\n' "$2"; return; fi
-  if [ -n "$wt" ] && [ "$wt" != - ]; then a="$(wt_meta "$wt" agent)"; [ -z "$a" ] || { printf '%s\tlane\n' "$a"; return; }; fi
-  [ -z "${P_AGENT:-}" ] || { printf '%s\tproject\n' "$P_AGENT"; return; }
-  a="$(global_config_get agent)"; [ -z "$a" ] || { printf '%s\tglobal\n' "$a"; return; }
-  printf 'claude\tdefault\n'
+agent_resolve() { agent_resolve_set "$@"; printf '%s\t%s\n' "$AGENT_NAME" "$AGENT_SOURCE"; }
+agent_resolve_set() { # les mêmes arguments : AGENT_NAME et AGENT_SOURCE, sans processus
+  local wt="${1:-}"
+  AGENT_SOURCE=option; AGENT_NAME="${2:-}"; [ -z "$AGENT_NAME" ] || return 0
+  if [ -n "$wt" ] && [ "$wt" != - ]; then kv_value "$wt/.lab/meta" agent || true; AGENT_SOURCE=lane; AGENT_NAME="$KV_VALUE"; [ -z "$AGENT_NAME" ] || return 0; fi
+  AGENT_SOURCE=project; AGENT_NAME="${P_AGENT:-}"; [ -z "$AGENT_NAME" ] || return 0
+  kv_value "$LAB_HOME/config" agent || true; AGENT_SOURCE=global; AGENT_NAME="$KV_VALUE"; [ -z "$AGENT_NAME" ] || return 0
+  AGENT_SOURCE=default; AGENT_NAME=claude
 }
 agent_source_file() { # <source> <wt|-> → le fichier lu pour cette source (vide pour option et défaut)
   case "$1" in lane) printf '%s/.lab/meta\n' "$2" ;; project) printf '%s/config\n' "$(project_dir "$P_NAME")" ;; global) printf '%s/config\n' "$LAB_HOME" ;; esac
@@ -154,18 +155,20 @@ agent_note() {
 cloud_resolve() {
   local p="$1" wt="${2:--}" v
   if [ "$wt" != - ]; then
-    v="$(wt_meta "$wt" cloud)"; if [ -n "$v" ]; then CLOUD="$v"; CLOUD_SOURCE=lane; CLOUD_FILE="$wt/.lab/meta"; return; fi
+    kv_value "$wt/.lab/meta" cloud || true; v="$KV_VALUE"; if [ -n "$v" ]; then CLOUD="$v"; CLOUD_SOURCE=lane; CLOUD_FILE="$wt/.lab/meta"; return; fi
   fi
-  v="$(config_get "$p" cloud 2>/dev/null)"; if [ -n "$v" ]; then CLOUD="$v"; CLOUD_SOURCE=project; CLOUD_FILE="$(project_dir "$p")/config"; return; fi
-  v="$(global_config_get cloud)"; if [ -n "$v" ]; then CLOUD="$v"; CLOUD_SOURCE=global; CLOUD_FILE="$LAB_HOME/config"; return; fi
+  kv_value "$LAB_PROJECTS/$p/config" cloud || true; v="$KV_VALUE"; if [ -n "$v" ]; then CLOUD="$v"; CLOUD_SOURCE=project; CLOUD_FILE="$LAB_PROJECTS/$p/config"; return; fi
+  kv_value "$LAB_HOME/config" cloud || true; v="$KV_VALUE"; if [ -n "$v" ]; then CLOUD="$v"; CLOUD_SOURCE=global; CLOUD_FILE="$LAB_HOME/config"; return; fi
   CLOUD=yes; CLOUD_SOURCE=default; CLOUD_FILE=""
 }
 # cloud_note → le refus à prononcer si la valeur résolue n'est ni yes ni no (fichier et valeur nommés), sinon rien
 cloud_note() { case "$CLOUD" in yes|no) ;; *) printf 'cloud "%s" read in %s: expected yes or no\n' "$CLOUD" "$CLOUD_FILE" ;; esac; }
 # cloud_display <p> [<wt>|-] → « yes (project) », « yes (default) » ; une valeur invalide est nommée sur stderr, sans arrêt
-cloud_display() {
-  local note; cloud_resolve "$@"; note="$(cloud_note)"; [ -z "$note" ] || warn "$note"
-  printf '%s (%s)\n' "$CLOUD" "$CLOUD_SOURCE"
+cloud_display() { cloud_display_set "$@"; printf '%s\n' "$CLOUD_DISPLAY"; }
+cloud_display_set() { # les mêmes arguments : CLOUD_DISPLAY, sans processus pour une valeur valide
+  cloud_resolve "$@"
+  case "$CLOUD" in yes|no) ;; *) warn "$(cloud_note)" ;; esac
+  CLOUD_DISPLAY="$CLOUD ($CLOUD_SOURCE)"
 }
 config_unset() { registry_locked "$1" config_drop "$@"; }   # config_unset <p> <key>
 config_drop() { local f tmp; f="$(project_dir "$1")/config"; tmp="$(mktemp "$f.XXXXXX")"; grep -v "^$2=" "$f" >"$tmp" || true; mv "$tmp" "$f"; }
@@ -189,8 +192,15 @@ meta_unset() { # meta_unset <wt> <clé>
 }
 # lane_permanent <wt> : couloir marqué permanent (lot 01 d'autonomie-tours) — il enchaîne ses lots livrés par PR, n'entre jamais en
 # recette, n'est jamais retiré ni fermé ; posé par lab permanent ou lab new --permanent, dans .lab/meta seulement
-lane_permanent() { [ "$(lang_code "$(wt_meta "$1" permanent)")" = yes ]; }   # « oui » écrit à la main se lit par la table de lib/lang.sh
-wt_lane() { kv_value "$1/.lab/meta" lane || true; printf '%s\n' "${KV_VALUE:-$(basename "$1")}"; }
+lane_permanent() { kv_value "$1/.lab/meta" permanent || true; lang_code_set "$KV_VALUE"; [ "$LANG_CODE" = yes ]; }   # « oui » écrit à la main se lit par la table de lib/lang.sh
+wt_lane() { wt_lane_set "$1"; printf '%s\n' "$WT_LANE"; }
+WL_FOR='' WL_LANE='' FACTS_DEPTH=0   # mémoire d'une lecture groupée (lib/facts.sh), jamais héritée de l'environnement
+wt_lane_set() { # <wt> : WT_LANE, lu une fois de suite par couloir dans une lecture groupée
+  local d="${1%/}"
+  if [ "$FACTS_DEPTH" != 0 ] && [ "$WL_FOR" = "$1" ]; then WT_LANE="$WL_LANE"; return 0; fi
+  kv_value "$1/.lab/meta" lane || true; WT_LANE="${KV_VALUE:-${d##*/}}"; WL_FOR="$1"; WL_LANE="$WT_LANE"
+}
 # docs_dir <worktree> : dans le dépôt (docs=repo, posé par lab new dans le worktree) ou local (_lab/projects/<p>/docs). owner ne décide jamais de docs (lot 8).
-docs_dir() { if [ "$P_DOCS" = repo ]; then printf '%s/docs\n' "$1"; else printf '%s/docs\n' "$(project_dir "$P_NAME")"; fi; }
+docs_dir() { docs_dir_set "$1"; printf '%s\n' "$DOCS_DIR"; }
+docs_dir_set() { if [ "$P_DOCS" = repo ]; then DOCS_DIR="$1/docs"; else DOCS_DIR="$LAB_PROJECTS/$P_NAME/docs"; fi; }   # <wt> : DOCS_DIR
 state_dir() { local d="$LAB_STATE/${1:-}"; mkdir -p "$d"; printf '%s\n' "$d"; }

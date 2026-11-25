@@ -107,7 +107,7 @@ promote_inflight() {
     case "$(watch_state "$f")" in armed|waiting) ;; *) continue ;; esac
     [ "$(watch_get "$f" base)" = "$P_STAGING" ] || continue
     pr="$(watch_get "$f" pr)"; br="$(watch_get "$f" branch)"; on="$(watch_get "$f" on_pr)"
-    if [ -n "$pr" ]; then printf '%s\n' "$open" | grep -q "^#$pr " || printf '#%s %s (watcher)\n' "$pr" "$br"
+    if [ -n "$pr" ]; then grep -q "^#$pr " <<<"$open" || printf '#%s %s (watcher)\n' "$pr" "$br"
     else printf '%s (queued after #%s)\n' "$br" "$on"; fi
   done
 }

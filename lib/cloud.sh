@@ -22,7 +22,8 @@ CLOUD_AS_ROOT=(sh -c 'if [ "$(id -u)" = 0 ]; then exec bash "$1"; fi; exec sudo 
 
 cloud_vm() { CMUX_QUIET=1 with_timeout "${2:-120}" cmux vm "${@:3}" </dev/null; }   # <libellé> <délai> <arguments de cmux vm…>
 cloud_marker() { printf '%s/.lab/cloud\n' "${1:-$WT}"; }
-cloud_get() { { sed -n "s/^$1=//p" "$(cloud_marker "${2:-$WT}")" 2>/dev/null || true; } | head -1; }   # marque absente : vide
+cloud_get() { if kv_value "${2:-$WT}/.lab/cloud" "$1"; then printf '%s\n' "$KV_VALUE"; fi; }   # marque absente : vide
+cloud_get_set() { kv_value "${2:-$WT}/.lab/cloud" "$1" || true; CLOUD_GET="$KV_VALUE"; }   # <clé> [wt] : CLOUD_GET, sans processus
 cloud_put() { # <clé> <valeur> [wt] : réécriture atomique d'une clé de la marque
   local f tmp; f="$(cloud_marker "${3:-$WT}")"; mkdir -p "$(dirname "$f")"; tmp="$(mktemp "$f.XXXXXX")"
   { grep -v "^$1=" "$f" 2>/dev/null || true; printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr '\n' ' ' | cloud_plain)"; } >"$tmp" && mv "$tmp" "$f"
@@ -55,10 +56,10 @@ cloud_terminal_tail() {
 }
 cloud_plain() { LC_ALL=C tr -d '\000-\010\013-\037\177'; }
 # cloud_live [wt] : une session de lot tourne sur une VM pour ce couloir — aucune autre ne part
-cloud_live() { [ "$(lang_code "$(cloud_get state "${1:-$WT}")")" = alive ]; }
+cloud_live() { cloud_get_set state "${1:-$WT}"; lang_code_set "$CLOUD_GET"; [ "$LANG_CODE" = alive ]; }
 # cloud_paused [wt] : la session du lot attend sa réponse, VM mise en pause après LAB_CLOUD_IDLE_MAX (lot 09 de cmux-pro) ; lab next
 # la réveille, lab launch ne lance rien d'autre
-cloud_paused() { [ "$(lang_code "$(cloud_get state "${1:-$WT}")")" = idle-paused ]; }
+cloud_paused() { cloud_get_set state "${1:-$WT}"; lang_code_set "$CLOUD_GET"; [ "$LANG_CODE" = idle-paused ]; }
 # cloud_finished <wt> <fiche> : la session VM de cette fiche a fini proprement — le Mac ouvre batch-end (session « fin »)
 cloud_finished() { [ "$(lang_code "$(cloud_get state "$1")")" = finished ] && [ "$(cloud_get lot "$1")" = "$(basename "$2" .md)" ]; }
 # ---------- besoins découverts sur la VM (lot 02 d'aiguillage-cloud) ----------
@@ -150,7 +151,7 @@ cloud_session_line() {
   esac
 }
 cloud_image_file() { printf '%s/cloud/%s\n' "$LAB_STATE" "$P_NAME"; }
-cloud_image_get() { { sed -n "s/^$1=//p" "$(cloud_image_file)" 2>/dev/null || true; } | head -1; }
+cloud_image_get() { if kv_value "$LAB_STATE/cloud/$P_NAME" "$1"; then printf '%s\n' "$KV_VALUE"; fi; }
 cloud_now() { rdv_now 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ---------- clé de déploiement : une paire SSH par couloir, par départ (lot 06 d'aiguillage-cloud) ----------
@@ -185,8 +186,8 @@ cloud_key_ids() { # <préfixe de titre> → ids des clés dont le titre commence
   with_timeout 30 gh repo deploy-key list -R "$r" --json id,title --jq ".[] | select(.title | startswith(\"$1\")) | .id" 2>/dev/null
 }
 cloud_key_listed() { # <id> : rc 0 si l'id figure encore dans la liste des clés du dépôt
-  local r; r="$(cloud_repo_slug)" && [ -n "$r" ] || return 1
-  with_timeout 30 gh repo deploy-key list -R "$r" --json id --jq '.[].id' 2>/dev/null | grep -qx "$1"
+  local r keys; r="$(cloud_repo_slug)" && [ -n "$r" ] || return 1
+  keys="$(with_timeout 30 gh repo deploy-key list -R "$r" --json id --jq '.[].id' 2>/dev/null)" && grep -qx "$1" <<<"$keys"
 }
 cloud_key_delete() { local r; r="$(cloud_repo_slug)" && [ -n "$r" ] || return 1; with_timeout 30 gh repo deploy-key delete -R "$r" "$1"; }
 # cloud_key_purge <slug> : les clés lab-cloud-<slug>-* restées sur GitHub (session plantée) supprimées par id, avant d'en créer une neuve ;
@@ -416,11 +417,11 @@ cloud_unbusy_mine() {   # seulement la sienne : un autre départ a pu poser la s
   [ -z "${CLOUD_BUSY:-}" ] || [ "$(cloud_busy_pid "$CLOUD_BUSY")" != "$$" ] || cloud_unbusy "$CLOUD_BUSY"; CLOUD_BUSY=""
 }
 cloud_project_machines() { # → « <machine><TAB><rôle> » : image du projet, puis couloir <slug>
-  local wt m
-  m="$(cloud_image_get machine)"; [ -z "$m" ] || printf '%s\tproject image\n' "$m"
+  local wt
+  kv_value "$LAB_STATE/cloud/$P_NAME" machine || true; [ -z "$KV_VALUE" ] || printf '%s\tproject image\n' "$KV_VALUE"
   for wt in "$P_ROOT"/.worktrees/*/; do
-    wt="${wt%/}"; m="$(wt_meta "$wt" cloud_machine)"; [ -n "$m" ] || continue
-    printf '%s\tlane %s\n' "$m" "$(basename "$wt")"
+    wt="${wt%/}"; kv_value "$wt/.lab/meta" cloud_machine || true; [ -n "$KV_VALUE" ] || continue
+    printf '%s\tlane %s\n' "$KV_VALUE" "${wt##*/}"
   done
 }
 cloud_machine_live() { # <machine> [<couloir exclu>] : une session de lot vivante l'occupe, ou lab la prépare — hors le couloir exclu
@@ -440,8 +441,8 @@ cloud_capacity() {
 cloud_lanes_on() {
   local wt l out=""
   for wt in "$P_ROOT"/.worktrees/*/; do
-    wt="${wt%/}"; l="$(basename "$wt")"; [ "$l" != "${2:-}" ] || continue
-    if [ "$(cloud_get machine "$wt")" = "$1" ] && cloud_live "$wt"; then out="$out$l"$'\n'; fi
+    wt="${wt%/}"; l="${wt##*/}"; [ "$l" != "${2:-}" ] || continue
+    cloud_get_set machine "$wt"; if [ "$CLOUD_GET" = "$1" ] && cloud_live "$wt"; then out="$out$l"$'\n'; fi
   done
   l="$(cloud_busy_lane "$1")"
   if [ -n "$l" ] && [ "$l" != "${2:-}" ] && pid_alive "$(cloud_busy_pid "$1")"; then
@@ -852,20 +853,25 @@ cloud_vm_script() {
   printf 'set -e; export GIT_SSH_COMMAND="%s"; mkdir -p ~/.lab-fin ~/work; rm -f ~/.lab-fin/%s ~/.lab-fin/%s.started; printf "%%s\\n" %s >~/.lab-fin/memcap; chmod +x ~/.lab-fin/memcap; LAB_CLOUD_MEM_MAX=%s ~/.lab-fin/memcap --setup; export CLAUDE_CODE_SHELL_PREFIX="$HOME/.lab-fin/memcap"; [ -d ~/%s/.git ] || git clone -q %s ~/%s; cd ~/%s; git config core.sshCommand "$GIT_SSH_COMMAND"; git fetch -q origin; if [ -n "$(git status --porcelain)" ]; then s="lab-$(date -u +%%Y%%m%%dT%%H%%M%%SZ)"; echo "lab: uncommitted changes kept in git stash $s (never committed, never dropped):"; git status --porcelain; git -c user.name=lab -c user.email=lab stash push -q -u -m "$s"; fi; git checkout -q -B %s %s; echo "%s"; : >~/.lab-fin/%s.started; exec claude --permission-mode bypassPermissions %s\n' \
     "$(cloud_ssh_opts "${CLOUD_ROUTE:-22}")" "$SLUG" "$SLUG" "$(shell_quote "$(cat "$LAB_ROOT/lib/memcap.sh")")" "$(shell_quote "${LAB_CLOUD_MEM_MAX:-}")" "$dir" "$(shell_quote "$url")" "$dir" "$dir" "$(shell_quote "$br")" "$(shell_quote "origin/$br")" "$CLOUD_START_MARK" "$SLUG" "$(shell_quote "$(cloud_goal_prompt "$1")")"
 }
-# cloud_lane_ws → le workspace local du couloir, où le terminal VM s'affiche
+# cloud_lane_ws → « <workspace>⇥<terminal initial> » : l'espace local du couloir, où le terminal VM s'affiche, et le terminal né avec lui
+# si cet appel l'a créé (vide sinon), à rendre une fois le terminal VM affiché
 cloud_lane_ws() {
-  local ws; ws="$(wt_ws "$WT")"
-  if [ -z "$ws" ] || ! cmux_ws_exists "$ws"; then ws="$(cmux_prepare_project "$P_NAME" "$P_ROOT" | cut -f2)" || ws=""; fi
-  printf '%s\n' "$ws"
+  local ws initial="" target; ws="$(wt_ws "$WT")"
+  if [ -z "$ws" ] || ! cmux_ws_exists "$ws"; then
+    target="$(cmux_prepare_project "$P_NAME" "$P_ROOT")" || target=""
+    IFS=$'\t' read -r _ ws initial <<<"$target"
+  fi
+  printf '%s\t%s\n' "$ws" "$initial"
 }
 # cloud_open <machine> <workspace distant> <terminal> : le terminal VM affiché dans le workspace du couloir, son pane local retenu
 # (pane, pane_ws : « OK surface=<id> workspace=<id> terminal=<id> », forme mesurée au lot 09) pour les alertes et la ligne d'onglet
 cloud_open() {
-  local ws out; ws="$(cloud_lane_ws)"
+  local ws initial out; ws="$(cloud_lane_ws)"; initial="${ws#*$'\t'}"; ws="${ws%%$'\t'*}"
   if ! out="$(cloud_vm open 60 open "$1/$2/$3" ${ws:+--workspace "$ws"} --no-focus 2>/dev/null)"; then
     warn "Cloud: terminal $3 not shown here — cmux vm open $1/$2/$3"; return 0
   fi
   cloud_put pane "$(printf '%s\n' "$out" | sed -n 's/.*surface=\([^ ]*\).*/\1/p' | head -1)"
+  cmux_drop_initial "$ws" "$initial" "$(cloud_get pane)" "$P_NAME"
   cloud_put pane_ws "$(printf '%s\n' "$out" | sed -n 's/.*workspace=\([^ ]*\).*/\1/p' | head -1)"
 }
 # cloud_pane [wt] → « <workspace><TAB><surface> » du pane local qui affiche le terminal VM, sinon le workspace du couloir seul
@@ -1119,7 +1125,7 @@ cloud_agent_alive() {
   local out; CLOUD_DEAD_CAUSE=""
   # shellcheck disable=SC2016 # évalué sur la VM
   out="$(cloud_vm agent 60 exec --timeout 60 "$1" -- sh -c 'pgrep -f "claude.*[b]ypassPermissions.*lab-fin/$1[;]" >/dev/null 2>&1; case $? in 0) echo alive ;; 1) echo dead; dmesg 2>/dev/null | grep -iE "out of memory|oom-kill" | tail -1 ;; *) echo unknown ;; esac' sh "$SLUG" 2>/dev/null)" || return 2
-  case "$(printf '%s\n' "$out" | head -1)" in
+  case "$(head -1 <<<"$out")" in
     alive) return 0 ;;
     dead) CLOUD_DEAD_CAUSE="$(printf '%s\n' "$out" | sed -n 2p | sed -E 's/^\[[^]]*\] *//' | cloud_plain | cut -c1-160)"
           CLOUD_DEAD_CAUSE="${CLOUD_DEAD_CAUSE:+last OOM since boot: $CLOUD_DEAD_CAUSE}"; return 1 ;;   # VM reprise, jamais redémarrée : peut-être une session plus ancienne
@@ -1312,7 +1318,8 @@ cloud_finish() {
   if [ "$code" != 0 ] && [ -z "$need" ]; then
     why="${why:-terminal exited with code $code}"
     [ -z "$tail" ] || why="$why — last lines: $tail"
-    local hint=" or cmux vm rm $m"; [ -z "$others" ] || hint=" — VM $m shared with ${others//,/, }, kept"   # jamais la VM d'un autre
+    # la VM part avec lab close ou le ménage Cloud, jamais une commande à taper (lot 01 de restes-cloud) ; jamais la VM d'un autre
+    local hint="; VM $m removed by lab close or the Cloud cleanup"; [ -z "$others" ] || hint=" — VM $m shared with ${others//,/, }, kept"
     cloud_put state failed; cloud_put detail "$why"
     if [ "$code" = timeout ]; then cloud_session_log timeout; else cloud_session_log failed; fi
     watch_issue "$f" failed "VM session of $br: $why — batch-end not opened; deploy key: $keyproof; next: lab next $P_NAME $SLUG (VM), --local (Mac)$hint"

@@ -287,7 +287,7 @@ _import_toml_refs() { # <fichier toml> → « catégorie<TAB>section » (une ré
 }
 _import_in() { awk -F '\t' -v f="$1" 'BEGIN {OFS = "\t"} {print $1, f, $2}'; }   # <fichier> : insère le fichier entre catégorie et repère
 _import_refs() { # toutes les références : « catégorie<TAB>fichier<TAB>repère »
-  local f n config root dir e target self settings legacy
+  local f n config root dir e target self settings legacy lines
   # Les hooks <copie>/hooks/ d'un fichier fusionné par la pose sont retirés, donc hors inventaire ; tout autre hook reste listé.
   settings="${LAB_CLAUDE_SETTINGS:-$(claude_home)/settings.json}"
   legacy='[]'; [ -z "$(_setup_hooks_file claude)" ] || legacy="$(_merge_legacy_prefixes "$settings")"
@@ -298,7 +298,7 @@ _import_refs() { # toutes les références : « catégorie<TAB>fichier<TAB>repè
   _import_toml_refs "$(codex_config)" | _import_in "$(codex_config)"
   for f in "$HOME/Library/LaunchAgents"/*.plist; do
     [ -f "$f" ] || continue
-    if { plutil -convert xml1 -o - -- "$f" 2>/dev/null || cat "$f"; } | _import_lines | grep -q .; then printf 'scheduled\t%s\tlaunchd job\n' "$f"; fi
+    if lines="$({ plutil -convert xml1 -o - -- "$f" 2>/dev/null || cat "$f"; } | _import_lines)" && grep -q . <<<"$lines"; then printf 'scheduled\t%s\tlaunchd job\n' "$f"; fi
   done
   { crontab -l 2>/dev/null || true; } | _import_lines | while IFS= read -r n; do printf 'scheduled\tcrontab\tline %s\n' "$n"; done
   for e in "$LAB_SETUP_IMPORT"/skills/*; do

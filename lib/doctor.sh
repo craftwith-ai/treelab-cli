@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034 # DOC_DONE est lu par le trap de dispatch dans bin/lab.
 # doctor.sh — mesure le contexte réellement chargé, vérifie le câblage, compare à la baseline (cliquet).
 # Sortie : blocs KEY=value (CHECK, STATUS, VALUE, LIMIT, NOTE) ; résumé humain sur stderr ; exit 1 si un RED.
-DOC_RED=0; DOC_METRICS=""; DOC_REPORT="${DOC_REPORT:-0}"; DOC_PROJECT=''; DOC_PROJECT_INDEX=0
+DOC_RED=0; DOC_METRICS=""; DOC_REPORT="${DOC_REPORT:-0}"; DOC_PROJECT=''; DOC_PROJECT_INDEX=0; DOC_BASE_TSV=''; DOC_SAY_W=
 BASELINE="${LAB_BASELINE:-$LAB_STATE/baseline.json}"
 DOC_ROOT_EXPLICIT="${LAB_INSTALL_ROOT:+yes}"
 if [ -z "${LAB_INSTALL_ROOT:-}" ] && [ -f "$LAB_ROOT/.release" ]; then LAB_INSTALL_ROOT="$LAB_ROOT"; fi
@@ -12,26 +12,40 @@ if [ -z "${LAB_INSTALL_ROOT:-}" ]; then
 fi
 LAB_INSTALL_ROOT="$(real_path "$LAB_INSTALL_ROOT")"   # l'installation globale pointe le checkout principal stable, jamais un worktree éphémère
 SKILLS_DIR="${LAB_SKILLS_DIR:-$LAB_INSTALL_ROOT/skills}"   # surchargeable pour les tests ; par défaut, mesure ce qui est réellement installé
-# doctor_old_name <nom> → le nom français d'une mesure avant le lot 09 du couloir anglais : une baseline gelée avant reste lue sous
-# cet ancien nom, jamais réécrite (--freeze ajoute le nom anglais à côté). Sans ancien nom : le nom tel quel.
-doctor_old_name() {
+# doctor_old_name_set <nom> → le nom français d'une mesure avant le lot 09 du couloir anglais : une baseline gelée avant reste lue sous
+# cet ancien nom, jamais réécrite (--freeze ajoute le nom anglais à côté). Sans ancien nom : le nom tel quel. DOC_OLD, sans sous-shell.
+doctor_old_name_set() {
   case "$1" in
-    *.claude_md.lines_outside_import) printf '%s\n' "${1%.claude_md.lines_outside_import}.claude_md.lines_hors_import" ;;
-    *.rules.without_paths) printf '%s\n' "${1%.rules.without_paths}.rules.sans_paths" ;;
-    *.tracked.mechanical) printf '%s\n' "${1%.tracked.mechanical}.tracked.mecanique" ;;
-    *.worktrees.outside_layout) printf '%s\n' "${1%.worktrees.outside_layout}.worktrees.hors_layout" ;;
-    *.hooks.broken) printf '%s\n' "${1%.hooks.broken}.hooks.casses" ;;
-    global.skills.codex.duplicates) echo global.skills.codex.doublons ;;
-    *) printf '%s\n' "$1" ;;
+    *.claude_md.lines_outside_import) DOC_OLD="${1%.claude_md.lines_outside_import}.claude_md.lines_hors_import" ;;
+    *.rules.without_paths) DOC_OLD="${1%.rules.without_paths}.rules.sans_paths" ;;
+    *.tracked.mechanical) DOC_OLD="${1%.tracked.mechanical}.tracked.mecanique" ;;
+    *.worktrees.outside_layout) DOC_OLD="${1%.worktrees.outside_layout}.worktrees.hors_layout" ;;
+    *.hooks.broken) DOC_OLD="${1%.hooks.broken}.hooks.casses" ;;
+    global.skills.codex.duplicates) DOC_OLD=global.skills.codex.doublons ;;
+    *) DOC_OLD="$1" ;;
   esac
+}
+# doctor_base_set <nom> : DOC_BASE, la valeur de la baseline sous ce nom, sinon sous son ancien nom, sinon vide — celle de jq
+# '.[$k] // .[$o] // empty', lue dans DOC_BASE_TSV (la baseline lue une fois par bilan, une ligne « clé<TAB>valeur » par mesure)
+doctor_base_set() {
+  local t
+  DOC_BASE=''
+  t="${DOC_BASE_TSV#*$'\n'"$1"$'\t'}"
+  if [ "$t" = "$DOC_BASE_TSV" ]; then
+    doctor_old_name_set "$1"; t="${DOC_BASE_TSV#*$'\n'"$DOC_OLD"$'\t'}"
+    [ "$t" != "$DOC_BASE_TSV" ] || return 0
+  fi
+  DOC_BASE="${t%%$'\n'*}"
+}
+# doctor_upper <sévérité> : DOC_UPPER, en majuscules — ok, warn et red sans programme, tout autre mot par tr comme avant
+doctor_upper() {
+  case "$1" in ok) DOC_UPPER=OK ;; warn) DOC_UPPER=WARN ;; red) DOC_UPPER=RED ;; *) DOC_UPPER="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" ;; esac
 }
 check() { # check <nom> <valeur> <limite|-> <ok|warn|red> [note] [sans-cliquet|cliquet-au-dela]   (statut calculé si limite numérique ;
   # cliquet-au-dela : la baseline ne rougit qu'au-delà de la limite, pour une mesure qui fluctue sous elle)
   local name="$1" value="$2" limit="$3" sev="$4" note="${5:-}" ratchet="${6:-}" status=OK base=""
-  if [ "$ratchet" != sans-cliquet ] && [ -n "$DOC_BASE_JSON" ]; then
-    base="$(printf '%s' "$DOC_BASE_JSON" | jq -r --arg k "$name" --arg o "$(doctor_old_name "$name")" '.[$k] // .[$o] // empty')"
-  fi
-  if [ "$limit" != "-" ] && [[ "$value" =~ ^[0-9]+$ ]] && doctor_greater "$value" "$limit"; then status="$(printf '%s' "$sev" | tr '[:lower:]' '[:upper:]')"; note="${note:+$note; }above the limit $limit"; fi
+  if [ "$ratchet" != sans-cliquet ] && [ -n "$DOC_BASE_JSON" ]; then doctor_base_set "$name"; base="$DOC_BASE"; fi
+  if [ "$limit" != "-" ] && [[ "$value" =~ ^[0-9]+$ ]] && doctor_greater "$value" "$limit"; then doctor_upper "$sev"; status="$DOC_UPPER"; note="${note:+$note; }above the limit $limit"; fi
   if [ "$ratchet" = cliquet-au-dela ] && [ "$status" = OK ]; then base=""; fi
   if [ -n "$base" ] && [[ "$value" =~ ^[0-9]+$ ]] && doctor_greater "$value" "$base"; then status=RED; note="${note:+$note; }went up: baseline $base"; fi
   [ "$status" = RED ] && DOC_RED=1
@@ -39,19 +53,58 @@ check() { # check <nom> <valeur> <limite|-> <ok|warn|red> [note] [sans-cliquet|c
   doctor_emit "$name" "$status" "$value" "$limit" "$note" "$base"
 }
 flag() { # flag <nom> <ok|warn|red> <valeur> [note] : contrôle booléen
-  local st; st="$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]')"; [ "$st" = RED ] && DOC_RED=1
+  local st; doctor_upper "$2"; st="$DOC_UPPER"; [ "$st" = RED ] && DOC_RED=1
   doctor_emit "$1" "$st" "$3" - "${4:-}" '' "${5:-}"
 }
 . "$LAB_ROOT/lib/doctor_report.sh"
 . "$LAB_ROOT/lib/doctor_product.sh"
 . "$LAB_ROOT/lib/tests_guard.sh"
 . "$LAB_ROOT/lib/mcp.sh"
-lines_of() { [ -f "$1" ] && wc -l <"$1" | tr -d ' ' || echo 0; }
+lines_of() { lines_set "$1"; printf '%s\n' "$DOC_N"; }
+# lines_set <fichier> : DOC_N, ses fins de ligne comme wc -l les compte (une dernière ligne sans fin n'est pas comptée), 0 sans
+# fichier ou illisible (l'ancien wc -l || echo 0) ; lu par le shell (lot 03 de charge-processeur), sans arrêter le bilan
+lines_set() {
+  local _l
+  DOC_N=0
+  [ -f "$1" ] || return 0
+  { while IFS= read -r _l; do DOC_N=$((DOC_N + 1)); done <"$1"; } 2>/dev/null || true
+}
 bytes_of() { [ -f "$1" ] && wc -c <"$1" | tr -d ' ' || echo 0; }
-# octets réellement chargés d'un dossier de skills : name + description de chaque SKILL.md
-skills_desc_bytes() { local d f t=0; for f in "$1"/*/SKILL.md; do [ -f "$f" ] || continue; d="$(awk '/^---/{c++; next} c==1 && /^(name|description):/' "$f" | wc -c)"; t=$((t + d)); done; echo "$t"; }
 skills_count() { local n=0 f; for f in "$1"/*/SKILL.md; do [ -f "$f" ] && n=$((n + 1)); done; echo "$n"; }
-skill_header() { awk -v k="$2" '/^---/{c++; next} c==1 && index($0, k":")==1 {sub("^"k": *", ""); print; exit}' "$1"; }   # <SKILL.md> <name|description> : champ de l'en-tête, lu par Claude et Codex
+# doctor_skill_facts <dossier de skills> (lot 03 de charge-processeur) : un awk pour tous les SKILL.md (fichiers réguliers, dans
+# l'ordre du motif) au lieu de cinq programmes par skill — DOC_SKILL_NAME[i] et DOC_SKILL_DESC[i], les champs name: et description:
+# du premier en-tête (comme skill_header), DOC_SKILL_RESERVED[i] = 1 si une ligne commence par « disable-model-invocation: true »
+# (comme grep), DOC_SKILL_BYTES les octets des lignes name: et description: de cet en-tête (comme skills_desc_bytes)
+doctor_skill_facts() {
+  local f i=0 line
+  DOC_SKILL_FILES=(); DOC_SKILL_NAME=(); DOC_SKILL_DESC=(); DOC_SKILL_RESERVED=(); DOC_SKILL_BYTES=0
+  # DOC_SKILL_FILES : la liste lue, que les contrôles des en-têtes reparcourent (jamais un second motif : revue du lot 03)
+  for f in "$1"/*/SKILL.md; do [ -f "$f" ] && DOC_SKILL_FILES+=("$f"); done
+  [ "${#DOC_SKILL_FILES[@]}" -gt 0 ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      N*) DOC_SKILL_NAME[i]="${line#N}" ;;
+      D*) DOC_SKILL_DESC[i]="${line#D}" ;;
+      R*) DOC_SKILL_RESERVED[i]="${line#R}" ;;
+      B*) DOC_SKILL_BYTES=$((DOC_SKILL_BYTES + ${line#B})); i=$((i + 1)) ;;
+    esac
+  done < <(LC_ALL=C awk '
+    BEGIN {
+      for (i = 1; i < ARGC; i++) {
+        c = 0; name = ""; desc = ""; hn = 0; hd = 0; res = 0; bytes = 0
+        while ((getline l < ARGV[i]) > 0) {
+          if (l ~ /^---/) { c++; continue }
+          if (c == 1 && l ~ /^(name|description):/) bytes += length(l) + 1
+          if (c == 1 && !hn && index(l, "name:") == 1) { hn = 1; name = l; sub(/^name: */, "", name) }
+          if (c == 1 && !hd && index(l, "description:") == 1) { hd = 1; desc = l; sub(/^description: */, "", desc) }
+          if (l ~ /^disable-model-invocation: true/) res = 1
+        }
+        close(ARGV[i])
+        print "N" name; print "D" desc; print "R" res; print "B" bytes
+      }
+      exit
+    }' "${DOC_SKILL_FILES[@]}" 2>/dev/null)
+}
 rules_without_paths() { local n=0 f; for f in "$1"/.claude/rules/*.md; do [ -f "$f" ] || continue; grep -q '^paths:' "$f" || n=$((n + 1)); done; echo "$n"; }
 expected_link() { # <chemin> <cible> → flag
   if [ -L "$1" ] && [ "$1" -ef "$2" ]; then flag "link.$3" ok "$1 → $2"; else flag "link.$3" red "$(readlink "$1" 2>/dev/null || echo missing)" "expected → $2 (treelab setup)"; fi
@@ -137,7 +190,7 @@ doctor_hook_count() {
 doctor_statusline_record() {
   local cmd w script="" ok=0
   cmd="$(jq -r '.statusLine.command // empty' "$1" 2>/dev/null || true)"
-  if printf '%s' "$cmd" | grep -q 'account record'; then ok=1; fi
+  if grep -q 'account record' <<<"$cmd"; then ok=1; fi
   # chaque mot qui désigne un fichier (« bash ~/x.sh », « $HOME/x.sh ») : le script n'est pas toujours le premier mot (revue du lot 01)
   for w in $cmd; do
     case "$w" in \~/*) w="$HOME/${w#\~/}" ;; "\$HOME/"*) w="$HOME/${w#\$HOME/}" ;; esac
@@ -150,7 +203,7 @@ doctor_statusline_record() {
   fi
 }
 doctor_global() {
-  local f n b s names bad stale
+  local f n b s names bad stale i
   printf '\n== global ==\n' >&2
   doctor_install_context
   if [ "$DOC_CLAUDE" = yes ]; then
@@ -170,24 +223,27 @@ doctor_global() {
   if [ -n "$names" ]; then flag install.legacy warn "${names# }" "Outdated Treelab links; treelab setup removes the intact ones; remove a changed link yourself if it is no longer used."
   else flag install.legacy ok 0 "No outdated Treelab link."; fi
   f="$LAB_INSTALL_ROOT/templates/global-instructions.md"
-  check global.instructions.lines "$(lines_of "$f")" 40 red; check global.instructions.bytes "$(bytes_of "$f")" - -
+  lines_set "$f"; check global.instructions.lines "$DOC_N" 40 red; check global.instructions.bytes "$(bytes_of "$f")" - -
   check global.skills.count "$(skills_count "$SKILLS_DIR")" "${LAB_DOCTOR_SKILLS_WARN_LIMIT:--}" warn 'Number of skills; adjust the chosen limit if this selection is intended.' sans-cliquet
-  check global.skills.desc_bytes "$(skills_desc_bytes "$SKILLS_DIR")" - - '' sans-cliquet
+  doctor_skill_facts "$SKILLS_DIR"
+  check global.skills.desc_bytes "$DOC_SKILL_BYTES" - - '' sans-cliquet
   # Codex lit ~/.agents/skills (→ _lab/skills, prouvé par link.agents-skills) ET ~/.codex/skills : un skill présent aux deux endroits est vu deux fois
-  n=0; names=""; for f in "$SKILLS_DIR"/*/; do [ "$DOC_CODEX" = yes ] && [ -f "$f/SKILL.md" ] || continue; s="$(basename "$f")"; if [ -f "$(codex_home)/skills/$s/SKILL.md" ]; then n=$((n + 1)); names="$names $s"; fi; done
-  check global.skills.codex.duplicates "$n" 0 red "${names:+Codex would see the skill twice ($(codex_home)/skills and ~/.agents/skills):$names}"
+  b="$(codex_home)"
+  n=0; names=""; for f in "$SKILLS_DIR"/*/; do [ "$DOC_CODEX" = yes ] && [ -f "$f/SKILL.md" ] || continue; s="${f%/}"; s="${s##*/}"; if [ -f "$b/skills/$s/SKILL.md" ]; then n=$((n + 1)); names="$names $s"; fi; done
+  check global.skills.codex.duplicates "$n" 0 red "${names:+Codex would see the skill twice ($b/skills and ~/.agents/skills):$names}"
   # en-têtes : name = dossier, description non vide — c'est tout ce que les deux outils chargent avant d'ouvrir un skill (tous les skills, pas une liste)
-  n=0; bad=""; for f in "$SKILLS_DIR"/*/SKILL.md; do
-    [ -f "$f" ] || continue; s="$(basename "$(dirname "$f")")"; n=$((n + 1))
-    if [ "$(skill_header "$f" name)" != "$s" ] || [ -z "$(skill_header "$f" description)" ]; then bad="$bad $s"; fi
+  n=0; bad=""; i=0; while [ "$i" -lt "${#DOC_SKILL_FILES[@]}" ]; do
+    f="${DOC_SKILL_FILES[$i]}"; s="${f%/SKILL.md}"; s="${s##*/}"; n=$((n + 1))
+    if [ "${DOC_SKILL_NAME[$i]:-}" != "$s" ] || [ -z "${DOC_SKILL_DESC[$i]:-}" ]; then bad="$bad $s"; fi
+    i=$((i + 1))
   done
   if [ -z "$bad" ]; then flag global.skills.headers ok "$n/$n"; else flag global.skills.headers red "$bad" "name: = folder and a non-empty description: (read by Claude and Codex)"; fi
   # skills réservés à l'utilisateur = ceux qui portent disable-model-invocation: true (en-tête Claude) ; Codex ignore cet en-tête et les
   # déclencherait seul sur leur description : il lui faut agents/openai.yaml avec policy.allow_implicit_invocation: false (review du lot 10 :
   # une liste codée en dur restait verte pour un troisième skill réservé)
-  n=0; bad=""; for f in "$SKILLS_DIR"/*/SKILL.md; do
-    grep -q '^disable-model-invocation: true' "$f" 2>/dev/null || continue; s="$(basename "$(dirname "$f")")"; n=$((n + 1))
-    grep -Eq '^[[:space:]]*allow_implicit_invocation:[[:space:]]*false[[:space:]]*$' "$(dirname "$f")/agents/openai.yaml" 2>/dev/null || bad="$bad $s"
+  n=0; bad=""; i=0; while [ "$i" -lt "${#DOC_SKILL_FILES[@]}" ]; do
+    f="${DOC_SKILL_FILES[$i]}"; i=$((i + 1)); [ "${DOC_SKILL_RESERVED[$((i - 1))]:-}" = 1 ] || continue; s="${f%/SKILL.md}"; s="${s##*/}"; n=$((n + 1))
+    grep -Eq '^[[:space:]]*allow_implicit_invocation:[[:space:]]*false[[:space:]]*$' "${f%/SKILL.md}/agents/openai.yaml" 2>/dev/null || bad="$bad $s"
   done
   if [ -z "$bad" ]; then flag global.skills.reserved.codex ok "$n/$n"; else flag global.skills.reserved.codex red "$bad" "agents/openai.yaml with policy.allow_implicit_invocation: false (otherwise Codex triggers them on its own)"; fi
   n=0; for f in "$(codex_home)"/agents/*.toml; do [ -f "$f" ] && n=$((n + 1)); done; check global.codex.agents.count "$n" - - '' sans-cliquet
@@ -375,22 +431,28 @@ doctor_project() {
   { printf '\n'; doctor_say "== project $(doctor_text "$p") ($(doctor_text "$root")) =="; } >&2
   local sev=warn; [ "$P_DOCS" = repo ] && sev=red   # le layout vit dans le dépôt : son contexte est tenu au budget ; sinon il n'est pas à nous
   if [ -f "$root/AGENTS.md" ]; then
-    check "$p.agents_md.lines" "$(lines_of "$root/AGENTS.md")" 80 "$sev"
+    lines_set "$root/AGENTS.md"; check "$p.agents_md.lines" "$DOC_N" 80 "$sev"
     n="$(grep -cv '^@' "$root/CLAUDE.md" 2>/dev/null || echo 0)"; check "$p.claude_md.lines_outside_import" "$n" 20 "$sev"
     if grep -q '^@AGENTS.md' "$root/CLAUDE.md" 2>/dev/null; then flag "$p.claude_md.imports_agents" ok yes; else flag "$p.claude_md.imports_agents" "$sev" no "CLAUDE.md must start with @AGENTS.md"; fi
   else
-    check "$p.claude_md.lines" "$(lines_of "$root/CLAUDE.md")" 80 "$sev" "no AGENTS.md: Codex reads nothing"
+    lines_set "$root/CLAUDE.md"; check "$p.claude_md.lines" "$DOC_N" 80 "$sev" "no AGENTS.md: Codex reads nothing"
   fi
   check "$p.context.bytes" "$(( $(bytes_of "$root/CLAUDE.md") + $(bytes_of "$root/AGENTS.md") ))" - -
   check "$p.rules.without_paths" "$(rules_without_paths "$root")" 0 "$sev" "a rule without paths: always loads"
   check "$p.skills.count" "$(skills_count "$root/.claude/skills")" 6 "$sev"
-  f="$(memory_file "$root")"; check "$p.memory.lines" "$(lines_of "$f")" 200 warn "beyond that, the rest no longer loads" sans-cliquet
+  f="$(memory_file "$root")"; lines_set "$f"; check "$p.memory.lines" "$DOC_N" 200 warn "beyond that, the rest no longer loads" sans-cliquet
   # Le cliquet suit la part stable à la racine du projet. La taille reçue dans le couloir reste publiée :
   # son chemin, sa branche et son lot varient normalement sans signifier que le contexte durable a grossi.
+  # les deux démarrages en même temps, à blanc (lot 03 de charge-processeur : l'un après l'autre, une seconde par bilan ici)
+  f="$(mktemp "${TMPDIR:-/tmp}/lab-ctx.XXXXXX")" || f=/dev/null
+  { printf '{"cwd":"%s"}' "$root" | LAB_DRY=1 LAB_NO_SWEEP=1 "$LAB_ROOT/bin/lab" hook session-start 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null || true; } >"$f" &
+  n=$!
   ctx="$(printf '{"cwd":"%s"}' "$P_ROOT" | LAB_DRY=1 LAB_NO_SWEEP=1 "$LAB_ROOT/bin/lab" hook session-start 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null || true)"
-  ctx_wt="$(printf '{"cwd":"%s"}' "$root" | LAB_DRY=1 LAB_NO_SWEEP=1 "$LAB_ROOT/bin/lab" hook session-start 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null || true)"
+  wait "$n" 2>/dev/null || true
+  ctx_wt=''; IFS= read -r -d '' ctx_wt <"$f" || true; [ "$f" = /dev/null ] || rm -f "$f"
+  while [ "${ctx_wt%$'\n'}" != "$ctx_wt" ]; do ctx_wt="${ctx_wt%$'\n'}"; done   # comme $( ) : fins de ligne finales retirées
   check "$p.sessionstart.chars" "${#ctx}" 800 red "measured at the root; a worktree session receives ${#ctx_wt}"
-  check "$p.notes.lines" "$(lines_of "$(project_dir "$p")/notes.md")" 21 warn
+  lines_set "$(project_dir "$p")/notes.md"; check "$p.notes.lines" "$DOC_N" 21 warn
   # fichiers de mécanique versionnés par erreur
   n="$(git -C "$root" ls-files .lab .worktrees .codex-local 2>/dev/null | wc -l | tr -d ' ')"; check "$p.tracked.mechanical" "$n" 0 red ".lab/.worktrees must never be tracked"
   # worktrees : hérités hors .worktrees/, prunables, verrous morts
@@ -493,11 +555,65 @@ doctor_conflicts() {
 # le déclencherait et l'effacerait) ; couloir non fusionné servi depuis plus de 2 jours ; sonde ≠ registre (sonde lancée au plus
 # LAB_DOCTOR_PROBE_TIMEOUT secondes depuis le checkout principal ; muette, en échec ou hors ligne : ignorée en silence)
 DOC_SERVED_DAYS=2
+# doctor_probes_launch <projet…> (lot 03 de charge-processeur) : les sondes de chaque projet partent dès le début du bilan et tournent
+# pendant les contrôles du poste et du projet — une sonde de 5 s ne s'ajoute plus au reste ; doctor_targets attend celles de son
+# projet. Un projet dont la config ne déclare aucune sonde ne coûte rien ; les autres, un sous-shell d'arrière-plan qui charge le
+# projet sans toucher au shell du bilan, lance ses sondes et les attend. Sorties dans DOC_PROBE_ROOT/<rang du projet>.<cible>.
+# LAB_DOCTOR_NO_PROBES=1 (garde de livraison) : aucune sonde lancée.
+DOC_PROBE_ROOT=''; DOC_PROBE_JOBS=(); DOC_PROBE_PRE=''
+doctor_probes_launch() {
+  local p i=0 line probes
+  [ "${LAB_DOCTOR_NO_PROBES:-}" != 1 ] || return 0
+  for p in "$@"; do
+    i=$((i + 1)); probes=0
+    case "$p" in *[[:cntrl:]]*) continue ;; esac
+    { while IFS= read -r line; do case "$line" in probe.*=?*) probes=1; break ;; esac; done <"$LAB_PROJECTS/$p/config"; } 2>/dev/null || true
+    [ "$probes" = 1 ] || continue
+    [ -n "$DOC_PROBE_ROOT" ] || DOC_PROBE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/lab-probe.XXXXXX")" || { DOC_PROBE_ROOT=''; return 0; }
+    # sans le piège EXIT du bilan (--report : bash 5 le rejouerait à la sortie du sous-shell), sans le descripteur 3 de bats ou du rapport
+    # shellcheck disable=SC2046 # noms de cibles, sans espace
+    ( trap - EXIT; load_project "$p" && doctor_probes_start "$DOC_PROBE_ROOT/$i." $(deploy_registries) ) </dev/null >/dev/null 2>&1 3>&- &
+    DOC_PROBE_JOBS[i]=$!
+  done
+}
+# doctor_probes_start <préfixe> <cible…> : dans le sous-shell d'un projet, la sonde de chaque cible qui en a une et dont le registre porte
+# une révision, toutes en même temps, chacune coupée à LAB_DOCTOR_PROBE_TIMEOUT (15 s) ; sortie dans <préfixe><cible>
+doctor_probes_start() {
+  local pre="$1" t probe rev pid; local -a pids=(); shift
+  for t in "$@"; do
+    probe="$(deploy_cfg probe "$t")"; rev="$(state_field "$(deploy_dir)/$t" rev)"
+    [ -n "$probe" ] && [[ "$rev" =~ ^[0-9a-f]{7,40}$ ]] || continue
+    (cd "$P_ROOT" && LAB_DEPLOY_TARGET="$t" with_timeout "${LAB_DOCTOR_PROBE_TIMEOUT:-15}" bash -c "$probe") </dev/null >"$pre$t" 2>/dev/null &
+    pids+=("$!")
+  done
+  # chaque sonde attendue par son numéro : jamais de wait nu
+  for pid in "${pids[@]+"${pids[@]}"}"; do wait "$pid" 2>/dev/null || true; done
+}
+# doctor_probes_wait : attend les sondes du projet en cours (rang DOC_PROJECT_INDEX) ; DOC_PROBE_PRE : préfixe de leurs sorties, vide sans
+doctor_probes_wait() {
+  local pid="${DOC_PROBE_JOBS[$DOC_PROJECT_INDEX]:-}"
+  DOC_PROBE_PRE=''
+  [ -n "$pid" ] || return 0
+  wait "$pid" 2>/dev/null || true
+  DOC_PROBE_PRE="$DOC_PROBE_ROOT/$DOC_PROJECT_INDEX."
+}
+# doctor_probes_end [--no-wait] : fin du bilan — sondes encore en vol attendues (projet sans section des cibles), dossier retiré ;
+# --no-wait (bilan arrêté sur une erreur) : retiré sans les attendre, elles finissent seules, au plus LAB_DOCTOR_PROBE_TIMEOUT
+doctor_probes_end() {
+  local pid
+  if [ "${1:-}" != --no-wait ]; then
+    for pid in "${DOC_PROBE_JOBS[@]+"${DOC_PROBE_JOBS[@]}"}"; do wait "$pid" 2>/dev/null || true; done
+  fi
+  [ -z "$DOC_PROBE_ROOT" ] || rm -rf "$DOC_PROBE_ROOT"
+  DOC_PROBE_ROOT=''; DOC_PROBE_JOBS=()
+}
 doctor_targets() {
-  local p="$1" root="$2" t nop="" old="" s0 wf="" diff="" probe got rev reg i ep lanes="" w; local -a l=() h=() m=() sn=()
+  local p="$1" root="$2" t nop="" old="" s0 wf="" diff="" probe got rev reg i ep lanes="" w regs; local -a l=() h=() m=() sn=()
   [ "$(deploy_targets)" != none ] || [ -n "$(deploy_registries)" ] || return 0
   for t in $(deploy_targets); do [ "$t" = none ] || [ -n "$(deploy_cfg probe "$t")" ] || nop="${nop:+$nop }$t"; done
-  for t in $(deploy_registries); do
+  regs="$(deploy_registries)"
+  doctor_probes_wait   # lancées au début du bilan (doctor_probes_launch)
+  for t in $regs; do
     reg="$(deploy_dir)/$t"; ep="$(state_field "$reg" epoch)"
     read -r -a l <<<"$(state_field "$reg" lanes)" || true
     read -r -a h <<<"$(state_field "$reg" heads)" || true
@@ -513,8 +629,8 @@ doctor_targets() {
       fi
     done
     probe="$(deploy_cfg probe "$t")"; rev="$(state_field "$reg" rev)"
-    if [ -n "$probe" ] && [[ "$rev" =~ ^[0-9a-f]{7,40}$ ]]; then
-      got="$( (cd "$P_ROOT" && LAB_DEPLOY_TARGET="$t" with_timeout "${LAB_DOCTOR_PROBE_TIMEOUT:-15}" bash -c "$probe") </dev/null 2>/dev/null | grep -oE '[0-9a-f]{7,40}' | head -1 || true)"
+    if [ -n "$probe" ] && [[ "$rev" =~ ^[0-9a-f]{7,40}$ ]] && [ -n "$DOC_PROBE_PRE" ] && [ -f "$DOC_PROBE_PRE$t" ]; then
+      got="$(grep -oE '[0-9a-f]{7,40}' "$DOC_PROBE_PRE$t" 2>/dev/null | head -1 || true)"
       case "$rev" in "${got:-$rev}"*) ;; *) diff="${diff:+$diff ; }$t serves ${got:0:7}, register ${rev:0:7}" ;; esac
     fi
   done
@@ -584,7 +700,7 @@ doctor_ci_measures() {
   if ! ci_fresh "$p" "$CI_WINDOW_DAYS"; then flag "$p.ci.measures" ok "not measured" "lab next and lab close measure the CI minutes once a day (gh)"; return; fi
   v="$(ci_get "$p" MINUTES_WEEK)"; check "$p.ci.minutes_week" "${v:-?}" 1500 warn "equivalent minutes over $(ci_get "$p" PERIOD) (macOS × 10)" cliquet-au-dela
   v="$(ci_get "$p" RUNS_PER_PR)"; check "$p.ci.runs_per_pr" "${v:-?}" 3 warn "CI runs per pull request; drafts and concurrency cancel the useless ones" cliquet-au-dela
-  v="$(ci_get "$p" HEAVY_PR_JOBS)"; check "$p.ci.heavy_pr_jobs" "${v:-?}" 0 warn "pull request jobs over 15 min outside full-suite: run targeted tests, the full suite once per lane" cliquet-au-dela
+  v="$(ci_get "$p" HEAVY_PR_JOBS)"; check "$p.ci.heavy_pr_jobs" "${v:-?}" 0 warn "pull request jobs over 15 min outside full-suite: run targeted tests, the full suite at night" cliquet-au-dela
   v="$(ci_get "$p" NIGHT_RED_DAYS)"; check "$p.ci.night_red_days" "${v:-?}" 2 warn "red nights of the base over 7 days: fix them in a fix/ lane" cliquet-au-dela
 }
 # doctor_lot_sizes <projet> <docs> : <projet>.batch_files.size, sans cliquet (une fiche grossit pendant son lot) — octets de la plus lourde
@@ -592,14 +708,48 @@ doctor_ci_measures() {
 # avertissement ; au-delà de 60 000, rouge si la ligne **Créé** date du 2026-09-16 ou après, avertissement pour une fiche antérieure ou
 # sans date lisible (une fiche de 193 Ko dont seule la Reprise servait, sans signal avant : constat 1 et A7 du brief, lot 06).
 DOC_LOT_WARN=30000; DOC_LOT_RED=60000; DOC_LOT_RULE=2026-09-16
+# doctor_lot_facts <fiche…> (lot 03 de charge-processeur) : DOC_LOT_SIZE et DOC_LOT_DATE, la taille (wc -c) et la date « Créé » de
+# chaque fiche, dans l'ordre — un wc pour toutes, un awk pour les dates (la première ligne qui en porte une, la dernière date de cette
+# ligne, après lang_line : l'ancien lang_norm | sed | head), au lieu de cinq programmes par fiche
+doctor_lot_facts() {
+  local i=0 line n f; local -a out=()
+  DOC_LOT_SIZE=(); DOC_LOT_DATE=()
+  [ "$#" -gt 0 ] || return 0
+  # wc imprime « taille nom » dans l'ordre (et un total) : une ligne qui ne finit pas par le nom attendu → fiche par fiche, comme avant
+  while IFS= read -r line; do out+=("$line"); done < <(wc -c -- "$@" 2>/dev/null)
+  for f in "$@"; do
+    line="${out[$i]:-}"; n="${line#"${line%%[! ]*}"}"; n="${n%% *}"
+    if [ "$line" = "${line%" $f"}" ] || [ -z "$n" ] || [ -n "${n//[0-9]/}" ]; then n="$(wc -c <"$f" 2>/dev/null | tr -d ' ')" || n=''; fi
+    DOC_LOT_SIZE+=("$n"); i=$((i + 1))
+  done
+  i=0
+  while IFS= read -r line; do DOC_LOT_DATE[i]="$line"; i=$((i + 1)); done < <(LC_ALL=C LANG_S="$LANG_PAIRS_S" LANG_F="$LANG_PAIRS_F" LANG_V="$LANG_PAIRS_V" \
+    awk "$LANG_AWK"'
+    BEGIN {
+      lang_init()
+      for (i = 1; i < ARGC; i++) {
+        d = ""
+        while (d == "" && (getline raw < ARGV[i]) > 0) {
+          s = lang_line(raw, 0)
+          while (match(s, /\*\*Créé\*\* *: *[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)) { d = substr(s, RSTART + RLENGTH - 10, 10); s = substr(s, RSTART + 1) }
+        }
+        close(ARGV[i]); print d
+      }
+      exit
+    }' "$@" 2>/dev/null)
+}
 doctor_lot_sizes() {
-  local p="$1" docs="$2" f summary max n_warn n_red n_old top sev=warn note=""
+  local p="$1" docs="$2" f i summary max n_warn n_red n_old top sev=warn note=""; local -a files=()
+  for f in "$docs"/lots/lot-[0-9]*.md "$docs"/lots/*/lot-[0-9]*.md; do
+    [ -f "$f" ] || continue
+    [ "${f#"$docs"/lots/preuves/}" = "$f" ] || continue
+    files+=("$f")
+  done
+  doctor_lot_facts "${files[@]+"${files[@]}"}"
   summary="$(
-    for f in "$docs"/lots/lot-[0-9]*.md "$docs"/lots/*/lot-[0-9]*.md; do
-      [ -f "$f" ] || continue
-      [ "${f#"$docs"/lots/preuves/}" = "$f" ] || continue   # pas de case dans $( ) : bash 3.2 lit mal sa parenthèse
-      printf '%s\t%s\t%s\n' "$(wc -c <"$f" | tr -d ' ')" \
-        "$(lang_norm <"$f" | sed -n 's/.*\*\*Créé\*\* *: *\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\).*/\1/p' | head -1)" "${f#"$docs"/lots/}"
+    i=0
+    while [ "$i" -lt "${#files[@]}" ]; do   # pas de case dans $( ) : bash 3.2 lit mal sa parenthèse
+      printf '%s\t%s\t%s\n' "${DOC_LOT_SIZE[$i]}" "${DOC_LOT_DATE[$i]:-}" "${files[$i]#"$docs"/lots/}"; i=$((i + 1))
     done | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k3,3 | LC_ALL=C awk -F '\t' -v w="$DOC_LOT_WARN" -v r="$DOC_LOT_RED" -v rule="$DOC_LOT_RULE" '
       NR == 1 { max = $1 }
       $1 + 0 > w + 0 { nw++; if (nw <= 3) top = top (nw > 1 ? ", " : "") $3 " (" $1 ")" }
@@ -702,24 +852,28 @@ cmd_doctor() {
   fi
   DOC_BASE_JSON=""
   if [ -e "$BASELINE" ] || [ -L "$BASELINE" ]; then
-    if DOC_BASE_JSON="$(jq -cse 'if length==1 and (.[0] | type=="object" and all(.[]; type=="number" and .>=0 and floor==.)) then .[0] else error("invalid baseline") end' "$BASELINE" 2>/dev/null)"; then :
+    if DOC_BASE_JSON="$(jq -cse 'if length==1 and (.[0] | type=="object" and all(.[]; type=="number" and .>=0 and floor==.)) then .[0] else error("invalid baseline") end' "$BASELINE" 2>/dev/null)"; then
+      # lue une fois pour tout le bilan (lot 03 de charge-processeur) ; une clé à tabulation ou fin de ligne ne nomme aucune mesure
+      DOC_BASE_TSV=$'\n'"$(printf '%s' "$DOC_BASE_JSON" | jq -r 'to_entries[] | select(.key | test("^[^\t\n]*$")) | "\(.key)\t\(.value)"')"$'\n'
     else DOC_BASE_JSON=''; baseline_bad=1; fi
   fi
   if [ "$baseline_bad:$project_only" = 1:0 ]; then flag global.baseline red unreadable 'Baseline unreadable or invalid; restore the chosen file without recalibrating it.'; fi
-  [ "$project_only" = 1 ] || doctor_global
   if [ "${#ps[@]}" -eq 0 ]; then
     if p="$(project_from_cwd 2>/dev/null)"; then ps=("$p"); else while IFS= read -r p; do ps+=("$p"); done < <(project_names); fi
   fi
+  doctor_probes_launch "${ps[@]+"${ps[@]}"}"   # avant les contrôles du poste : les sondes tournent pendant eux
+  [ "$project_only" = 1 ] || doctor_global
   if [ "${#ps[@]}" -eq 0 ]; then
     if [ "$DOC_REPORT" = 1 ]; then doctor_say 'No registered project to check.' >&3
     else doctor_say 'No registered project to check.' >&2; fi
   fi
   for p in "${ps[@]+"${ps[@]}"}"; do
     DOC_PROJECT="$p"; DOC_PROJECT_INDEX=$((DOC_PROJECT_INDEX + 1))
-    if [[ "$p" =~ [[:cntrl:]] ]] || ! (load_project "$p") 2>/dev/null; then doctor_error PROJECT; return 2; fi
+    if [[ "$p" =~ [[:cntrl:]] ]] || ! (load_project "$p") 2>/dev/null; then doctor_probes_end --no-wait; doctor_error PROJECT; return 2; fi
     if [ "$baseline_bad:$project_only" = 1:1 ]; then flag "$p.baseline" red unreadable 'Baseline unreadable or invalid; restore the chosen file without recalibrating it.'; fi
     doctor_project "$p" "$root"
   done
+  doctor_probes_end
   if [ "$freeze:$baseline_bad" = 1:0 ]; then
     mkdir -p "$(dirname "$BASELINE")"
     { [ -n "$DOC_BASE_JSON" ] && printf '%s\n' "$DOC_BASE_JSON" || echo '{}'; } >"$BASELINE.old"

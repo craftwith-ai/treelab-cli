@@ -60,11 +60,21 @@ function sid_of(args,   a, n, i, s) {
   for (i = 2; i <= n; i++) if (a[i] ~ /^--(session-id|resume)=[0-9a-fA-F-]+$/) { s = a[i]; sub(/^[^=]*=/, "", s); if (length(s) == 36) return s }
   return ""
 }
-function family_of(args, ag,   a, b0) {
+# term_load : les apps de terminal posées (lot 02 du couloir app-treelab : le fork de cmux) — paquets et noms de commande de TOP_TERM_APPS et
+# TOP_TERM_CLIS (terminal_found_set, posés par top_terminals), une ligne chacun ; classées comme cmux, jamais coupables
+function term_load(   n, a, i) {
+  if (TERM_LOADED) return
+  TERM_LOADED = 1; TERM_N = 0
+  n = split(ENVIRON["TOP_TERM_APPS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") TERM_APP[++TERM_N] = a[i] "/"
+  n = split(ENVIRON["TOP_TERM_CLIS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") TERM_CLI[a[i]] = 1
+}
+function family_of(args, ag,   a, b0, i) {
   if (ag == "helper") return "agent-helper"
   split(args, a, " "); b0 = top_base(a[1])
   if (args ~ /cmux-cua/) return "cmux-cua"
   if (args ~ /\/cmux\.app\// || b0 == "cmux") return "cmux"
+  term_load(); if (b0 in TERM_CLI) return "cmux"
+  for (i = 1; i <= TERM_N; i++) if (index(args, TERM_APP[i]) > 0) return "cmux"
   if (args ~ /ms-playwright|chrome-headless-shell|Google Chrome for Testing|Chromium\.app|chromedriver|puppeteer/) return "test-browser"
   if (args ~ /\/Google Chrome\.app\//) return "chrome"
   if (args ~ /Virtualization\.framework|com\.apple\.Virtualization|qemu-system|limactl|vfkit|OrbStack|Docker\.app|com\.docker\./) return "vm"
@@ -313,7 +323,10 @@ top_footprints() {
 # verrou optionnel ni rafraîchissement d'index (git diff HEAD réécrit l'index d'un fichier suivi touché même sous GIT_OPTIONAL_LOCKS=0).
 # ps et lsof sous une locale UTF-8 : sous C, ils écrivent les octets non ASCII en M-… et \xNN (mesuré), un dossier accentué ne serait
 # plus reconnu ; les jointures awk restent sous C, en octets.
+# top_terminals : TOP_TERM_APPS et TOP_TERM_CLIS exportés pour les awk de top (term_load) — cmux, le fork et toute app de terminal posée
+top_terminals() { terminal_found_set; export TOP_TERM_APPS="$TERMINAL_FOUND" TOP_TERM_CLIS="$TERMINAL_FOUND_CLIS"; }
 top_snapshot() {
+  top_terminals
   local fast="$1" probe="${2:-}" ps_out agents pids codex_pids cwds opened envs projects lorph layout attach phases journals mem="" msource=footprint
   local idle_h now_iso hib gc="${GIT_CONFIG_COUNT:-0}" sp sa sdir; local -a sfiles=()
   export GIT_OPTIONAL_LOCKS=0 "GIT_CONFIG_KEY_$gc=diff.autoRefreshIndex" "GIT_CONFIG_VALUE_$gc=false" GIT_CONFIG_COUNT=$((gc + 1))

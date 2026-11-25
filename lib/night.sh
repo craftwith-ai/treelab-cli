@@ -125,6 +125,9 @@ night_words_reason() {
   case "$WD_SOURCE" in click) printf "user's click" ;; voice) printf "user's voice" ;; *) printf "user's words" ;; esac
   printf ': "%s" (%s)' "$WD_SAID" "$(words_where)"
 }
+# night_order_reason (lot 04 d'onglet-tower) : le motif écrit par lab quand l'accord par les mots (via=words close=yes, AG_SAID posé
+# par agreement_by_words) tient lieu d'accord de nuit rouge — un seul « oui ferme » suffit, la nuit nommée par lab sans question
+night_order_reason() { printf 'user'"'"'s order to close: "%s", given with the acceptance, red night named by lab' "$AG_SAID"; }
 # night_fix_proof <tête> → « <run> <sha> », rc 0 : la plus récente nuit manuelle (workflow_dispatch) verte du workflow de la nuit
 # rouge, sur une révision qui contient le premier rouge et précède la tête (lot 02 de fix-nuit-2026-11-14). Une lecture gh, aucun
 # fetch : une révision absente du dépôt local n'est l'ancêtre d'aucune tête locale. Sans gh, gh en panne ou rien de valide → rc 1.
@@ -167,17 +170,17 @@ night_agree_write() {
 }
 # night_close_gate <motif> <posé=0|1> : avant toute livraison. Nuit rouge sans accord → refus nommé ; avec un motif → la ligne datée
 # est écrite dans la section de recette de la fiche, commitée et poussée comme lab acceptance (une seule fois par nuit rouge). Sans
-# motif, une preuve de correctif (night_fix_proof sur la tête du couloir) en tient lieu.
+# motif, une preuve de correctif (night_fix_proof sur la tête du couloir), le clic du bouton ou l'accord par les mots en tiennent lieu.
 # night_agreed_file / night_agreed_here <fiche> (revue de sécurité du lot 10) : l'accord de nuit commité par lab lui-même, marqué
 # dans son état (numéro de la nuit, commit) — une ligne écrite dans la fiche par un agent ne porte jamais une relance de lab close
 night_agreed_file() { printf '%s/%s/night-agreed/%s\n' "$LAB_STATE" "$P_NAME" "$SLUG"; }
 night_agreed_here() {
-  local run; run="$(night_get "$P_NAME" run)"
+  local run body; run="$(night_get "$P_NAME" run)"
   [ -n "$run" ] && [ "$(sed -n 's/^run=//p' "$(night_agreed_file)" 2>/dev/null)" = "$run" ] || return 1
-  recette_filter body <"$1" 2>/dev/null | grep -F "night run $run " >/dev/null
+  body="$(recette_filter body <"$1" 2>/dev/null)" && grep -qF "night run $run " <<<"$body"
 }
 night_close_gate() {
-  local reason="$1" set="$2" lot droot rel lang line nn branch run proof clicked=0
+  local reason="$1" set="$2" lot droot rel lang line nn branch run proof clicked=0 body
   night_refresh || true
   night_red "$P_NAME" || return 0
   lot="$(wt_lot_file "$WT")"; lot="$(real_path "$(dirname "$lot")")/$(basename "$lot")"
@@ -190,10 +193,11 @@ night_close_gate() {
     if proof="$(night_fix_proof "$(git -C "$WT" rev-parse HEAD 2>/dev/null)")"; then reason="$(night_proof_reason "${proof% *}" "${proof#* }")"
     # lot 10 : le clic de l'utilisateur sur « Close <couloir> despite the red night », lu par lab, est l'accord ; motif écrit par lab
     elif words_valid "$WT" night; then reason="$(night_words_reason)"; clicked=1
+    elif agreement_by_words "$WT"; then reason="$(night_order_reason)"   # lot 04 d'onglet-tower : le oui de fermer couvre la nuit
     else die "$(night_refusal_for_caller)"; fi
   fi
   close_recette_guard   # l'accord s'ajoute à une recette valide, jamais à sa place
-  if recette_filter body <"$lot" | grep -F "night run $run " >/dev/null; then
+  if body="$(recette_filter body <"$lot")" && grep -qF "night run $run " <<<"$body"; then
     log "night red agreement already in $(basename "$lot"): closing goes on"; return 0
   fi
   droot="$(real_path "$(repo_root "$(dirname "$lot")")")"; rel="${lot#"$droot"/}"

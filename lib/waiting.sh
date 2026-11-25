@@ -8,8 +8,9 @@
 # Aucun état caché : tout se relit dans les fiches, la date se juge contre rdv_now (LAB_NOW en test).
 
 # Autonome : lu aussi par lib/recette.sh hors CLI (lane_phase), il charge lui-même ses dépendances (dates de lib/rdv.sh, table de lib/lang.sh).
-declare -F rdv_epoch >/dev/null || . "$(dirname "${BASH_SOURCE[0]}")/rdv.sh"
-declare -F lang_norm >/dev/null || . "$(dirname "${BASH_SOURCE[0]}")/lang.sh"
+declare -F rdv_epoch >/dev/null || . "${BASH_SOURCE[0]%/*}/rdv.sh"
+declare -F lang_norm >/dev/null || . "${BASH_SOURCE[0]%/*}/lang.sh"
+declare -F doc_need >/dev/null || . "${BASH_SOURCE[0]%/*}/facts.sh"
 WAIT_SECTION='En attente'
 WAIT_DOT=' · '   # séparateur des champs d'une ligne ; un « · » tapé dans le motif devient « - »
 WAIT_REPORTS_MAX=1
@@ -19,21 +20,7 @@ WAIT_LABEL="${LAB_WAKE_LABEL:-dev.treelab.wake}"
 # Seule la section compte (titre lu par lang_norm, blocs de code ignorés) ; les champs vides restent vides : lire avec cut, jamais read.
 wait_lines() {
   [ -f "${1:-}" ] && [ -r "$1" ] || return 0
-  lang_norm <"$1" | LC_ALL=C awk '
-    { sub(/\r$/, "") }
-    /^[ \t]*(```|~~~)/ { fence = !fence; next }
-    fence { next }
-    /^## / { inside = ($0 ~ /^## +En attente[ \t]*$/); next }
-    !inside { next }
-    /^- C[0-9]+ \302\267 / {
-      n = split($0, a, / \302\267 /); id = substr(a[1], 3); rep = 0; meas = ""; reo = ""
-      for (i = 4; i <= n; i++) {
-        if (a[i] ~ /^reports [0-9]+$/) rep = substr(a[i], 9) + 0
-        else if (a[i] ~ /^measured /) meas = substr(a[i], 10)
-        else if (a[i] ~ /^reopened /) reo = substr(a[i], 10)
-      }
-      printf "%s\t%s\t%s\t%d\t%s\t%s\n", id, a[2], a[3], rep, meas, reo
-    }'
+  lang_norm <"$1" | LC_ALL=C awk "$DOC_AWK"'BEGIN { wait_reset() } { w = wait_scan($0); if (w != "") print w }'
 }
 wait_line_of() { wait_lines "$1" | awk -F'\t' -v id="$2" '$1 == id { print; exit }'; }   # <fiche> <Cn>
 wait_open_lines() { wait_lines "$1" | awk -F'\t' '$5 == ""'; }                         # <fiche> : lignes non mesurées
@@ -109,17 +96,36 @@ wait_resolve_date() {
 
 # ---------- lecture du couloir ----------
 # wait_lane_files <wt> → les fiches du couloir, par numéro
-# shellcheck disable=SC2012 # noms lot-NN-<slug> : lettres, chiffres, tirets, points
-wait_lane_files() { ls "$(lots_dir "$(docs_dir "$1")" "$(wt_lane "$1")")"/lot-[0-9]*.md 2>/dev/null | sort || true; }
+wait_lane_files() { wait_files_set "$1"; [ "${#WAIT_FILES[@]}" = 0 ] || printf '%s\n' "${WAIT_FILES[@]}"; }
+wait_files_set() { # <wt> : WAIT_FILES, les mêmes, sans processus hors d'un dossier nommé comme une fiche (current_lot_set)
+  local f d=0
+  WAIT_FILES=(); docs_dir_set "$1"; wt_lane_set "$1"
+  for f in "$DOCS_DIR/lots/$WT_LANE"/lot-[0-9]*.md; do if [ -e "$f" ] || [ -L "$f" ]; then WAIT_FILES+=("$f"); [ ! -d "$f" ] || d=1; fi; done
+  # shellcheck disable=SC2012 # repli voulu : la réponse de ls d'avant le lot, quand un dossier porte le nom d'une fiche
+  [ "$d" = 0 ] || { WAIT_FILES=(); while IFS= read -r f; do WAIT_FILES+=("$f"); done < <(ls "$DOCS_DIR/lots/$WT_LANE"/lot-[0-9]*.md 2>/dev/null | sort); }
+}
+# wait_lane_load <wt> : les fiches du couloir lues en une fois, si la lecture en cours ne les a pas déjà
+wait_lane_load() {
+  local f list=''
+  wait_files_set "$1"
+  for f in "${WAIT_FILES[@]+"${WAIT_FILES[@]}"}"; do
+    if [ -f "$f" ] && [ -r "$f" ] && ! doc_find "$f"; then list="$list${list:+$'\n'}F"$'\t'"$f"; fi
+  done
+  facts_load "$list"
+}
 # wait_lane_open <wt> → lignes ouvertes du couloir, la plus ancienne date d'abord :
 #   epoch<TAB>fiche<TAB>Cn<TAB>date<TAB>motif<TAB>reports<TAB>reopened
 # Champs relus par awk : un read à IFS tabulation fusionnerait les champs vides (measured), et « reopened » serait perdu (revue).
 wait_lane_open() {
-  local f
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    wait_open_lines "$f" | LC_ALL=C awk -F'\t' -v f="$f" "$RDV_AWK"'{ e = epoch($2); if (e == "invalide") next; printf "%.0f\t%s\t%s\t%s\t%s\t%s\t%s\n", e, f, $1, $2, $3, $4, $6 }'
-  done < <(wait_lane_files "$1") | sort -t "$(printf '\t')" -k1,1n -k2,2 -k3,3 || true
+  local f rows w
+  facts_begin; wait_lane_load "$1"
+  for f in "${WAIT_FILES[@]+"${WAIT_FILES[@]}"}"; do
+    doc_need "$f" F || continue
+    doc_fact WAITS; rows="$DOC_FACT"; [ -n "$rows" ] || continue
+    rows="$rows"$'\n'
+    while [ -n "$rows" ]; do w="${rows%%$'\n'*}"; rows="${rows#*$'\n'}"; printf '%s\t%s\t%s\n' "${w%%$'\t'*}" "$f" "${w#*$'\t'}"; done
+  done | sort -t "$(printf '\t')" -k1,1n -k2,2 -k3,3 || true
+  facts_end
 }
 # wait_lane_due <wt> → la première ligne due (date atteinte, pas encore rouverte pour cette date), au format de wait_lane_open
 wait_lane_due() {
@@ -127,9 +133,33 @@ wait_lane_due() {
   wait_lane_open "$1" | awk -F'\t' -v now="$(rdv_epoch "$now")" '$1 <= now && $7 == "" { print; exit }'
 }
 # wait_lane_first <wt> → la première ligne ouverte (la plus proche), au format de wait_lane_open ; vide si aucune
-wait_lane_first() { wait_lane_open "$1" | head -1; }
+wait_lane_first() { wait_first_set "$1"; [ -z "$WAIT_FIRST" ] || printf '%s\n' "$WAIT_FIRST"; }
+WF_FOR='' WF_LINE=''   # mémoire d'une lecture groupée, jamais héritée de l'environnement
+wait_first_set() { # <wt> : WAIT_FIRST, la même ligne ; un awk au plus. Même ordre que wait_lane_open : date, fiche, puis critère
+  local f rows w e id best='' bestf='' bestid='' bestw=''
+  if [ "$FACTS_DEPTH" != 0 ] && [ "$WF_FOR" = "$1" ]; then WAIT_FIRST="$WF_LINE"; return 0; fi
+  WAIT_FIRST=''
+  facts_begin; wait_lane_load "$1"
+  for f in "${WAIT_FILES[@]+"${WAIT_FILES[@]}"}"; do
+    doc_need "$f" F || continue
+    doc_fact WAITS; rows="$DOC_FACT"; [ -n "$rows" ] || continue
+    rows="$rows"$'\n'
+    while [ -n "$rows" ]; do
+      w="${rows%%$'\n'*}"; rows="${rows#*$'\n'}"; e="${w%%$'\t'*}"; id="${w#*$'\t'}"; id="${id%%$'\t'*}"
+      if [ -z "$best" ] || [ "$e" -lt "$best" ] || { [ "$e" = "$best" ] && [ "$f" = "$bestf" ] && { [[ "$id" < "$bestid" ]] || { [ "$id" = "$bestid" ] && [[ "$w" < "$bestw" ]]; }; }; }; then
+        best="$e"; bestf="$f"; bestid="$id"; bestw="$w"; WAIT_FIRST="$e"$'\t'"$f"$'\t'"${w#*$'\t'}"
+      fi
+    done
+  done
+  WF_FOR="$1"; WF_LINE="$WAIT_FIRST"; facts_end
+}
 # wait_summary <ligne de wait_lane_open> → « lot-02-x C4 2026-11-18 — <motif> »
-wait_summary() { printf '%s' "$1" | awk -F'\t' '{ n = $2; sub(/.*\//, "", n); sub(/\.md$/, "", n); printf "%s %s %s — %s\n", n, $3, $4, $5 }'; }
+wait_summary() { wait_summary_set "$1"; printf '%s\n' "$WAIT_SUMMARY"; }
+wait_summary_set() { # <ligne> : WAIT_SUMMARY, sans processus
+  local r="${1#*$'\t'}" f id d
+  f="${r%%$'\t'*}"; r="${r#*$'\t'}"; id="${r%%$'\t'*}"; r="${r#*$'\t'}"; d="${r%%$'\t'*}"; r="${r#*$'\t'}"
+  f="${f##*/}"; WAIT_SUMMARY="${f%.md} $id $d — ${r%%$'\t'*}"
+}
 # wait_block <wt> : refus de la recette ou de la fermeture tant qu'une attente du couloir reste ouverte ; rc 0 sans attente
 wait_block() {
   local w; w="$(wait_lane_first "$1")"; [ -n "$w" ] || return 0
@@ -139,7 +169,7 @@ wait_block() {
 # ---------- lab batch wait ----------
 # cmd_batch_wait <Cn> <date|instant|+Nd> <motif> | --done <Cn> : depuis le dossier du couloir, sur sa fiche courante
 cmd_batch_wait() {
-  local root lot st id date motif now line cur rep reo n
+  local root lot st id date motif now line cur rep reo n crits
   root="$(repo_root)" || die "not in a repository"
   PROJECT="$(project_from_cwd)" || die "unknown project for $root"; load_project "$PROJECT"
   lot="$(wt_lot_file "$root")"; ! reopen_branch_of "$root" >/dev/null || lot="$(wt_own_lot_file "$root")"   # la fiche rouverte, quel que soit son État
@@ -162,7 +192,7 @@ cmd_batch_wait() {
   [ "$#" -eq 3 ] || usage
   id="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"; motif="$3"
   [[ "$id" =~ ^C[0-9]+$ ]] || die "criterion \"$1\" refused: expected C<number>, as in the exit criteria"
-  wait_criteria "$lot" | grep -qx "$id" || die "unknown criterion $id: not among the exit criteria of $(basename "$lot" .md) ($(wait_criteria "$lot" | paste -sd' ' -))"
+  { crits="$(wait_criteria "$lot")" && grep -qx "$id" <<<"$crits"; } || die "unknown criterion $id: not among the exit criteria of $(basename "$lot" .md) ($(wait_criteria "$lot" | paste -sd' ' -))"
   rdv_check_text reason "$motif"
   motif="$(printf '%s' "$motif" | sed 's/·/-/g')"
   st="$(lot_state "$lot")"

@@ -17,26 +17,20 @@ doctor_version_read() {
   esac
   printf '%s\n' "$version"
 }
+# doctor_manifest_metadata : les métadonnées de chaque ligne — aucun retrait en cours, row et after lisibles, after = la valeur de la
+# ligne, dossier en 700, row = la ligne préparée (after « pending », sauf un skip) ; la première ligne fausse décide. Lot 03 de
+# charge-processeur : verdict rendu par le passage de la validation (LAB_TXN_META), sinon par une lecture perl de plus
 doctor_manifest_metadata() {
-  local line d after prepared expected
-  while IFS= read -r line; do
-    [ "$line" != $'treelab-install\t1' ] || continue
-    _txn_parse "$line" || return 1
-    d="$LAB_TXN_BACKUPS/${LAB_TXN_FIELDS[0]}/${LAB_TXN_FIELDS[1]}"
-    if _txn_exists "$d/done" || _txn_exists "$d/retirement" || _txn_exists "$LAB_TXN_BACKUPS/${LAB_TXN_FIELDS[0]}/remove-started"; then
-      DOC_MANIFEST_CAUSE=REMOVAL_PENDING; return 1
-    fi
-    after="${LAB_TXN_FIELDS[5]}"
-    [ -r "$d/row" ] && [ -r "$d/after" ] && [ "$(cat "$d/after")" = "$after" ] || return 1
-    [ "$(stat -f %Lp "$d")" = 700 ] || return 1
-    prepared="$(cat "$d/row")"
-    if [ "${LAB_TXN_FIELDS[2]}" = skip ]; then expected="$line"
-    else
-      LAB_TXN_FIELDS[5]=pending
-      expected="$(_txn_row "${LAB_TXN_FIELDS[@]}")"
-    fi
-    [ "$prepared" = "$expected" ] || return 1
-  done <"$LAB_TXN_MANIFEST"
+  local m="${LAB_TXN_META:-}"
+  [ -n "$m" ] || m="$(perl -e "$TXN_FACTS_PL" meta "$LAB_TXN_MANIFEST" "$LAB_TXN_BACKUPS" 2>/dev/null | sed -n 's/^meta\t//p')"
+  case "$m" in ok) return 0 ;; removal) DOC_MANIFEST_CAUSE=REMOVAL_PENDING; return 1 ;; *) return 1 ;; esac
+}
+# doctor_setup_info : _setup_info, sans relire le manifeste que la validation vient de lire (lot 03 de charge-processeur : 13 % de son
+# travail) — mêmes lignes, toutes découpées par _txn_parse, en-tête seulement en tête, dernière ligne terminée : la note de pose en sort
+# telle quelle. Validation d'un autre manifeste, ou ligne skip sans note : la relecture d'avant.
+doctor_setup_info() {
+  [ "${LAB_TXN_SETUP_FOR:-}" = "$LAB_TXN_MANIFEST" ] || { _setup_info; return; }
+  LAB_SETUP_INFO="$LAB_TXN_SETUP_NOTE"; _setup_info_check
 }
 doctor_product_context() {
   DOC_CLAUDE=yes; DOC_CODEX=yes; DOC_INSTALLED=no; DOC_COLLISIONS=0; DOC_SETUP_TXN=''
@@ -55,7 +49,7 @@ doctor_product_context() {
   if [ ! -e "$LAB_STATE/install-manifest.tsv" ] && [ ! -L "$LAB_STATE/install-manifest.tsv" ] && [ "$pending" = no ]; then
     DOC_MANIFEST_CAUSE=MANIFEST_MISSING
   elif _txn_paths && _txn_validate_manifest; then
-    if [ -f "$LAB_TXN_MANIFEST" ] && _setup_info && [ -n "$LAB_SETUP_INFO" ]; then info=yes; fi
+    if [ -f "$LAB_TXN_MANIFEST" ] && doctor_setup_info && [ -n "$LAB_SETUP_INFO" ]; then info=yes; fi
     if ! _txn_pending; then DOC_MANIFEST_CAUSE=MANIFEST_INVALID
     elif [ -n "$LAB_TXN_PENDING" ]; then DOC_MANIFEST_CAUSE=TRANSACTION_PENDING
     elif [ -f "$LAB_TXN_MANIFEST" ]; then

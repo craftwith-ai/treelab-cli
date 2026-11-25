@@ -236,7 +236,7 @@ ginkgo_question() {
 ginkgo_norm() { printf '%s' "$1" | sed -E 's/[[:space:]]*\((Recommended|Recommandé|recommended|recommandé)\)[[:space:]]*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]'; }
 ginkgo_answer() {
   [ "$#" -ge 4 ] || usage
-  local p="$1" lane="$2" qid="" text="" has_text=0 cur=0 qmax=0 qf n i; shift 2
+  local p="$1" lane="$2" qid="" text="" has_text=0 cur=0 qmax=0 qf n i screen; shift 2
   local -a CH=() REC=() OT=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -318,7 +318,7 @@ ginkgo_answer() {
   done
   ginkgo_tab "$GK_WT" "$lane"
   # la boîte doit être à l'écran avant toute touche forcée : fermée par Échap (sans PostToolUse), ses touches deviendraient un prompt
-  cmx read-screen --workspace "$GK_WS" --surface "$GK_SURFACE" 2>/dev/null | grep -q 'Type something' \
+  { screen="$(cmx read-screen --workspace "$GK_WS" --surface "$GK_SURFACE" 2>/dev/null)" && grep -q 'Type something' <<<"$screen"; } \
     || die "the box of $lane is not on screen (closed in its tab?): nothing sent — look at its tab"
   # les touches, question par question (preuve §1)
   local plan keys rest d
@@ -364,7 +364,8 @@ ginkgo_answer_text() { # <projet> <couloir> <texte> <fichier de boîte>
 GINKGO_ORDER_PREFIX='Ginkgo, voice of the user:'
 # ginkgo_is_close <texte> : fermer, abandonner, retirer ou supprimer un couloir ne passe jamais par un ordre libre
 ginkgo_closing() {   # sur l'entrée standard, une ligne ou plusieurs
-  words_fold | LC_ALL=C grep -Eq '(^|[^a-z])(ferm[a-z]*|clos[a-z]*|clore|clotur[a-z]*|abandon[a-z]*|retir[a-z]*|supprim[a-z]*|enlev[a-z]*|delete[a-z]*|remov[a-z]*|discard[a-z]*)([^a-z]|$)'
+  local folded
+  folded="$(words_fold)" && LC_ALL=C grep -Eq '(^|[^a-z])(ferm[a-z]*|clos[a-z]*|clore|clotur[a-z]*|abandon[a-z]*|retir[a-z]*|supprim[a-z]*|enlev[a-z]*|delete[a-z]*|remov[a-z]*|discard[a-z]*)([^a-z]|$)' <<<"$folded"
 }
 ginkgo_is_close() { printf '%s' "$1" | ginkgo_closing; }
 ginkgo_tower() { # <projet> : GK_WT, le dossier de la tour
@@ -384,14 +385,14 @@ ginkgo_tower_send() { # <projet> <texte déjà assaini> : tapé puis Entrée, ja
 }
 ginkgo_order() {
   [ "$#" -ge 2 ] || usage
-  local p="$1" text; shift; text="$*"
+  local p="$1" text folded; shift; text="$*"
   ginkgo_tower "$p"
   ginkgo_human order
   text="$(printf '%s' "$text" | words_clean "$GINKGO_TELL_MAX")"
   [ -n "${text// /}" ] || die "empty order — nothing sent"
   ! ginkgo_is_close "$text" || die "closing a lane is never a free order: lab ginkgo close $p <lane> reads it back first — nothing sent"
   # la formule de la fermeture confirmée n'appartient qu'à lab ginkgo close (revue de sécurité du lot)
-  ! printf '%s' "$text" | words_fold | LC_ALL=C grep -Eq 'confirm[a-z]*[^a-z]*(aloud|out[^a-z]*loud)|voix haute' \
+  ! { folded="$(printf '%s' "$text" | words_fold)" && LC_ALL=C grep -Eq 'confirm[a-z]*[^a-z]*(aloud|out[^a-z]*loud)|voix haute' <<<"$folded"; } \
     || die "\"confirmed aloud\" is written by only lab ginkgo close, after a read-back — nothing sent"
   ginkgo_tower_send "$p" "$text"
   kv ORDERED yes
@@ -402,13 +403,13 @@ ginkgo_order() {
 # fermeture relue et confirmée à voix haute répond à sa place : Échap ferme la boîte (sans PostToolUse : l'entrée est retirée ici),
 # puis l'ordre confirmé est tapé ; toute autre boîte de la tour reste un refus de ginkgo_tower_send
 ginkgo_close_tower_box() {
-  local qf; qf="$(waits_question_file "$GK_WT")"
+  local qf texts screen; qf="$(waits_question_file "$GK_WT")"
   ginkgo_box "$GK_WT" >/dev/null || return 0
   jq -r '.questions[] | .question, .header, .options[].label' "$qf" | ginkgo_closing || return 0
-  jq -r '.questions[] | .question, .header' "$qf" | grep -qF -- "$2" || return 0
+  texts="$(jq -r '.questions[] | .question, .header' "$qf")" && grep -qF -- "$2" <<<"$texts" || return 0
   GK_LANE="$TOWER_LANE"; ginkgo_tab "$GK_WT" "$TOWER_LANE"
   ginkgo_send_key escape
-  ! cmx read-screen --workspace "$GK_WS" --surface "$GK_SURFACE" 2>/dev/null | grep -q 'Type something' \
+  ! { screen="$(cmx read-screen --workspace "$GK_WS" --surface "$GK_SURFACE" 2>/dev/null)" && grep -q 'Type something' <<<"$screen"; } \
     || die "the close box of the tower stayed open after Escape: nothing closed — look at its tab"
   rm -f "$qf"
 }
@@ -465,54 +466,67 @@ ginkgo_reply() {
 # ---------- lab ginkgo news <projet> --open yes|no | --baseline : parler de soi-même (lot 03) ----------
 # Ce qui attend la personne et ne lui a pas encore été dit, et par où le dire : CHANNEL=voice (conversation ouverte), notify
 # (fermée), hold (fermée pendant les heures calmes : retenu, récapitulé au premier passage après elles), none. Le bash décide ;
-# Ginkgo.app relit toutes les 10 s et ne fait que dire ou notifier. Lecture seule, sauf son fichier $LAB_STATE/<projet>/ginkgo/news
+# Ginkgo.app relit toutes les 30 s et ne fait que dire ou notifier. Lecture seule, sauf son fichier $LAB_STATE/<projet>/ginkgo/news
 # (told=<clé> dit ou vu, held=<clé> retenu) ; clé = couloir|sorte|empreinte du QID de la boîte, sinon de at=, sinon du motif : une attente qui change
 # (nouvelle question, nouvelle date) est annoncée de nouveau, une clé disparue est oubliée. --forget <clé> : une annonce vocale que
 # l'app n'a pas pu dire (conversation fermée avant) redevient nouvelle, et la même relecture décide de nouveau (revue du lot).
 GINKGO_QUIET_DEFAULT=21:00-08:00
 GINKGO_NEWS_TEXT_MAX=200   # octets de NEW_n_TEXT, comme WHY= de lab ginkgo question
-ginkgo_speak_mode() {
-  local v; v="$(global_config_get ginkgo_speak | tr -d '[:space:]')"
-  case "$v" in
-    ''|always) echo always ;; conversation|never) echo "$v" ;;
-    *) log_wrap "ginkgo_speak=$v in ~/.lab/config is not always, conversation or never: always is used."; echo always ;;
+# Réglages et heure lus sans sous-shell, une valeur par variable (lot 04 de charge-processeur : lab ginkgo news, toutes les 30 s) ;
+# les formes qui impriment restent pour la lecture humaine et les tests
+# ginkgo_config_set <clé> : GINKGO_CONF, sa valeur dans ~/.lab/config sans aucun blanc (comme global_config_get | tr -d '[:space:]')
+ginkgo_config_set() { GINKGO_CONF=""; ! kv_value "$LAB_HOME/config" "$1" || GINKGO_CONF="${KV_VALUE//[[:space:]]/}"; }
+ginkgo_speak_mode() { ginkgo_speak_mode_set; printf '%s\n' "$GINKGO_SPEAK"; }
+ginkgo_speak_mode_set() { # GINKGO_SPEAK
+  ginkgo_config_set ginkgo_speak
+  case "$GINKGO_CONF" in
+    ''|always) GINKGO_SPEAK=always ;; conversation|never) GINKGO_SPEAK="$GINKGO_CONF" ;;
+    *) log_wrap "ginkgo_speak=$GINKGO_CONF in ~/.lab/config is not always, conversation or never: always is used."; GINKGO_SPEAK=always ;;
   esac
 }
-ginkgo_minute() { case "$1" in [0-9]:[0-5][0-9]|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) echo $(( 10#${1%%:*} * 60 + 10#${1#*:} )) ;; *) return 1 ;; esac; }
+ginkgo_minute() { ginkgo_minute_set "$1" && printf '%s\n' "$GINKGO_MINUTE"; }
+ginkgo_minute_set() { # <HH:MM> : GINKGO_MINUTE, les minutes du jour ; rc 1 pour une heure illisible
+  case "$1" in [0-9]:[0-5][0-9]|[01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) GINKGO_MINUTE=$(( 10#${1%%:*} * 60 + 10#${1#*:} )) ;; *) return 1 ;; esac
+}
 # ginkgo_quiet_range → « <début> <fin> » en minutes du jour, ou off ; une valeur illisible : la plage par défaut, avertie sur stderr
-ginkgo_quiet_range() {
-  local v s e; v="$(global_config_get ginkgo_quiet | tr -d '[:space:]')"; v="${v:-$GINKGO_QUIET_DEFAULT}"
-  if [ "$v" = off ]; then echo off; return 0; fi
-  if [ "${v#*-}" != "$v" ] && s="$(ginkgo_minute "${v%%-*}")" && e="$(ginkgo_minute "${v#*-}")" && [ "$s" != "$e" ]; then
-    echo "$s $e"; return 0
-  fi
+ginkgo_quiet_range() { ginkgo_quiet_range_set; printf '%s\n' "$GINKGO_RANGE"; }
+ginkgo_quiet_range_set() { # GINKGO_RANGE
+  local v s e
+  ginkgo_config_set ginkgo_quiet; v="${GINKGO_CONF:-$GINKGO_QUIET_DEFAULT}"
+  if [ "$v" = off ]; then GINKGO_RANGE=off; return 0; fi
+  if [ "${v#*-}" != "$v" ] && ginkgo_minute_set "${v%%-*}" && s="$GINKGO_MINUTE" && ginkgo_minute_set "${v#*-}" && e="$GINKGO_MINUTE" \
+    && [ "$s" != "$e" ]; then GINKGO_RANGE="$s $e"; return 0; fi
   log_wrap "ginkgo_quiet=$v in ~/.lab/config is not HH:MM-HH:MM or off: $GINKGO_QUIET_DEFAULT is used."
-  echo "$(ginkgo_minute "${GINKGO_QUIET_DEFAULT%-*}") $(ginkgo_minute "${GINKGO_QUIET_DEFAULT#*-}")"
+  ginkgo_minute_set "${GINKGO_QUIET_DEFAULT%-*}"; s="$GINKGO_MINUTE"; ginkgo_minute_set "${GINKGO_QUIET_DEFAULT#*-}"; GINKGO_RANGE="$s $GINKGO_MINUTE"
 }
 # ginkgo_quiet_now <début fin|off> → yes|no à l'heure locale du Mac (TZ) ; début compris, fin exclue ; une plage passe minuit ou non
-ginkgo_quiet_now() {
-  [ "$1" != off ] || { echo no; return 0; }
-  local s="${1% *}" e="${1#* }" t m; t="$(date -r "$(ginkgo_now)" +%H:%M)"; m=$(( 10#${t%%:*} * 60 + 10#${t#*:} ))
+ginkgo_quiet_now() { ginkgo_quiet_now_set "$1"; printf '%s\n' "$GINKGO_QUIET"; }
+ginkgo_quiet_now_set() { # <début fin|off> : GINKGO_QUIET, un seul date (l'heure de LAB_NOW_EPOCH, sinon celle du moment)
+  GINKGO_QUIET=no; [ "$1" != off ] || return 0
+  local s="${1% *}" e="${1#* }" t m
+  if [ -n "${LAB_NOW_EPOCH:-}" ]; then t="$(exec date -r "$LAB_NOW_EPOCH" +%H:%M)"; else t="$(exec date +%H:%M)"; fi
+  m=$(( 10#${t%%:*} * 60 + 10#${t#*:} ))
   if [ "$s" -lt "$e" ]; then
-    if [ "$m" -ge "$s" ] && [ "$m" -lt "$e" ]; then echo yes; else echo no; fi
-  elif [ "$m" -ge "$s" ] || [ "$m" -lt "$e" ]; then echo yes; else echo no; fi
+    if [ "$m" -ge "$s" ] && [ "$m" -lt "$e" ]; then GINKGO_QUIET=yes; fi
+  elif [ "$m" -ge "$s" ] || [ "$m" -lt "$e" ]; then GINKGO_QUIET=yes; fi
 }
 # ginkgo_waits : une ligne par attente de la personne, « <clé>\t<couloir>\t<sorte>\t<texte> », dans l'ordre des couloirs — ce que la
 # vue de la tour range dans WAITING_FOR_YOU (une recette sur check: seul est l'affaire de la tour), plus question|permission de la tour
+# Lot 04 de charge-processeur : couloir, attente et motif lus sans sous-shell, verrou de session non lu — mêmes lignes.
 ginkgo_waits() {
   local wt lane kind tok text q
   for wt in "$P_ROOT"/.worktrees/*/; do
-    [ -d "$wt" ] || continue; wt="${wt%/}"; lane="$(wt_lane "$wt")"
+    [ -d "$wt" ] || continue; wt="${wt%/}"; wt_lane_set "$wt"; lane="$WT_LANE"
     case "$lane" in ''|.*|*[!A-Za-z0-9._-]*) continue ;; esac
-    kind="$(waits_get "$wt" kind)"
+    kv_value "$wt/.lab/waits-for" kind || true; kind="$KV_VALUE"
     if lane_is_tower "$wt"; then
       case "$kind" in question|permission) ;; *) continue ;; esac
-      tok="at=$(waits_get "$wt" at)"; text="$(waits_get "$wt" why)"
+      kv_value "$wt/.lab/waits-for" at || true; tok="at=$KV_VALUE"; kv_value "$wt/.lab/waits-for" why || true; text="$KV_VALUE"
     else
-      tower_waits_for "$wt"
+      tower_waits_for "$wt" --no-session
       case "$TW_WAITS:$TW_EVIDENCE" in acceptance:check) continue ;; you:*|acceptance:*) ;; *) continue ;; esac
       case "$kind" in
-        question|permission|blocked) tok="at=$(waits_get "$wt" at)"; text="$(waits_get "$wt" why)" ;;
+        question|permission|blocked) kv_value "$wt/.lab/waits-for" at || true; tok="at=$KV_VALUE"; kv_value "$wt/.lab/waits-for" why || true; text="$KV_VALUE" ;;
         *)   # la phase seule : son motif, sans date, fait l'empreinte ; le texte de la sorte est dit par Ginkgo
           case "$TW_PHASE" in 'in acceptance') kind=acceptance ;; 'acceptance passed') kind=closing ;; *) kind=blocked ;; esac
           tok="why=$TW_WHY"; text="" ;;
@@ -548,10 +562,17 @@ ginkgo_news() {
   load_project "$p"
   # la mémoire de ce qui a été dit à la personne : un agent qui la viderait ferait taire une attente (revue de sécurité du lot)
   ginkgo_human news
-  local speak range quiet f cur told held line key all="" fresh="" kept="" say="" recap="" channel=none keep_held=""
-  speak="$(ginkgo_speak_mode)"; range="$(ginkgo_quiet_range)"; quiet="$(ginkgo_quiet_now "$range")"
+  local speak range quiet f cur told="" held="" line key all="" fresh="" kept="" say="" recap="" channel=none keep_held=""
+  ginkgo_speak_mode_set; speak="$GINKGO_SPEAK"; ginkgo_quiet_range_set; range="$GINKGO_RANGE"; ginkgo_quiet_now_set "$range"; quiet="$GINKGO_QUIET"
   f="$LAB_STATE/$p/ginkgo/news"
-  told="$(sed -n 's/^told=//p' "$f" 2>/dev/null || true)"; held="$(sed -n 's/^held=//p' "$f" 2>/dev/null || true)"
+  # sa mémoire en une lecture du shell, les valeurs comme sed -n 's/^told=//p' les rendait (fins de ligne finales retirées)
+  if [ -f "$f" ] && [ -r "$f" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in told=*) told="$told${line#told=}"$'\n' ;; held=*) held="$held${line#held=}"$'\n' ;; esac
+    done <"$f"
+    while [ "${told%$'\n'}" != "$told" ]; do told="${told%$'\n'}"; done
+    while [ "${held%$'\n'}" != "$held" ]; do held="${held%$'\n'}"; done
+  fi
   [ -z "$forget" ] || { told="$(ginkgo_drop "$told" "$forget")"; held="$(ginkgo_drop "$held" "$forget")"; }
   cur="$(ginkgo_waits)"
   # chaque attente présente : déjà dite ou vue, retenue cette nuit, ou nouvelle ; les clés absentes sont oubliées
@@ -567,17 +588,21 @@ ginkgo_news() {
   elif [ "$quiet" = yes ]; then say="$fresh"; keep_held="$kept$fresh"; [ -z "$fresh" ] || channel=hold
   elif [ -n "$kept" ]; then recap="$kept$fresh"; channel=notify   # premier passage après la plage : un seul récapitulatif
   else say="$fresh"; [ -z "$fresh" ] || channel=notify; fi
-  # mémoire : tout ce qui est présent est dit ou vu, sauf ce qui reste retenu
-  local out="" k
+  # mémoire : tout ce qui est présent est dit ou vu, sauf ce qui reste retenu ; les clés retenues (1re colonne) relevées une fois
+  local out="" k held_keys=""
+  while IFS= read -r line; do [ -z "$line" ] || held_keys="$held_keys${line%%$'\t'*}"$'\n'; done <<<"$keep_held"
+  held_keys="${held_keys%$'\n'}"
   while IFS= read -r k; do
     [ -n "$k" ] || continue
-    if ginkgo_has "$(printf '%s' "$keep_held" | cut -f1)" "$k"; then out="${out}held=$k"$'\n'; else out="${out}told=$k"$'\n'; fi
+    if ginkgo_has "$held_keys" "$k"; then out="${out}held=$k"$'\n'; else out="${out}told=$k"$'\n'; fi
   done <<<"$all"
-  mkdir -p "$(dirname "$f")"
+  [ -d "${f%/*}" ] || mkdir -p "${f%/*}"
   ( umask 077; printf '%s' "$out" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f" ) || die "cannot write $f: nothing announced"
   kv SPEAK "$speak"; kv QUIET "$quiet"; kv CHANNEL "$channel"
   local n=0 r=0 i lane kind text
-  n="$(printf '%s' "$say" | grep -c . || true)"; r="$(printf '%s' "$recap" | grep -c . || true)"
+  # les lignes non vides, comme grep -c . (chaque ligne porte au moins sa clé)
+  while IFS= read -r line; do [ -z "$line" ] || n=$((n + 1)); done <<<"$say"
+  while IFS= read -r line; do [ -z "$line" ] || r=$((r + 1)); done <<<"$recap"
   kv NEW "$n"; i=0
   while IFS=$'\t' read -r key lane kind text; do
     [ -n "$key" ] || continue; i=$((i + 1))

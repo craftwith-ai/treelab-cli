@@ -524,6 +524,7 @@ _update_command() (
     private=yes
     # Une seconde de marge pour la précision entière de SECONDS : budget <120 s (mode auto : LAB_UPDATE_AUTO_BUDGET, 30 s).
     local LAB_PRIVATE_DEADLINE=$((SECONDS+119))
+    # shellcheck disable=SC2034 # LAB_PRIVATE_DEADLINE est lu par lib/update_private.sh
     [ "$mode" != auto ] || LAB_PRIVATE_DEADLINE=$((SECONDS+${LAB_UPDATE_AUTO_BUDGET:-30}))
     local license_status=0
     _update_cause licence "$LAB_HOME/license"
@@ -616,12 +617,12 @@ _update_auto_run() (
     link="$(printf '%s\n' "$out" | sed -n 's/^AUTO_LINK=//p' | head -1)"
     printf 'MSG=%s\n' "$notice"; [ -z "$link" ] || printf 'LINK=%s\n' "$link"
     _update_auto_write "$LAB_STATE/update-auto-notice" "$notice${link:+$'\n'$link}" || true
-    if printf '%s\n' "$out" | grep -qx 'RESULT=updated'; then printf 'UPDATED_ROOT=%s\n' "$(cd "$HOME/.lab/current" && pwd -P)"; fi
+    if grep -qx 'RESULT=updated' <<<"$out"; then printf 'UPDATED_ROOT=%s\n' "$(cd "$HOME/.lab/current" && pwd -P)"; fi
   else
     reason="$(sed -n 's/^lab: //p' "$err" | sed -E 's/^(Bloqué :|Blocked:) //' | head -1)"
     if [ -e "$HOME/.lab/update-pending" ]; then
       printf 'MSG=automatic update interrupted%s; run treelab update --resume outside the sessions\n' "${reason:+ (${reason%.})}"
-    elif printf '%s\n' "$out" | grep -qx 'REASON=entitlement'; then
+    elif grep -qx 'REASON=entitlement' <<<"$out"; then
       # droits échus (lot 05 de refonte-onboarding) : la phrase du refus (date, version gardée, lien), une ligne par jour au plus à
       # partager avec le rappel de lab next (même tampon entitlement-notice)
       [ -n "$reason" ] && declare -F entitlement_once >/dev/null && entitlement_once entitlement-notice || return 0

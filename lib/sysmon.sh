@@ -6,24 +6,33 @@
 # unique et les greffons en bash pur qui lisent le cache (un seul lab par cycle).
 #
 # macmon (macmon pipe, JSON) donne l'usage P/E, le GPU, la puissance, les températures et les ventilateurs ; sans lui, TEMP et la
-# puissance sont absents, les autres modules restent entiers depuis les outils natifs (sysctl/vm_stat, df/iostat, netstat -ib en
+# puissance sont absents, les autres modules restent entiers depuis les outils natifs (sysctl/vm_stat, df/iostat, netstat -ibn en
 # delta, pmset -g batt + ioreg). Le JSON de macmon est lu par des motifs awk sur ses clés (uniques, même imbriquées) : aucune
 # dépendance à jq ni à python3. Le top 5 des consommateurs est rattaché au projet/couloir par les verrous de lib/top.sh.
 
 # macmon_bin → chemin de macmon, vide s'il manque. LAB_MACMON impose un chemin (tests, installation ailleurs) ; posé mais non
 # exécutable = macmon absent (test « sans macmon »). Non posé : le macmon du PATH (celui que lab widget install pose par brew).
-macmon_bin() {
-  if [ "${LAB_MACMON+set}" = set ]; then [ -x "$LAB_MACMON" ] && printf '%s\n' "$LAB_MACMON"; return 0; fi
-  command -v macmon 2>/dev/null || true
+macmon_bin() { macmon_bin_set; [ -z "$MACMON_BIN" ] || printf '%s\n' "$MACMON_BIN"; }
+# macmon_bin_set : MACMON_BIN, le même chemin, sans sous-shell
+macmon_bin_set() {
+  MACMON_BIN=""
+  if [ "${LAB_MACMON+set}" = set ]; then [ ! -x "$LAB_MACMON" ] || MACMON_BIN="$LAB_MACMON"; return 0; fi
+  MACMON_BIN="$(command -v macmon 2>/dev/null)" || MACMON_BIN=""
+}
+# sysmon_file_set <fichier> : SYSMON_FILE, son texte comme $(cat <fichier>) le rend (fins de ligne finales retirées), lu sans cat
+sysmon_file_set() {
+  SYSMON_FILE=""; [ -f "$1" ] || return 0
+  IFS= read -r -d '' SYSMON_FILE <"$1" || :
+  while [ "${SYSMON_FILE%$'\n'}" != "$SYSMON_FILE" ]; do SYSMON_FILE="${SYSMON_FILE%$'\n'}"; done
 }
 
 sysmon_state() { printf '%s/widget\n' "$LAB_STATE"; }
 
-# sysmon_net <sortie de netstat -ib> → « iface ibytes obytes » de l'interface active (hors lo, plus gros trafic cumulé). La colonne
+# sysmon_net <sortie de netstat -ibn> → « iface ibytes obytes » de l'interface active (hors lo, plus gros trafic cumulé). La colonne
 # d'adresse peut manquer (lignes sans MAC) : on compte les champs à partir du jeton <Link#…> pour ne jamais lire un paquet pour un
 # octet. Interfaces de service ignorées (utun, awdl, bridge… : tunnels et liens pair-à-pair, jamais le lien principal).
-sysmon_net() {
-  printf '%s\n' "$1" | LC_ALL=C awk '
+# shellcheck disable=SC2016 # programme awk
+SYSMON_NET_AWK='
     $1 != "lo0" && $1 !~ /^(utun|awdl|llw|gif|stf|ap|p2p|bridge|anpi|en[0-9]+:)/ {
       for (i = 1; i <= NF; i++) if ($i ~ /^<Link#[0-9]+>$/) {
         j = i + 1; if ($j ~ /:/) { ib = $(j + 3); ob = $(j + 6) } else { ib = $(j + 2); ob = $(j + 5) }
@@ -31,34 +40,37 @@ sysmon_net() {
       }
     }
     END { if (bi != "") print bi " " bib " " bob }'
-}
+sysmon_net() { LC_ALL=C awk "$SYSMON_NET_AWK" <<<"$1"; }
 
 # sysmon_collect → les six blocs KEY=value sur stdout. macmon et iostat (chacun ~1 s de délai, ~0 CPU) tournent en parallèle
 # des sondes natives ; le delta réseau se lit sur le cache de la passe précédente ($state/net-raw : « epoch iface ibytes obytes »).
+# Un processus par sonde (exec dans chaque substitution, fichiers relus sans cat, uid de bash) : lot 04 de charge-processeur.
 sysmon_collect() {
   local state mac now macout iostat_out sysctl_out vmstat_out df_out netstat_out batt_out ioreg_out ps_out
-  local mtmp itmp netcur netiface netib netob down=0 up=0 pib="" pob="" pt="" pif="" projects layout
-  state="$(sysmon_state)"; mkdir -p "$state" 2>/dev/null || true
-  now="${LAB_NOW_EPOCH:-$(date +%s)}"
-  mac="$(macmon_bin)"
+  local mtmp itmp netcur netiface netib netob down=0 up=0 pib="" pob="" pt="" pif="" projects layout all
+  state="$LAB_STATE/widget"; [ -d "$state" ] || mkdir -p "$state" 2>/dev/null || true
+  now="${LAB_NOW_EPOCH:-$(exec date +%s)}"
+  macmon_bin_set; mac="$MACMON_BIN"
   mtmp="$state/.macmon.$$"; itmp="$state/.iostat.$$"
-  [ -z "$mac" ] || ( "$mac" pipe --samples 1 --interval 200 --soc-info 2>/dev/null | head -1 >"$mtmp" ) &
-  ( LC_ALL=C iostat -c 2 -w 1 2>/dev/null >"$itmp" ) &
-  sysctl_out="$(LC_ALL=C sysctl hw.memsize hw.ncpu vm.swapusage vm.loadavg kern.memorystatus_vm_pressure_level kern.memorystatus_level 2>/dev/null || true)"
-  vmstat_out="$(LC_ALL=C vm_stat 2>/dev/null || true)"
-  df_out="$(LC_ALL=C df -k /System/Volumes/Data 2>/dev/null || true)"
-  netstat_out="$(LC_ALL=C netstat -ib 2>/dev/null || true)"
-  batt_out="$(LC_ALL=C pmset -g batt 2>/dev/null || true)"
-  ioreg_out="$(LC_ALL=C ioreg -r -c AppleSmartBattery 2>/dev/null || true)"
+  if [ -n "$mac" ]; then "$mac" pipe --samples 1 --interval 200 --soc-info 2>/dev/null | head -1 >"$mtmp" & fi
+  LC_ALL=C iostat -c 2 -w 1 2>/dev/null >"$itmp" &
+  sysctl_out="$(LC_ALL=C exec sysctl hw.memsize hw.ncpu vm.swapusage vm.loadavg kern.memorystatus_vm_pressure_level kern.memorystatus_level 2>/dev/null)" || :
+  vmstat_out="$(LC_ALL=C exec vm_stat 2>/dev/null)" || :
+  df_out="$(LC_ALL=C exec df -k /System/Volumes/Data 2>/dev/null)" || :
+  # -n : sans traduction des adresses en noms, qui attend 5 s par passe sur un vrai Mac (lot 04 de charge-processeur) ; seules les
+  # lignes <Link#…>, identiques, sont lues
+  netstat_out="$(LC_ALL=C exec netstat -ibn 2>/dev/null)" || :
+  batt_out="$(LC_ALL=C exec pmset -g batt 2>/dev/null)" || :
+  ioreg_out="$(LC_ALL=C exec ioreg -r -c AppleSmartBattery 2>/dev/null)" || :
   # même format que lib/top.sh : ps_parse attend pid, ppid, uid, stat, rss, %cpu, etime, args (stat et etime inutilisés ici mais
   # exigés par le motif de ps_parse) ; sous une locale C, ps écrit les octets non ASCII en M-… — UTF-8 garde les dossiers accentués
-  ps_out="$(LC_ALL=en_US.UTF-8 ps -axww -o pid=,ppid=,uid=,stat=,rss=,%cpu=,etime=,args= 2>/dev/null || true)"
+  ps_out="$(LC_ALL=en_US.UTF-8 exec ps -axww -o pid=,ppid=,uid=,stat=,rss=,%cpu=,etime=,args= 2>/dev/null)" || :
   wait
-  macout=""; [ -z "$mac" ] || { macout="$(cat "$mtmp" 2>/dev/null || true)"; }
-  iostat_out="$(cat "$itmp" 2>/dev/null || true)"; rm -f "$mtmp" "$itmp"
+  macout=""; [ -z "$mac" ] || { sysmon_file_set "$mtmp"; macout="$SYSMON_FILE"; }
+  sysmon_file_set "$itmp"; iostat_out="$SYSMON_FILE"; rm -f "$mtmp" "$itmp"
   # delta réseau : octets de l'interface active moins ceux de la passe précédente, par seconde ; compteur remis à zéro (reboot,
   # changement d'interface) → débit 0, la passe sert de nouvelle base
-  netcur="$(sysmon_net "$netstat_out")"; netiface="${netcur%% *}"; netib="${netcur#* }"; netib="${netib%% *}"; netob="${netcur##* }"
+  netcur="$(LC_ALL=C exec awk "$SYSMON_NET_AWK" <<<"$netstat_out")"; netiface="${netcur%% *}"; netib="${netcur#* }"; netib="${netib%% *}"; netob="${netcur##* }"
   if [ -f "$state/net-raw" ]; then read -r pt pif pib pob <"$state/net-raw" 2>/dev/null || true; fi
   if [ -n "$netiface" ] && [ "$pif" = "$netiface" ] && [ -n "$pt" ] && [ "$now" -gt "$pt" ] 2>/dev/null \
      && [ "$netib" -ge "$pib" ] 2>/dev/null && [ "$netob" -ge "$pob" ] 2>/dev/null; then
@@ -67,15 +79,10 @@ sysmon_collect() {
   [ -z "$netiface" ] || printf '%s %s %s %s\n' "$now" "$netiface" "$netib" "$netob" >"$state/net-raw"
   # projets et verrous (lecture légère, sans lsof) : rattachent les sessions d'agent du top 5 à leur couloir
   projects="$(top_projects)"; layout="$(top_layout "$projects")"
-  {
-    printf '#MAC\n%s\n' "$macout"
-    printf '#Y\n%s\n#V\n%s\n#D\n%s\n' "$sysctl_out" "$vmstat_out" "$df_out"
-    printf '#IO\n%s\n' "$iostat_out"
-    printf '#NETD\n%s %s %s %s %s\n' "$netiface" "$down" "$up" "$netib" "$netob"
-    printf '#BT\n%s\n#BR\n%s\n' "$batt_out" "$ioreg_out"
-    printf '%s\n' "$layout"
-    printf '#S\n%s\n' "$ps_out"
-  } | LC_ALL=C awk -v self="${LAB_SELF:-$$}" -v uid="$(id -u)" "$TOP_AWK_LIB"'
+  # les sections en une chaîne (printf -v), lue par awk sans tuyau ; le uid de bash, comme id -u
+  printf -v all '#MAC\n%s\n#Y\n%s\n#V\n%s\n#D\n%s\n#IO\n%s\n#NETD\n%s %s %s %s %s\n#BT\n%s\n#BR\n%s\n%s\n#S\n%s' "$macout" \
+    "$sysctl_out" "$vmstat_out" "$df_out" "$iostat_out" "$netiface" "$down" "$up" "$netib" "$netob" "$batt_out" "$ioreg_out" "$layout" "$ps_out"
+  LC_ALL=C awk -v self="${LAB_SELF:-$$}" -v uid="$UID" "$TOP_AWK_LIB"'
     function mb(x) { return int(x + 0.5) }
     function pct(x) { x += 0; return (x < 0) ? 0 : (x > 100) ? 100 : int(x + 0.5) }
     # jnum(clé) : le nombre qui suit "clé": dans le JSON de macmon (clé unique, imbriquée ou non) ; "" si absente
@@ -204,7 +211,7 @@ sysmon_collect() {
         out = out "BLOCK=PROC\nKIND=" kind "\nRANK=" r "\nPID=" p "\nNAME=" nm "\nAGENT=" ag \
           "\nCPU=" sprintf("%.1f", CPU[p]) "\nMEM_MB=" mb(RSS[p] / 1024) "\nWHERE=" where "\n\n"
       }
-    }'
+    }' <<<"$all"
 }
 
 # sysmon_view <largeur> : vue lisible des six blocs (stdin, KEY=value) sur stdout, pour lab sysmon et les tests ; aucune mise en
@@ -237,15 +244,16 @@ sysmon_report() {
 
 # ---------- historique circulaire (lot 05) ----------
 # Une ligne par passe du collecteur, « epoch cpu mem pression io down up batt temp » (« - » pour une valeur absente) ; borné à
-# SYSMON_HIST_MAX lignes (10 min à 10 s, graphiques des menus), la barre lit les SYSMON_BAR_POINTS derniers (1 min). Réécrit en
-# entier à chaque passe (≤ 60 lignes, ~2 Ko) puis renommé : jamais de croissance, jamais de fichier à moitié écrit.
-SYSMON_HIST_MAX=60
+# SYSMON_HIST_MAX lignes (10 min à 30 s, graphiques des menus légendés « −10 min », étalés sur toute leur largeur), la barre lit
+# les SYSMON_BAR_POINTS derniers (ses six bâtons : 3 min à 30 s). Réécrit en entier à chaque passe (≤ 20 lignes, < 1 Ko) puis
+# renommé : jamais de croissance, jamais de fichier à moitié écrit. Lot 04 de charge-processeur : 60 points à 10 s avant.
+SYSMON_HIST_MAX=20
 # shellcheck disable=SC2034 # lu par widget_module_render (lib/widget.sh)
 SYSMON_BAR_POINTS=6
 # sysmon_history_push <fichier> <blocs KEY=value> : ajoute le point de la passe, garde les SYSMON_HIST_MAX derniers
 sysmon_history_push() {
-  local f="$1" now; now="${LAB_NOW_EPOCH:-$(date +%s)}"
-  printf '%s\n' "$2" | LC_ALL=C awk -v f="$f" -v tmp="$f.$$" -v now="$now" -v max="$SYSMON_HIST_MAX" '
+  local f="$1" now; now="${LAB_NOW_EPOCH:-$(exec date +%s)}"
+  LC_ALL=C awk -v f="$f" -v tmp="$f.$$" -v now="$now" -v max="$SYSMON_HIST_MAX" '
     BEGIN { RS = ""; FS = "\n" }
     function val(k,   i) { for (i = 1; i <= NF; i++) if (index($i, k "=") == 1) return substr($i, length(k) + 2); return "" }
     function d(x) { return (x == "") ? "-" : x }
@@ -262,7 +270,7 @@ sysmon_history_push() {
       H[++n] = now " " d(cpu) " " d(mem) " " d(lvl) " " d(io) " " d(down) " " d(up) " " d(batt) " " d(temp)
       for (i = (n > max) ? n - max + 1 : 1; i <= n; i++) print H[i] > tmp
       close(tmp)
-    }' && mv "$f.$$" "$f"
+    }' <<<"$2" && mv "$f.$$" "$f"
 }
 # sysmon_history_tail <fichier> <n> : les n derniers points (rien si l'historique n'existe pas encore)
 sysmon_history_tail() { tail -n "$2" "$1" 2>/dev/null || true; }
@@ -316,7 +324,7 @@ function pdf_wedge(cx, cy, r, pct,   n, i, t) {
 # pdf_series(x, y, w, h, vals, n, max, app, name, area) : courbe de n valeurs (V[1..n] lues dans vals, séparées par des espaces),
 # la plus récente à droite ; un point absent (« - ») coupe la courbe. area = 1 : surface remplie sous la courbe en alpha 28.
 function pdf_series(x, y, w, h, vals, n, max, app, name, area,   V, i, k, px, pyv, step, path, seg, first, fx, ap) {
-  split(vals, V, " "); if (max <= 0) max = 1; step = w / 59; path = ""; seg = 0; ap = ""
+  split(vals, V, " "); if (max <= 0) max = 1; step = w / (((hm + 0 > 1) ? hm : 60) - 1); path = ""; seg = 0; ap = ""
   for (i = 1; i <= n; i++) {
     if (V[i] == "-" || V[i] == "") { seg = 0; continue }
     px = x + w - (n - i) * step; k = V[i] / max; if (k > 1) k = 1; if (k < 0) k = 0

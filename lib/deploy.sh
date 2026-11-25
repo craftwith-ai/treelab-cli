@@ -48,28 +48,32 @@ deploy_lost() {
 # ---------- ce qui est en ligne (lot 02) : registre seul — ni git, ni gh, ni réseau : lu au démarrage, par status et next ----------
 deploy_registries() { local f; for f in "$(deploy_dir)"/*; do [ -f "$f" ] && basename "$f"; done; return 0; }
 # deploy_summary <cible> → « main@1a2b3c4 + #49 (api, not-merged) » ; fusionné → « (api, merged: lab deploy <cible>) »
-deploy_summary() {
-  local reg i out st; local -a l=() p=() m=()
-  reg="$(deploy_dir)/$1"; [ -f "$reg" ] || return 1
-  read -r -a l <<<"$(state_field "$reg" lanes)" || true
-  read -r -a p <<<"$(state_field "$reg" prs)" || true
-  read -r -a m <<<"$(state_field "$reg" merged)" || true
-  out="$(state_field "$reg" base)@$(state_field "$reg" base_rev | cut -c1-7)"
+deploy_summary() { deploy_summary_set "$1" || return; printf '%s\n' "$DEPLOY_SUMMARY"; }
+deploy_summary_set() { # <cible> : DEPLOY_SUMMARY, sans processus ; rc 1 sans registre
+  local reg="$LAB_STATE/$P_NAME/en-ligne/$1" i out st; local -a l=() p=() m=()
+  [ -f "$reg" ] || return 1
+  kv_value "$reg" lanes || true; read -r -a l <<<"$KV_VALUE" || true
+  kv_value "$reg" prs || true; read -r -a p <<<"$KV_VALUE" || true
+  kv_value "$reg" merged || true; read -r -a m <<<"$KV_VALUE" || true
+  kv_value "$reg" base || true; out="$KV_VALUE"; kv_value "$reg" base_rev || true; out="$out@${KV_VALUE:0:7}"
   for i in "${!l[@]}"; do
     if in_words "${l[$i]}" "${m[@]+"${m[@]}"}"; then st="merged: lab deploy $1"; else st=not-merged; fi
     case "${p[$i]:--}" in -) out="$out + ${l[$i]} ($st)" ;; *) out="$out + ${p[$i]} (${l[$i]}, $st)" ;; esac
   done
-  printf '%s%s\n' "$out" "$(prod_check_summary "$reg")"
+  prod_check_set "$reg"; DEPLOY_SUMMARY="$out$PROD_CHECK"
 }
 # ---------- contrôle de prod (lot 08 d'autonomie-tours) ----------
 # prod_check.<cible>= (config du projet, écrite à la main) : commande en lecture seule qui dit si la prod marche, lancée par lab
 # deploy après la sonde vérifiée et par lab deploy <cible> --check ; résultat dans le registre : check_rc= check_rev= (révision
 # servie contrôlée) check_epoch= (cloud_epoch, suit LAB_NOW) check_log=. Rouge : couloirs servis bloqués, aucun retour arrière.
-prod_check_summary() { # <registre> → « , check green at 1a2b3c4 » ; rien sans contrôle enregistré
-  local rc; rc="$(state_field "$1" check_rc)"; [ -n "$rc" ] || return 0
-  case "$rc" in 0) printf ', check green at %s' "$(state_field "$1" check_rev | cut -c1-7)" ;;
-    124) printf ', check red at %s (timeout)' "$(state_field "$1" check_rev | cut -c1-7)" ;;
-    *) printf ', check red at %s (rc %s)' "$(state_field "$1" check_rev | cut -c1-7)" "$rc" ;; esac
+prod_check_summary() { prod_check_set "$1"; printf '%s' "$PROD_CHECK"; } # <registre> → « , check green at 1a2b3c4 » ; rien sans contrôle enregistré
+prod_check_set() { # <registre> : PROD_CHECK, sans processus
+  local rc
+  PROD_CHECK=''
+  kv_value "$1" check_rc || true; rc="$KV_VALUE"; [ -n "$rc" ] || return 0
+  kv_value "$1" check_rev || true
+  case "$rc" in 0) PROD_CHECK=", check green at ${KV_VALUE:0:7}" ;; 124) PROD_CHECK=", check red at ${KV_VALUE:0:7} (timeout)" ;;
+    *) PROD_CHECK=", check red at ${KV_VALUE:0:7} (rc $rc)" ;; esac
 }
 # prod_check_run <cible> <révision> : sous le verrou de la cible tenu par l'appelant ; lancée depuis le checkout principal, sous délai
 # (LAB_PROD_CHECK_TIMEOUT, 300 s), avec LAB_DEPLOY_TARGET et LAB_DEPLOY_REV ; journal en-ligne/checks/<cible>-<UTC>-<pid>.log. Pose
@@ -135,7 +139,10 @@ en_ligne_line() {
   [ -z "$out" ] || printf 'SERVED=%s.\n' "$out"
 }
 # deploy_status_kv : une ligne SERVED=<cible> <résumé> par registre (lab status)
-deploy_status_kv() { local t; for t in $(deploy_registries); do kv SERVED "$t $(deploy_summary "$t")"; done; return 0; }
+deploy_status_kv() {
+  local f
+  for f in "$LAB_STATE/$P_NAME/en-ligne"/*; do [ -f "$f" ] || continue; deploy_summary_set "${f##*/}"; kv SERVED "${f##*/} $DEPLOY_SUMMARY"; done
+}
 # deploy_lane_warn <couloir> : lab next d'un couloir servi non fusionné rappelle que seule lab deploy met en ligne
 deploy_lane_warn() {
   local t
@@ -150,11 +157,12 @@ deploy_lane_warn() {
 # en cours réécrit le registre, l'annotation est alors remise à plus tard. Jamais bloquant.
 deploy_note_merged() {
   [ -n "${1:-}" ] && [ "${2:-$P_BASE}" = "$P_BASE" ] || return 0
-  local t reg i m changed promo=0 lock rc; local -a l=() b=() h=() mm=()
+  local t reg i m changed promo=0 lock rc dir="$LAB_STATE/$P_NAME/en-ligne"; local -a l=() b=() h=() mm=()
   [ -z "${P_STAGING:-}" ] || [ "$1" != "$P_STAGING" ] || promo=1
-  for t in $(deploy_registries); do
-    reg="$(deploy_dir)/$t"; lock="$(deploy_dir)/verrous/$t"; changed=0; rc=0
-    resource_take "$t" annotation "$$" "$(deploy_dir)/verrous" 1 || rc=$?
+  for reg in "$dir"/*; do   # deploy_registries, sans substitution (lot 05 de charge-processeur)
+    [ -f "$reg" ] || continue; t="${reg##*/}"
+    lock="$dir/verrous/$t"; changed=0; rc=0
+    resource_take "$t" annotation "$$" "$dir/verrous" 1 || rc=$?
     [ "$rc" = 0 ] || { warn "annotation of $t postponed: a go-live is running (it rewrites the registry)"; continue; }
     read -r -a l <<<"$(state_field "$reg" lanes)" || true
     read -r -a b <<<"$(state_field "$reg" branches)" || true
@@ -244,8 +252,9 @@ deploy_queue_turn() {
 # deploy_queue_status_kv : lab status et lab tower — DEPLOY_QUEUE=<cible> <couloir> <pos>/<long> since <heure> par demande,
 # DEPLOY_STOPPED=<cible> <couloir> <cause> pour une file arrêtée
 deploy_queue_status_kv() {
-  local t q l e c n m
-  for t in $(deploy_queue_targets); do
+  local f t q l e c n m
+  for f in "$LAB_STATE/$P_NAME/en-ligne"/file/*; do
+    [ -f "$f" ] || continue; t="${f##*/}"
     q="$(deploy_queue_lines "$t")"; [ -n "$q" ] || continue
     n=0; m="$(grep -c . <<<"$q")"
     while IFS=$'\t' read -r l e _ _ _ _ c; do
@@ -318,7 +327,8 @@ deploy_drain() {
           opts+=(--pin "${k%% *}" "${k#* }")
         done
         journal="$(mktemp)"; rc=0
-        (cd "$P_ROOT" && "$LAB_ROOT/bin/lab" deploy "$P_NAME" "$t" --pin "$lane" "$rev" "${opts[@]+"${opts[@]}"}") </dev/null >"$journal" 2>&1 || rc=$?
+        # sans COLUMNS : le refus final reste sur une ligne, relue ci-dessous (revue du lot 03 de charge-processeur)
+        (cd "$P_ROOT" && unset COLUMNS && "$LAB_ROOT/bin/lab" deploy "$P_NAME" "$t" --pin "$lane" "$rev" "${opts[@]+"${opts[@]}"}") </dev/null >"$journal" 2>&1 || rc=$?
         sed 's/^/  /' "$journal" >&2
         cause="$(awk -v p="$DIE_PREFIX" 'index($0, p) == 1 {c = substr($0, length(p) + 1)} END {print c}' "$journal")"; rm -f "$journal"
         if [ "$rc" = 0 ]; then
@@ -522,10 +532,18 @@ deploy_add_write() {
 }
 
 # cmd_deploy [projet] <cible> [--with <couloir>…] [--retire <couloir>…] [--record] [--dry-run] ; --add : deploy_add
+# deploy_reg_write <verified> : le registre de la cible, écrit par cmd_deploy avec ses variables (portée dynamique de bash) ; deux
+# écritures au plus par mise en ligne, mêmes valeurs sauf verified= (revue du lot 03 de charge-processeur)
+deploy_reg_write() {
+  state_write "$reg" "$(printf 'target=%s\nrev=%s\nbase=%s\nbase_rev=%s\nlanes=%s\nbranches=%s\nheads=%s\nprs=%s\nsince=%s\nretired=%s\nlane=%s\ndate=%s\nepoch=%s\nverified=%s\n' \
+    "$target" "$rev" "$P_BASE" "$base_rev" "${inc[*]+"${inc[*]}"}" "${incb[*]+"${incb[*]}"}" "${inch[*]+"${inch[*]}"}" \
+    "$(for pr in "${incp[@]+"${incp[@]}"}"; do printf '%s ' "${pr:--}"; done | sed 's/ $//')" "$since" "${retired[*]+"${retired[*]}"}" \
+    "$actor" "$stamp" "$now" "$1")"$'\n'
+}
 cmd_deploy() {
   case " $* " in *" --add "*) deploy_add "$@"; return ;; *" --queue "*) deploy_drain "$@"; return ;; esac
   local target record=0 dry=0 cancel=0 check=0 here cmd probe got reg base_rev rev part i lane br head pr verified=yes rc=0 pin="" actor lrev
-  local waited poll max
+  local waited poll max again=0
   local -a pins=() pin_revs=() pos=() with=() retire=() inc=() incb=() inch=() incp=() r_lanes=() r_since=() lost=() lostn=() retired=()
   while [ "$#" -gt 0 ]; do case "$1" in
     --with) [ -n "${2:-}" ] || usage; valid_slug "$2" || die "invalid lane: $2"; with+=("$2"); shift 2 ;;
@@ -684,30 +702,40 @@ cmd_deploy() {
     log "going live on $target: $part"
     (cd "$D_TMP" && LAB_DEPLOY_TARGET="$target" LAB_DEPLOY_REV="$rev" LAB_DEPLOY_LANE="$actor" bash -c "$cmd") </dev/null >&2 || {
       rc=$?; die "go-live command failed (code $rc): $cmd — the target may be in a partial state; registry unchanged"; }
-    if [ -z "$probe" ]; then
-      verified=no; warn "no probe for $target (key probe.$target= of the config): the served revision is not verified"
-    else
-      got="$( (cd "$D_TMP" && LAB_DEPLOY_TARGET="$target" LAB_DEPLOY_LANE="$actor" bash -c "$probe") </dev/null 2>/dev/null | grep -oE '[0-9a-f]{7,40}' | head -1 || true)"
-      case "$rev" in "${got:-empty}"*) ;; *) verified=no ;; esac
-    fi
   fi
   # since= : première mise en ligne de chaque couloir servi, gardée tant qu'il le reste (le doctor mesure son ancienneté)
-  local since="" now j s; now="$(epoch_now)"
+  local since="" now stamp j s; now="$(epoch_now)"; stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   for lane in "${inc[@]+"${inc[@]}"}"; do
     s="$now"
     for j in "${!r_lanes[@]}"; do [ "${r_lanes[$j]}" != "$lane" ] || s="${r_since[$j]:-$(state_field "$reg" epoch)}"; done
     since="${since:+$since }${s:-$now}"
   done
-  state_write "$reg" "$(printf 'target=%s\nrev=%s\nbase=%s\nbase_rev=%s\nlanes=%s\nbranches=%s\nheads=%s\nprs=%s\nsince=%s\nretired=%s\nlane=%s\ndate=%s\nepoch=%s\nverified=%s\n' \
-    "$target" "$rev" "$P_BASE" "$base_rev" "${inc[*]+"${inc[*]}"}" "${incb[*]+"${incb[*]}"}" "${inch[*]+"${inch[*]}"}" \
-    "$(for pr in "${incp[@]+"${incp[@]}"}"; do printf '%s ' "${pr:--}"; done | sed 's/ $//')" "$since" "${retired[*]+"${retired[*]}"}" \
-    "$actor" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$now" "$verified")"$'\n'
+  if [ "$record" = 0 ] && [ -z "$probe" ]; then
+    verified=no; warn "no probe for $target (key probe.$target= of the config): the served revision is not verified"
+  elif [ "$record" = 0 ]; then
+    # la cible sert encore l'ancienne révision quelques instants après la commande (propagation, cache) : la sonde est relue
+    # toutes les LAB_DEPLOY_PROBE_EVERY s (5), LAB_DEPLOY_PROBE_WAIT s au plus (120) — jamais juste : le même refus qu'avant
+    # (lot 03 de charge-processeur : le site devait commencer par sleep 60, coupé par le doctor et jamais lu). Le registre dit
+    # d'abord la révision mise en ligne, non vérifiée : un appel coupé pendant la relecture la laisse inscrite (revue du lot 03)
+    deploy_reg_write no
+    poll="${LAB_DEPLOY_PROBE_EVERY:-5}"; max="${LAB_DEPLOY_PROBE_WAIT:-120}"
+    [[ "$poll" =~ ^[1-9][0-9]*$ ]] || poll=5; [[ "$max" =~ ^[0-9]+$ ]] || max=120
+    waited="$SECONDS"
+    while :; do
+      got="$( (cd "$D_TMP" && LAB_DEPLOY_TARGET="$target" LAB_DEPLOY_LANE="$actor" bash -c "$probe") </dev/null 2>/dev/null | grep -oE '[0-9a-f]{7,40}' | head -1 || true)"
+      case "$rev" in "${got:-empty}"*) break ;; esac
+      if [ $((SECONDS - waited)) -ge "$max" ]; then verified=no; break; fi
+      [ "$again" = 1 ] || log_wrap "probe of $target: served revision ${got:-unreadable}, expected ${rev:0:7} — read again every $poll s, $max s at most."
+      again=1; sleep "$poll"
+    done
+  fi
+  deploy_reg_write "$verified"
   kv PROJECT "$P_NAME"; kv TARGET "$target"; kv ACTION "$(if [ "$record" = 1 ]; then printf recorded; else printf deployed; fi)"
   kv REV "$rev"; kv BASE "$P_BASE@${base_rev:0:7}"; kv INCLUDED "$(words_or "${inc[@]+"${inc[@]}"}")"
   kv RETIRED "$(words_or "${retired[@]+"${retired[@]}"}")"; [ "${#inc[@]}" = 0 ] || [ "$record" = 1 ] || kv SERVE "serve/$target"
   kv VERIFIED "$verified"
   if [ "$record" = 0 ] && [ -n "$probe" ] && [ "$verified" = no ]; then
-    die "probe of $target: served revision ${got:-unreadable}, expected ${rev:0:7} — the go-live is not verified (registry marked verified=no)"
+    die_wrap "probe of $target: served revision ${got:-unreadable}, expected ${rev:0:7} — the go-live is not verified (registry marked verified=no)"
   fi
   # lot 08 d'autonomie-tours : la prod contrôlée sur la révision servie, une fois la sonde vérifiée ; --record ne lance rien
   PC_STATE=none; PC_RC=""; PC_LOG=""

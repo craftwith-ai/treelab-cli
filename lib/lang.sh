@@ -73,50 +73,61 @@ lang_pairs_set "$LANG_VALUES_EN"; LANG_PAIRS_V="$LANG_PAIRS"
 # de lignes ne change jamais. detect imprime la langue du premier marqueur reconnu — en ou fr, fr sans marqueur.
 # Champs en gras, casse et puce tolérées ; sans gras, seuls État et Tests retirés (leurs lecteurs le toléraient déjà) : une ligne
 # de journal « - Branch: … » reste du texte.
+# LANG_AWK : les règles elles-mêmes, en fonctions awk (lang_init, puis lang_line pour chaque ligne) — une seule copie, pour lang_norm et
+# pour la lecture groupée des fiches (lib/reads.sh). lang_line rend la ligne lue et pose LANG_HIT (en ou fr, vide sans marqueur) ;
+# detect=1 : la langue seule compte, les champs en milieu de ligne ne sont pas ramenés
+# shellcheck disable=SC2016 # programme awk, rien à développer
+LANG_AWK='
+function lang_load(s, M, R,   n, i, a, kv) { n = split(s, a, "\n"); for (i = 1; i <= n; i++) if (split(a[i], kv, "\t") == 2) { M[kv[1]] = kv[2]; R[kv[2]] = 1 } }
+function lang_init(   k) {
+  lang_load(ENVIRON["LANG_S"], LG_S, LG_SF); lang_load(ENVIRON["LANG_F"], LG_F0, LG_FF); lang_load(ENVIRON["LANG_V"], LG_V0, LG_VF)
+  for (k in LG_F0) LG_F[tolower(k)] = LG_F0[k]; for (k in LG_FF) LG_FFL[tolower(k)] = 1; for (k in LG_V0) LG_V[tolower(k)] = LG_V0[k]
+}
+function lang_nbsp(s) { gsub(/\302\240|\342\200\257|\342\200\211/, " ", s); return s }
+function lang_found(l) { if (LANG_HIT == "") LANG_HIT = l }
+function lang_line(line, detect,   pre, rest, k, sp, head, tail, word, lw, bold, fr, p, v, q, r) {
+  LANG_HIT = ""
+  if (match(line, /^## +/)) {
+    pre = substr(line, 1, RLENGTH); rest = substr(line, RLENGTH + 1)
+    for (k in LG_S) if (index(rest, k) == 1 && substr(rest, length(k) + 1, 1) !~ /[A-Za-z]/) { lang_found("en"); line = pre LG_S[k] substr(rest, length(k) + 1); break }
+    for (k in LG_SF) if (index(rest, k) == 1 && substr(rest, length(k) + 1, 1) !~ /[A-Za-z]/) lang_found("fr")
+  } else if (match(line, /^# Batch [0-9]/)) { lang_found("en"); line = "# Lot " substr(line, 9) }
+  else if (line ~ /^# Lot [0-9]/) lang_found("fr")
+  else if (match(sp = lang_nbsp(line), /^[ \t]*([-*+][ \t]+)?(\*\*|__)?[^*_:]+(\*\*|__)?[ \t]*:/)) {
+    head = substr(sp, 1, RLENGTH); tail = substr(sp, RLENGTH + 1)   # espaces insécables lus comme espaces (lot_state_check)
+    word = head; sub(/^[ \t]*([-*+][ \t]+)?(\*\*|__)?/, "", word); sub(/(\*\*|__)?[ \t]*:$/, "", word); sub(/[ \t]+$/, "", word)
+    lw = tolower(word); bold = (head ~ /^[ \t]*([-*+][ \t]+)?(\*\*|__)/)
+    if ((lw in LG_F) && !bold && lw != "state" && lw != "tests removed") lw = ""   # sans gras : seuls État et Tests retirés sont des champs
+    if (lw in LG_F) {
+      # la ligne lue ne perd que le mot du champ et la valeur : ses espaces, insécables compris, restent
+      lang_found("en"); fr = LG_F[lw]; p = index(line, word); line = substr(line, 1, p - 1) fr substr(line, p + length(word))
+      if (fr == "\303\211tat" || fr == "D\303\251cision" || fr == "Prochain lot") {
+        match(tail, /^[ \t]*(\*\*|__)?[ \t]*/); v = substr(tail, RLENGTH + 1)
+        # waiting : valeur du seul champ État ; un slug waiting-list du Prochain lot reste tel quel (revue, lot 02 autonomie-tours)
+        for (k in LG_V) if ((k != "waiting" || fr == "\303\211tat") && index(tolower(v), k) == 1 && substr(v, length(k) + 1, 1) !~ /[A-Za-z0-9]/) {
+          q = p + length(fr); rest = substr(line, q); r = index(tolower(rest), k)
+          if (r) line = substr(line, 1, q + r - 2) LG_V[k] substr(rest, r + length(k))
+          break
+        }
+      }
+    } else if (lw in LG_FFL || lw == "\303\251tat" || lw == "etat" || lw == "\303\211tat") lang_found("fr")
+  }
+  # champ en gras en milieu de ligne, ainsi « **Created** » après « · » : seul le marqueur change
+  if (!detect && index(line, "**")) for (k in LG_F0) while ((p = index(line, "**" k "**")) > 0) line = substr(line, 1, p + 1) LG_F0[k] substr(line, p + 2 + length(k))
+  return line
+}
+'
 lang_norm() {   # un lecteur qui sort tôt (awk exit, head) ferme le tube : SIGPIPE (141) n'est pas une panne sous pipefail
   local rc=0
   LC_ALL=C LANG_S="$LANG_PAIRS_S" LANG_F="$LANG_PAIRS_F" LANG_V="$LANG_PAIRS_V" \
-  awk -v mode="${1:-norm}" '
-    function load(s, M, R,   n, i, a, kv) { n = split(s, a, "\n"); for (i = 1; i <= n; i++) if (split(a[i], kv, "\t") == 2) { M[kv[1]] = kv[2]; R[kv[2]] = 1 } }
-    function lower(s) { return tolower(s) }
-    function nbsp(s) { gsub(/\302\240|\342\200\257|\342\200\211/, " ", s); return s }
-    function found(l) { if (mode == "detect") { print l; done = 1; exit } }
-    BEGIN {
-      load(ENVIRON["LANG_S"], S, SF); load(ENVIRON["LANG_F"], F0, FF); load(ENVIRON["LANG_V"], V0, VF)
-      for (k in F0) F[lower(k)] = F0[k]; for (k in FF) FFL[lower(k)] = 1; for (k in V0) V[lower(k)] = V0[k]
-    }
+  awk -v mode="${1:-norm}" "$LANG_AWK"'
+    BEGIN { lang_init(); detect = (mode == "detect") }
     {
-      line = $0
-      if (match(line, /^## +/)) {
-        pre = substr(line, 1, RLENGTH); rest = substr(line, RLENGTH + 1)
-        for (k in S) if (index(rest, k) == 1 && substr(rest, length(k) + 1, 1) !~ /[A-Za-z]/) { found("en"); line = pre S[k] substr(rest, length(k) + 1); break }
-        for (k in SF) if (index(rest, k) == 1 && substr(rest, length(k) + 1, 1) !~ /[A-Za-z]/) found("fr")
-      } else if (match(line, /^# Batch [0-9]/)) { found("en"); line = "# Lot " substr(line, 9) }
-      else if (line ~ /^# Lot [0-9]/) found("fr")
-      else if (match(sp = nbsp(line), /^[ \t]*([-*+][ \t]+)?(\*\*|__)?[^*_:]+(\*\*|__)?[ \t]*:/)) {
-        head = substr(sp, 1, RLENGTH); tail = substr(sp, RLENGTH + 1)   # espaces insécables lus comme espaces (lot_state_check)
-        word = head; sub(/^[ \t]*([-*+][ \t]+)?(\*\*|__)?/, "", word); sub(/(\*\*|__)?[ \t]*:$/, "", word); sub(/[ \t]+$/, "", word)
-        lw = lower(word); bold = (head ~ /^[ \t]*([-*+][ \t]+)?(\*\*|__)/)
-        if ((lw in F) && !bold && lw != "state" && lw != "tests removed") lw = ""   # sans gras : seuls État et Tests retirés sont des champs
-        if (lw in F) {
-          # la ligne lue ne perd que le mot du champ et la valeur : ses espaces, insécables compris, restent
-          found("en"); fr = F[lw]; p = index(line, word); line = substr(line, 1, p - 1) fr substr(line, p + length(word))
-          if (fr == "\303\211tat" || fr == "D\303\251cision" || fr == "Prochain lot") {
-            match(tail, /^[ \t]*(\*\*|__)?[ \t]*/); v = substr(tail, RLENGTH + 1)
-            # waiting : valeur du seul champ État ; un slug waiting-list du Prochain lot reste tel quel (revue, lot 02 autonomie-tours)
-            for (k in V) if ((k != "waiting" || fr == "\303\211tat") && index(lower(v), k) == 1 && substr(v, length(k) + 1, 1) !~ /[A-Za-z0-9]/) {
-              q = p + length(fr); rest = substr(line, q); r = index(lower(rest), k)
-              if (r) line = substr(line, 1, q + r - 2) V[k] substr(rest, r + length(k))
-              break
-            }
-          }
-        } else if (lw in FFL || lw == "\303\251tat" || lw == "etat" || lw == "\303\211tat") found("fr")
-      }
-      # champ en gras en milieu de ligne, ainsi « **Created** » après « · » : seul le marqueur change
-      if (mode != "detect" && index(line, "**")) for (k in F0) while ((p = index(line, "**" k "**")) > 0) line = substr(line, 1, p + 1) F0[k] substr(line, p + 2 + length(k))
-      if (mode != "detect") print line
+      line = lang_line($0, detect)
+      if (!detect) print line
+      else if (LANG_HIT != "") { print LANG_HIT; done = 1; exit }
     }
-    END { if (mode == "detect" && !done) print "fr" }' || rc=$?
+    END { if (detect && !done) print "fr" }' || rc=$?
   [ "$rc" -ne 141 ] || rc=0; return "$rc"
 }
 # ---------- table unique des valeurs KEY=value : ancien mot français → mot anglais (lot 09 du couloir anglais) ----------
@@ -124,89 +135,91 @@ lang_norm() {   # un lecteur qui sort tôt (awk exit, head) ferme le tube : SIGP
 # porte encore la colonne française : lang_code la traduit à la lecture (veilleur, marqueur Cloud, échéances, registre en ligne,
 # .lab/correction, état de fiche). Ni migration ni double écriture : la colonne française n'est jamais réécrite, seulement lue.
 # Un mot absent de la table ressort tel quel : lang_code se pose sans risque sur une valeur déjà anglaise ou sur une donnée libre.
-lang_code() {
+lang_code() { lang_code_set "$1"; printf '%s\n' "$LANG_CODE"; }
+lang_code_set() { # <valeur> : LANG_CODE, sa forme anglaise, sans processus
   case "$1" in
-    'armé'|'armée') echo armed ;;
-    'attente'|'en attente') echo waiting ;;
-    'mort') echo dead ;;
-    'vivant'|'vivante') echo alive ;;
-    'incertain') echo uncertain ;;
-    'libre') echo free ;;
-    'fini') echo finished ;;
-    'attente-pause') echo idle-paused ;;
-    'repris') echo resumed ;;
-    'relance') echo restarted ;;
-    'fusionné'|'fusionnée'|'mergée') echo merged ;;
-    'non fusionnée'|'non mergée') echo not-merged ;;
-    'fermé') echo closed ;;
-    'clos') echo closed ;;
-    'rouge') echo red ;;
-    'conflit') echo conflict ;;
-    'sync-conflit') echo sync-conflict ;;
-    'stack-conflit') echo stack-conflict ;;
-    'changée') echo changed ;;
-    'échec') echo failed ;;
-    'retiré'|'retirée') echo removed ;;
-    'ajouté') echo added ;;
-    'lancé') echo started ;;
-    'libérée') echo released ;;
-    'prête') echo ready ;;
-    'en file') echo queued ;;
-    'à-jour') echo up-to-date ;;
-    'ignorée') echo ignored ;;
-    'bloquée') echo blocked ;;
-    'présentation') echo preview ;;
-    'rien'|'aucun'|'aucune') echo none ;;
-    'non vérifiable') echo not-checkable ;;
-    'vérifiable') echo checkable ;;
-    'planifié') echo planned ;;
-    'en cours') echo 'in progress' ;;
-    'prévu'|'à venir') echo upcoming ;;
-    'retard') echo late ;;
-    'à clarifier') echo 'to clarify' ;;
-    'travail') echo work ;;
-    'en recette') echo 'in acceptance' ;;
-    'recette validée') echo 'acceptance passed' ;;
-    'HEAD-détachée') echo detached-HEAD ;;
-    'déjà') echo already ;;
-    'nouveau') echo new ;;
-    'inconnu') echo unknown ;;
-    'oui') echo yes ;;
-    'non') echo no ;;
-    'sans commit') echo 'no commit' ;;
-    'rangé') echo stored ;;
-    'déjà-importé') echo already-imported ;;
-    'à-importer') echo to-import ;;
-    'défaut') echo default ;;
-    'référence') echo reference ;;
-    'nom') echo name ;;
-    'épuisé') echo exhausted ;;
-    'semé') echo seeded ;;
-    'valable') echo valid ;;
-    'périmée') echo expired ;;
-    'inscrite') echo recorded ;;
-    'déployée') echo deployed ;;
-    'ouverte') echo open ;;
-    'faite') echo 'done' ;;
-    'annulée') echo cancelled ;;
-    'redatée') echo rescheduled ;;
-    'validée') echo accepted ;;
-    'refusée') echo rejected ;;
-    'hors-couloir') echo outside-lane ;;
-    'checkout-principal') echo main-checkout ;;
-    'copie') echo copy ;;   # manifeste de preuves d'avant le lot 09
-    *) printf '%s\n' "$1" ;;
+    'armé'|'armée') LANG_CODE=armed ;;
+    'attente'|'en attente') LANG_CODE=waiting ;;
+    'mort') LANG_CODE=dead ;;
+    'vivant'|'vivante') LANG_CODE=alive ;;
+    'incertain') LANG_CODE=uncertain ;;
+    'libre') LANG_CODE=free ;;
+    'fini') LANG_CODE=finished ;;
+    'attente-pause') LANG_CODE=idle-paused ;;
+    'repris') LANG_CODE=resumed ;;
+    'relance') LANG_CODE=restarted ;;
+    'fusionné'|'fusionnée'|'mergée') LANG_CODE=merged ;;
+    'non fusionnée'|'non mergée') LANG_CODE=not-merged ;;
+    'fermé') LANG_CODE=closed ;;
+    'clos') LANG_CODE=closed ;;
+    'rouge') LANG_CODE=red ;;
+    'conflit') LANG_CODE=conflict ;;
+    'sync-conflit') LANG_CODE=sync-conflict ;;
+    'stack-conflit') LANG_CODE=stack-conflict ;;
+    'changée') LANG_CODE=changed ;;
+    'échec') LANG_CODE=failed ;;
+    'retiré'|'retirée') LANG_CODE=removed ;;
+    'ajouté') LANG_CODE=added ;;
+    'lancé') LANG_CODE=started ;;
+    'libérée') LANG_CODE=released ;;
+    'prête') LANG_CODE=ready ;;
+    'en file') LANG_CODE=queued ;;
+    'à-jour') LANG_CODE=up-to-date ;;
+    'ignorée') LANG_CODE=ignored ;;
+    'bloquée') LANG_CODE=blocked ;;
+    'présentation') LANG_CODE=preview ;;
+    'rien'|'aucun'|'aucune') LANG_CODE=none ;;
+    'non vérifiable') LANG_CODE=not-checkable ;;
+    'vérifiable') LANG_CODE=checkable ;;
+    'planifié') LANG_CODE=planned ;;
+    'en cours') LANG_CODE='in progress' ;;
+    'prévu'|'à venir') LANG_CODE=upcoming ;;
+    'retard') LANG_CODE=late ;;
+    'à clarifier') LANG_CODE='to clarify' ;;
+    'travail') LANG_CODE=work ;;
+    'en recette') LANG_CODE='in acceptance' ;;
+    'recette validée') LANG_CODE='acceptance passed' ;;
+    'HEAD-détachée') LANG_CODE=detached-HEAD ;;
+    'déjà') LANG_CODE=already ;;
+    'nouveau') LANG_CODE=new ;;
+    'inconnu') LANG_CODE=unknown ;;
+    'oui') LANG_CODE=yes ;;
+    'non') LANG_CODE=no ;;
+    'sans commit') LANG_CODE='no commit' ;;
+    'rangé') LANG_CODE=stored ;;
+    'déjà-importé') LANG_CODE=already-imported ;;
+    'à-importer') LANG_CODE=to-import ;;
+    'défaut') LANG_CODE=default ;;
+    'référence') LANG_CODE=reference ;;
+    'nom') LANG_CODE=name ;;
+    'épuisé') LANG_CODE=exhausted ;;
+    'semé') LANG_CODE=seeded ;;
+    'valable') LANG_CODE=valid ;;
+    'périmée') LANG_CODE=expired ;;
+    'inscrite') LANG_CODE=recorded ;;
+    'déployée') LANG_CODE=deployed ;;
+    'ouverte') LANG_CODE=open ;;
+    'faite') LANG_CODE='done' ;;
+    'annulée') LANG_CODE=cancelled ;;
+    'redatée') LANG_CODE=rescheduled ;;
+    'validée') LANG_CODE=accepted ;;
+    'refusée') LANG_CODE=rejected ;;
+    'hors-couloir') LANG_CODE=outside-lane ;;
+    'checkout-principal') LANG_CODE=main-checkout ;;
+    'copie') LANG_CODE=copy ;;   # manifeste de preuves d'avant le lot 09
+    *) LANG_CODE="$1" ;;
   esac
 }
 # lang_code_prefix <valeur> : lang_code sur le premier mot d'une valeur suffixée (« fusionnée : lab deploy x » → « merged : lab
 # deploy x ») ; sans préfixe connu, la valeur entière passe par lang_code.
 LANG_CODE_PREFIXES="non fusionnée|non mergée|en cours|en attente|en file|à clarifier|à venir|sans commit|non vérifiable|fusionnée|planifié|validée|refusée|ouverte|faite|annulée|armé|armée|échec|clos|retard"
-lang_code_prefix() {
+lang_code_prefix() { lang_code_prefix_set "$1"; printf '%s\n' "$LANG_CODE"; }
+lang_code_prefix_set() { # <valeur> : LANG_CODE, la même, sans processus
   local w; local IFS='|'
   for w in $LANG_CODE_PREFIXES; do
-    case "$1" in "$w"[!A-Za-z]*) printf '%s%s\n' "$(lang_code "$w")" "${1#"$w"}"; return 0 ;; esac
+    case "$1" in "$w"[!A-Za-z]*) lang_code_set "$w"; LANG_CODE="$LANG_CODE${1#"$w"}"; return 0 ;; esac
   done
-  lang_code "$1"
+  lang_code_set "$1"
 }
 # lang_doc_of <fichier> → en | fr : la langue lue sur les marqueurs du document ; fr pour un document absent ou sans marqueur
 lang_doc_of() { if [ -f "${1:-}" ] && [ -r "$1" ]; then lang_norm detect <"$1"; else printf 'fr\n'; fi; }

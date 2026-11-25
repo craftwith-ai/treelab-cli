@@ -33,7 +33,7 @@ comptes_jetons() { [ -f "$(comptes_file)" ] || return 0; grep -E '^[A-Za-z0-9._-
 # comptes_actifs : la rotation n'existe que si au moins un jeton est rangé — sinon tout reste comme avant
 comptes_actifs() { [ -n "$(comptes_jetons)" ]; }
 comptes_liste() { printf '%s\n' "$COMPTE_PRINCIPAL"; comptes_jetons; }
-compte_connu() { comptes_liste | grep -qxF "$1"; }
+compte_connu() { local liste; liste="$(comptes_liste)" && grep -qxF "$1" <<<"$liste"; }
 
 compte_now() { # → epoch ; LAB_NOW (AAAA-MM-JJTHH:MM:SSZ) fixe l'horloge des tests
   if [ -n "${LAB_NOW:-}" ]; then
@@ -41,12 +41,28 @@ compte_now() { # → epoch ; LAB_NOW (AAAA-MM-JJTHH:MM:SSZ) fixe l'horloge des t
   else date +%s; fi
 }
 compte_heure() { perl -MPOSIX -e 'print strftime("%d/%m %H:%M", localtime($ARGV[0])), "\n"' "$1"; }   # <epoch> → « 13/10 09:00 »
-# fichier_remplace <fichier> : l'entrée standard remplace le fichier d'un coup (mktemp + mv, mode 600) — jamais un fichier à moitié écrit
+# fichier_remplace <fichier> : l'entrée standard remplace le fichier d'un coup (mktemp + mv, mode 600) — jamais un fichier à moitié écrit.
+# Coupé par TERM, INT ou HUP, le fichier temporaire part avec lui : Claude Code 2.1.331 tue tout le groupe de la statusline à chaque
+# rafraîchissement, relevé lancé en arrière-plan compris (111 restes sur le poste, lot 04 de charge-processeur). Toujours appelée au
+# bout d'un tuyau, donc dans un sous-shell : le piège ne remplace jamais celui de l'appelant. Un arrêt par KILL laisse son reste,
+# balayé au relevé complet suivant (compte_restes_balayer).
 fichier_remplace() {
-  local tmp; mkdir -p "$(dirname "$1")" || return 1
+  local tmp=""
+  trap 'rm -f "$tmp"; exit 1' TERM INT HUP
+  [ -d "${1%/*}" ] || mkdir -p "${1%/*}" || return 1
   tmp="$(umask 077; mktemp "$1.XXXXXX")" || return 1
   if cat >"$tmp" && mv "$tmp" "$1"; then return 0; fi
   rm -f "$tmp"; return 1
+}
+# compte_restes_balayer : les restes de fichier_remplace (<fichier>.XXXXXX, mktemp) des fichiers de comptes de plus de 10 minutes —
+# leur écriture a été tuée ; plus jeune, une écriture peut être en cours. Jamais un fichier d'un autre nom.
+COMPTE_RESTE_MIN=10
+compte_restes_balayer() {
+  local x='[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]'
+  # -H : un dossier d'état rangé derrière un lien symbolique est parcouru (revue du lot)
+  { find -H "$LAB_STATE" "$LAB_HOME" -maxdepth 1 -type f -name "comptes*.$x" -mmin "+$COMPTE_RESTE_MIN"
+    [ ! -d "$(comptes_badges_dir)" ] || find -H "$(comptes_badges_dir)" -maxdepth 1 -type f -name "*.$x" -mmin "+$COMPTE_RESTE_MIN"
+  } 2>/dev/null | while IFS= read -r f; do rm -f "$f"; done
 }
 
 # ---------- identité réelle : l'étiquette du compte dont Claude se sert vraiment ----------
@@ -121,8 +137,17 @@ compte_liberer() { # <étiquette>
 # compte_relever : le JSON de la statusline sur l'entrée standard (rate_limits.five_hour|seven_day.used_percentage et resets_at, en
 # secondes epoch — doc statusline de Claude Code, mesuré au lot 01) rangé pour le compte réel. Muet, toujours rc 0 : il tourne à
 # chaque rafraîchissement de la statusline. « - » = valeur absente.
+# shellcheck disable=SC2016 # programme jq
+COMPTE_RELEVE_JQ='(.rate_limits // empty | [.five_hour.used_percentage, .five_hour.resets_at, .seven_day.used_percentage, .seven_day.resets_at]
+    | map(if type == "number" then (. + 0.5 | floor | tostring) else "-" end) | join("\t"))'
 compte_relever() {
-  local json l v f; json="$(cat)" || return 0
+  local json v; json="$(cat)" || return 0
+  v="$(printf '%s' "$json" | jq -r "$COMPTE_RELEVE_JQ" 2>/dev/null)" || v=""
+  compte_relever_valeurs "$v"
+}
+# compte_relever_valeurs <valeurs séparées par des tabulations> [epoch] : la suite du relevé, JSON déjà lu
+compte_relever_valeurs() {
+  local v="$1" l f
   compte_badge_suivi 1 >/dev/null 2>&1
   l="$(compte_reel 2>/dev/null)" || return 0
   # badges : une fenêtre lancée sur un autre compte garde sa connexion en mémoire après une bascule globale — relevé ambigu, ignoré ;
@@ -131,11 +156,37 @@ compte_relever() {
     if [ -n "${LAB_COMPTE:-}" ]; then [ "$(compte_cle "$LAB_COMPTE")" = "$l" ] || return 0
     elif compte_fenetre_ancienne; then return 0; fi
   fi
-  v="$(printf '%s' "$json" | jq -r '.rate_limits // empty | [.five_hour.used_percentage, .five_hour.resets_at, .seven_day.used_percentage, .seven_day.resets_at]
-    | map(if type == "number" then (. + 0.5 | floor | tostring) else "-" end) | join("\t")' 2>/dev/null)" || return 0
   case "$v" in ''|-$'\t'-$'\t'-$'\t'-) return 0 ;; esac
   f="$(comptes_usage_file)"
-  { awk -F'\t' -v l="$l" '$1 != l' "$f" 2>/dev/null; printf '%s\t%s\t%s\n' "$l" "$v" "$(compte_now)"; } | fichier_remplace "$f" || return 0
+  { awk -F'\t' -v l="$l" '$1 != l' "$f" 2>/dev/null; printf '%s\t%s\t%s\n' "$l" "$v" "${2:-$(compte_now)}"; } | fichier_remplace "$f" || return 0
+}
+# ---------- chemin court de lab account record (lot 04 de charge-processeur) ----------
+# Au plus un relevé complet par minute et par session (session_id du JSON ; sans identifiant lisible, « - » : une fois par minute au
+# total). Un seul jq lit la session, l'heure (LAB_NOW des tests compris) et l'usage : un appel écarté coûte lab et ce jq, rien d'autre.
+# Mémoire : $LAB_STATE/comptes-releves, « <session> TAB <epoch du dernier relevé complet> », réécrite au relevé complet, sessions de
+# plus d'un jour oubliées. LAB_RECORD_GAP_S règle l'écart (60 ; 0 : chaque appel relève, les anciens tests des comptes).
+COMPTE_RELEVE_ECART_S="${LAB_RECORD_GAP_S:-60}"
+COMPTE_RELEVE_OUBLI_S=86400
+comptes_releves_file() { printf '%s/comptes-releves\n' "$LAB_STATE"; }
+compte_releve_court() {
+  local json="" r sid now v s t last="" f="$LAB_STATE/comptes-releves"
+  IFS= read -r -d '' json || :
+  # shellcheck disable=SC2016 # programme jq
+  r="$(exec jq -r '[(.session_id // "" | tostring), ($ENV.LAB_NOW // "" | if . == "" then now else fromdateiso8601 end | floor | tostring),
+    ('"$COMPTE_RELEVE_JQ"' // "")] | join("|")' <<<"$json" 2>/dev/null)" || return 0
+  IFS='|' read -r sid now v <<<"$r"
+  case "$sid" in ''|-*|*[!A-Za-z0-9-]*) sid=- ;; esac
+  [ "${#sid}" -le 64 ] || sid=-
+  case "$now" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$COMPTE_RELEVE_ECART_S" != 0 ] && [ -f "$f" ]; then
+    while IFS=$'\t' read -r s t; do [ "$s" != "$sid" ] || last="$t"; done <"$f"
+    case "$last" in ''|*[!0-9]*) ;; *) [ "$now" -lt "$last" ] || [ $((now - last)) -ge "$COMPTE_RELEVE_ECART_S" ] || return 0 ;; esac
+  fi
+  # relevé complet : la minute est prise d'abord (un relevé qui échoue ne se relance pas à chaque rafraîchissement), restes balayés
+  { awk -F'\t' -v s="$sid" -v n="$now" -v o="$COMPTE_RELEVE_OUBLI_S" '$1 != s && $2 ~ /^[0-9]+$/ && n - $2 < o' "$f" 2>/dev/null
+    printf '%s\t%s\n' "$sid" "$now"; } | fichier_remplace "$f" || :
+  compte_restes_balayer
+  compte_relever_valeurs "$v" "$now"
 }
 compte_usage() { awk -F'\t' -v l="$1" '$1 == l {r = $0} END {if (r) print r}' "$(comptes_usage_file)" 2>/dev/null || true; }
 # compte_releve_bloque <étiquette> → la reprise d'une fenêtre relevée pleine (≥ 100 %) et encore à venir (la plus tardive), rien sinon
@@ -557,10 +608,10 @@ compte_badge_remettre() {
 
 # compte_limite_lue <message> → rc 0 si le message parle d'une limite d'usage (« You've hit your … limit », « usage limit »,
 # « resets … ») ; un 429 passager (« Rate limited. Please try again ») n'épuise aucun compte
-compte_limite_lue() { printf '%s' "$1" | grep -Eqi "hit your|usage limit|limit reached|resets? "; }
+compte_limite_lue() { grep -Eqi "hit your|usage limit|limit reached|resets? " <<<"$1"; }
 # compte_fenetre_lue <message> → 7d (limite hebdomadaire, ou reprise datée d'un jour), sinon 5h
 compte_fenetre_lue() {
-  if printf '%s' "$1" | grep -Eqi 'week|7-day|resets? +(at +)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.? +[0-9]'; then echo 7d; else echo 5h; fi
+  if grep -Eqi 'week|7-day|resets? +(at +)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.? +[0-9]' <<<"$1"; then echo 7d; else echo 5h; fi
 }
 # compte_reprise_lue <message> → epoch de reprise. Forme mesurée (2026-10-11) : « You've hit your weekly limit · resets Oct 13 at
 # 9am (Europe/Brussels) » ; la limite des 5 h n'a que l'heure (déjà passée → échue dans une minute). Heure illisible ou hors des
@@ -705,11 +756,11 @@ compte_attente_inscrire() { # <échéance>
 }
 # compte_attente_vivante <fichier> : rc 0 si l'onglet inscrit attend encore — pid vivant, même heure de démarrage, commande lab
 compte_attente_vivante() {
-  local line pid start
+  local line pid start cmdline
   [ -f "$1" ] || return 1
   line="$(head -n 1 "$1")"; pid="${line%%$'\t'*}"; start="$(cut -f 6 <<<"$line")"
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ "$(basename "$1")" = "$pid" ] && [ -n "$start" ] && pid_alive "$pid" || return 1
-  [ "$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" = "$start" ] && ps -o command= -p "$pid" 2>/dev/null | grep -Eq '(^|/| )lab( |$)'
+  [ "$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" = "$start" ] && cmdline="$(ps -o command= -p "$pid" 2>/dev/null)" && grep -Eq '(^|/| )lab( |$)' <<<"$cmdline"
 }
 compte_attente_effacer() { rm -f "$(comptes_attente_dir)/$$"; }
 # compte_attente_lignes → les lignes des onglets qui attendent encore : pid vivant dont la commande est un lab lancé pour ce couloir
@@ -779,7 +830,7 @@ compte_agent_enfant() {
   local p="$1" seen=' '
   while p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" && [[ "$p" =~ ^[1-9][0-9]*$ ]] && [ "$p" != 1 ]; do
     case "$seen" in *" $p "*) return 1 ;; esac; seen="$seen$p "
-    printf '%s\n' "$2" | grep -qx "$p" || return 1
+    grep -qx "$p" <<<"$2" || return 1
     case "$(basename -- "$(ps -o comm= -p "$p" 2>/dev/null)")" in claude|claude-code) return 0 ;; esac
   done
   return 1
@@ -798,7 +849,7 @@ compte_relancer_ici() {
   # lancement est relue toutes les 0,5 s, COMPTE_ONGLET_ESSAIS fois au plus, tant qu'elle vit (lot 06 de comptes-complets)
   local essais="${COMPTE_ONGLET_ESSAIS:-1}"
   case "$essais" in ''|*[!0-9]*) essais=1 ;; esac
-  until pids="$(cmux_surface_pids "$ws" "$sf")" && printf '%s\n' "$pids" | grep -qx "$pid"; do
+  until pids="$(cmux_surface_pids "$ws" "$sf")" && grep -qx "$pid" <<<"$pids"; do
     essais=$((essais - 1))
     if [ "$essais" -le 0 ] || ! kill -0 "$pid" 2>/dev/null; then kv RELAUNCH "none (not in its tab)"; return 1; fi
     sleep 0.5
@@ -884,7 +935,7 @@ compte_badge_tester() {
   fi
   compte_badge_noter "$l" alive || true; kv BADGE_CHECK alive
 }
-compte_401_lu() { printf '%s' "$1" | grep -Eqi 'API Error: 401|authentication_error|invalid bearer|OAuth token (has )?(expired|revoked)|token missing'; }
+compte_401_lu() { grep -Eqi 'API Error: 401|authentication_error|invalid bearer|OAuth token (has )?(expired|revoked)|token missing' <<<"$1"; }
 
 # compte_session_etat <dossier de travail> → « <état> TAB <conversation> » de la dernière conversation Claude de ce dossier
 # (~/.claude/projects/<dossier, tout caractère non alphanumérique changé en ->/<conversation>.jsonl). État : stopped (dernière réponse =
@@ -923,7 +974,7 @@ compte_sessions_arretees() {
 }
 
 # compte_reprendre [--dry-run] : relance, espacés de LAB_RESUME_GAP s (25), les onglets en attente (USR1), les sessions de couloir
-# arrêtées (lab account switch) et celle de main (son onglet « main », lot 06), après un vrai appel qui vérifie chaque compte libre.
+# arrêtées (lab account switch) et celle du checkout principal (l'onglet de son terminal), après un vrai appel qui vérifie chaque compte libre.
 # Sessions illisibles ou trop récentes : listées seulement. Rien à relancer → aucun appel. Aucun processus en fond.
 compte_reprendre() {
   local dry=0 gap="${LAB_RESUME_GAP:-25}" waits stops l ok=0 n=0 pid p c wt st sid rc
@@ -933,7 +984,7 @@ compte_reprendre() {
   waits="$(compte_attente_lignes)"; stops="$(compte_sessions_arretees)"
   while IFS=$'\t' read -r c p wt st sid; do
     [ -n "$c" ] || continue
-    if [ "$c" = - ]; then   # main arrêté : relancé plus bas dans son onglet « main » (lot 06)
+    if [ "$c" = - ]; then   # session du checkout principal arrêtée : relancée plus bas dans l'onglet de son terminal
       case "$st" in
         stopped) ;;
         recent) kv LISTED "$p (main, moved < ${COMPTE_IMMOBILE_S} s)" ;;
@@ -978,14 +1029,15 @@ compte_reprendre() {
     else kv SKIPPED "$p/$c (switch failed)"; log "Cause: $(comptes_attente_dir).switch"; fi
   done <<<"$stops"
 }
-# compte_reprendre_main <projet> <checkout principal> <conversation> : la session de main arrêtée est relancée dans l'onglet « main »
-# du projet (lab account run, options relues) si cmux l'y montre ; sinon, sa commande à taper
+# compte_reprendre_main <projet> <checkout principal> <conversation> : la session du checkout principal arrêtée est relancée dans
+# l'onglet dont le terminal est celui de son processus, quel que soit son nom (lot 01 d'onglet-tower : plus d'onglet « main »), par lab
+# account run, options relues ; onglet introuvable ou cmux qui n'y montre pas le processus : sa commande à taper
 compte_reprendre_main() {
   local p="$1" root="$2" sid="$3" tab pid out
-  if has_cmux && tab="$(onboard_main_tab "$p")" && [ -n "$tab" ]; then
-    pid="$(lock_field "$(lock_file "$root")" pid || true)"
+  pid="$(lock_field "$(lock_file "$root")" pid || true)"
+  if has_cmux && tab="$(cmux_pid_tab "$pid")"; then
     if out="$(compte_relancer_ici "${tab%%$'\t'*}" "${tab#*$'\t'}" "$pid" "$sid" "$root")"; then kv RESUMED "$p/main (stopped)"; return 0; fi
     out="${out#RELAUNCH=none (}"; kv SKIPPED "$p/main (${out%)})"
-  else kv SKIPPED "$p/main (main tab not found)"; fi
+  else kv SKIPPED "$p/main (tab not found)"; fi
   log "Resume it by hand:"; log "cd $(shell_quote "$root") && lab account run --resume $sid"
 }

@@ -59,8 +59,8 @@ o.join("\n")'
 # nom de la position mémorisée la plus proche (bord droit à position − 2 pt du bord de l'écran, à 12 pt près) ; sinon, écartée.
 menubar_probe() {
   local raw pos
-  raw="$(osascript -l JavaScript -e "$MENUBAR_PROBE_JS" 2>/dev/null)" || true
-  if printf '%s\n' "$raw" | awk -F '\t' '$1 != "SCREEN" && $4 == "" { f = 1 } END { exit !f }'; then
+  raw="$(exec osascript -l JavaScript -e "$MENUBAR_PROBE_JS" 2>/dev/null)" || true
+  if awk -F '\t' '$1 != "SCREEN" && $4 == "" { f = 1 } END { exit !f }' <<<"$raw"; then
     pos="$(menubar_positions_cached)"
     printf '%s\n' "$raw" | awk -F '\t' -v OFS='\t' -v posf="$pos" '
       BEGIN { while ((getline l < posf) > 0) { split(l, F, "\t"); np++; PN[np] = F[2]; PP[np] = F[3] + 0 } }
@@ -82,19 +82,22 @@ menubar_positions() {
       n = substr(l, 1, j - 1); v = substr(l, j + 4); sub(/;[ \t]*$/, "", v); printf "%s\t%s\t%s\n", d, n, v }'
 }
 # menubar_positions_cached → le fichier des positions, relu si plus vieux que MENUBAR_POS_TTL minutes (ou forcé par « fresh »)
-menubar_positions_cached() {
-  local f; f="$(menubar_dir)/positions"; mkdir -p "$(menubar_dir)"
-  if [ "${1:-}" = fresh ] || [ -z "$(find "$f" -mmin "-$MENUBAR_POS_TTL" 2>/dev/null)" ]; then
-    if menubar_positions >"$f.$$" 2>/dev/null; then mv "$f.$$" "$f"; else rm -f "$f.$$"; fi
+menubar_positions_cached() { menubar_positions_cached_set "$@"; printf '%s\n' "$MENUBAR_POSF"; }
+# menubar_positions_cached_set [fresh] : MENUBAR_POSF, le même fichier, sans sous-shell (le séparateur, chaque minute)
+menubar_positions_cached_set() {
+  local d="$LAB_STATE/widget/bar"; MENUBAR_POSF="$d/positions"; [ -d "$d" ] || mkdir -p "$d"
+  if [ "${1:-}" = fresh ] || [ -z "$(exec find "$MENUBAR_POSF" -mmin "-$MENUBAR_POS_TTL" 2>/dev/null)" ]; then
+    if menubar_positions >"$MENUBAR_POSF.$$" 2>/dev/null; then mv "$MENUBAR_POSF.$$" "$MENUBAR_POSF"; else rm -f "$MENUBAR_POSF.$$"; fi
   fi
-  printf '%s\n' "$f"
 }
 menubar_order_file() { printf '%s/order\n' "$(menubar_dir)"; }
 
-# menubar_rival → le nom du rangeur concurrent qui tourne (Bartender, Ice, Hidden Bar), rien sinon
+# menubar_rival → le nom du rangeur concurrent qui tourne (Bartender, Ice, Hidden Bar), rien sinon ; le premier de MENUBAR_RIVALS
+# s'il en tourne plusieurs. Un seul pgrep pour tous (motif étendu, nom entier), au lieu d'un par nom : lot 04 de charge-processeur
 menubar_rival() {
-  local n IFS='|'
-  for n in $MENUBAR_RIVALS; do pgrep -x "$n" >/dev/null 2>&1 && { printf '%s\n' "$n"; return 0; }; done
+  local out n IFS='|'
+  out="$(exec pgrep -lx "$MENUBAR_RIVALS" 2>/dev/null)" || return 0
+  for n in $MENUBAR_RIVALS; do case $'\n'"$out"$'\n' in *[0-9]" $n"$'\n'*) printf '%s\n' "$n"; return 0 ;; esac; done
   return 0
 }
 menubar_refuse_rival() {
@@ -109,6 +112,9 @@ menubar_running() {
 }
 # menubar_impact_key <domaine> → clé de la table des textes : ce qu'implique le replacement de ses icônes
 menubar_impact_key() {
+  # lot 02 du couloir app-treelab : toute app de terminal posée (cmux, le fork) est exclue comme cmux, jamais quittée ni relancée
+  local nl=$'\n'; terminal_found_set
+  case "$nl$TERMINAL_FOUND_IDS$nl" in *"$nl$1$nl"*) echo imp_excluded; return ;; esac
   case "$1" in
     com.apple.controlcenter|com.apple.systemuiserver) echo imp_cc ;;
     com.ameba.SwiftBar) echo imp_swiftbar ;;
@@ -174,7 +180,7 @@ menubar_moved() {
 }
 menubar_order() {
   local action="${1:-show}" f pos dir tmp d moved n relaunch=0 res written="" relaunched="" planned="" skipped="" name target line max
-  dir="$(menubar_dir)"; f="$(menubar_order_file)"; mkdir -p "$dir"
+  dir="$(menubar_dir)"; f="$(menubar_order_file)"; mkdir -p "$dir"; terminal_found_set   # une fois : menubar_impact_key la relit
   case "$action" in
     save)
       [ "$#" -eq 1 ] || usage; menubar_refuse_rival ORDER
@@ -438,47 +444,54 @@ menubar_remove() {
 }
 
 # menubar_sep_open → secondes restantes du dépliage (0 : replié ; l'état périmé est oublié)
-menubar_sep_open() {
-  local f now t left=0; f="$(menubar_sep_state)"; now="${LAB_NOW_EPOCH:-$(date +%s)}"
-  if [ -f "$f" ]; then t="$(awk '{ print $2 + 0 }' "$f")"; left=$(( MENUBAR_SEP_OPEN_S - (now - t) )); [ "$left" -gt 0 ] || { rm -f "$f"; left=0; }; fi
-  printf '%s\n' "$left"
+menubar_sep_open() { menubar_sep_open_set; printf '%s\n' "$MENUBAR_LEFT"; }
+# menubar_sep_open_set [maintenant] : MENUBAR_LEFT, sans sous-shell ; l'état « expanded <epoch> » lu par read, l'heure prise une fois
+menubar_sep_open_set() {
+  local f="$LAB_STATE/widget/bar/sep" now="${1:-}" w t=""
+  MENUBAR_LEFT=0; [ -f "$f" ] || return 0
+  [ -n "$now" ] || now="${LAB_NOW_EPOCH:-$(exec date +%s)}"
+  read -r w t _ <"$f" || :
+  case "$t" in ''|*[!0-9]*) t=0 ;; esac
+  MENUBAR_LEFT=$(( MENUBAR_SEP_OPEN_S - (now - 10#$t) )); [ "$MENUBAR_LEFT" -gt 0 ] || { rm -f "$f"; MENUBAR_LEFT=0; }
 }
 # menubar_render_hide : l'écarteur pour SwiftBar — une image transparente, MENUBAR_SEP_WIDE pt replié, 1 pt déplié ; rien d'autre
 menubar_render_hide() {
   local w="$MENUBAR_SEP_WIDE"
   . "$LAB_ROOT/lib/sysmon.sh"
-  [ "$(menubar_sep_open)" -eq 0 ] || w=1
+  menubar_sep_open_set; [ "$MENUBAR_LEFT" -eq 0 ] || w=1
   LC_ALL=C awk -v w="$w" "$SYSMON_PDF_AWK"' BEGIN { pdf_init(); pdf_begin(w, 22); print "| image=" pdf_end() " ansi=false" }' </dev/null
 }
 
 # menubar_render_sep : le chevron pour SwiftBar (toujours dessiné, à droite de l'écarteur), puis son menu. Toujours rc 0.
 menubar_render_sep() {
-  local dir exp=0 left now probe pos order lab plugdir hist n week=0 rival istat_inst=0 lang menu
+  local dir exp=0 left now probe pos order lab plugdir hist n week=0 rival istat_inst=0 lang menu f
   . "$LAB_ROOT/lib/sysmon.sh"
-  dir="$(menubar_dir)"; mkdir -p "$dir"; now="${LAB_NOW_EPOCH:-$(date +%s)}"
-  left="$(menubar_sep_open)"; [ "$left" -eq 0 ] || exp=1
+  # chemins et lectures sans sous-shell, un processus par programme (lot 04 de charge-processeur) : même menu
+  dir="$LAB_STATE/widget/bar"; [ -d "$dir" ] || mkdir -p "$dir"; now="${LAB_NOW_EPOCH:-$(exec date +%s)}"
+  menubar_sep_open_set "$now"; left="$MENUBAR_LEFT"; [ "$left" -eq 0 ] || exp=1
   probe="$dir/probe"; menubar_probe >"$probe.$$"; mv "$probe.$$" "$probe"
-  pos="$(menubar_positions_cached)"; order="$(menubar_order_file)"
-  plugdir="$(widget_plugin_ctx_get dir)"
-  lab="$(widget_lab)"; [ ! -x "${SWIFTBAR_PLUGIN_PATH:-}" ] || lab="$SWIFTBAR_PLUGIN_PATH"
+  menubar_positions_cached_set; pos="$MENUBAR_POSF"; order="$dir/order"
+  widget_plugin_dir_set; plugdir="$WIDGET_PLUGIN_DIR"
+  if [ -x "${SWIFTBAR_PLUGIN_PATH:-}" ]; then lab="$SWIFTBAR_PLUGIN_PATH"; else lab="$(widget_lab)"; fi
   # apps rangées : compte gardé une fois par heure sur 7 jours, pour dire ce qui s'accumule
-  n="$(awk -F '\t' -v sep="/$MENUBAR_HIDE_PLUGIN" 'NR > 1 && NF == 4 { X[NR] = $1; W[NR] = $2; N[NR] = $4; if (substr($4, length($4) - length(sep) + 1) == sep) s = NR }
+  n="$(exec awk -F '\t' -v sep="/$MENUBAR_HIDE_PLUGIN" 'NR > 1 && NF == 4 { X[NR] = $1; W[NR] = $2; N[NR] = $4; if (substr($4, length($4) - length(sep) + 1) == sep) s = NR }
     END { c = 0; if (s) for (i in X) if (i != s && X[i] + W[i] <= X[s] + 1) c++; print c }' "$probe")"
   hist="$dir/history"
-  if [ -z "$(awk -v t="$now" 'END { if ($1 != "" && t - $1 < 3600) print "fresh" }' "$hist" 2>/dev/null)" ]; then
+  if [ -z "$(exec awk -v t="$now" 'END { if ($1 != "" && t - $1 < 3600) print "fresh" }' "$hist" 2>/dev/null)" ]; then
     printf '%s %s\n' "$now" "$n" >>"$hist"
     awk -v t="$now" 't - $1 <= 604800' "$hist" >"$hist.$$" 2>/dev/null && mv "$hist.$$" "$hist"
   fi
-  week="$(awk -v n="$n" 'NR == 1 { print n - $2 }' "$hist" 2>/dev/null)"; week="${week:-0}"
+  week="$(exec awk -v n="$n" 'NR == 1 { print n - $2 }' "$hist" 2>/dev/null)"; week="${week:-0}"
   rival="$(menubar_rival)"
-  [ -z "$(menubar_istat_plists)" ] || istat_inst=1
-  lang="$(widget_lang 2>/dev/null)"; menu="$(widget_menu_appearance)"
-  LC_ALL=C awk -F '\t' -v lang="$lang" -v menu="$menu" -v bar="$(widget_bar_appearance)" -v lab="$lab" -v plugdir="$plugdir" \
+  for f in "$HOME/Library/LaunchAgents"/com.bjango.istatmenus*.plist; do [ ! -e "$f" ] || istat_inst=1; break; done   # comme menubar_istat_plists
+  widget_lang_set 2>/dev/null; lang="$WIDGET_LANG"; widget_menu_set; menu="$WIDGET_MENU"
+  terminal_found_set   # apps de terminal posées (le fork de cmux) : identifiants exclus comme cmux, lot 02 d'app-treelab
+  LC_ALL=C awk -F '\t' -v lang="$lang" -v menu="$menu" -v bar="${LAB_WIDGET_BAR:-dark}" -v lab="$lab" -v plugdir="$plugdir" \
     -v sepname="/$MENUBAR_SEP_PLUGIN" -v hidename="/$MENUBAR_HIDE_PLUGIN" -v wide="$MENUBAR_SEP_WIDE" -v opened="$exp" -v left="$left" -v glyph="$MENUBAR_SEP_GLYPH" \
     -v order="$order" -v posf="$pos" -v saved="$([ -f "$order" ] && echo 1 || echo 0)" -v week="$week" -v rival="$rival" \
     -v spacing="$([ -f "$dir/spacing" ] && echo 1 || echo 0)" -v dupesf="$dir/dupes" -v dupes_done="$([ -f "$dir/dupes" ] && echo 1 || echo 0)" \
     -v istat_done="$([ -f "$dir/istat" ] && echo 1 || echo 0)" -v istat_inst="$istat_inst" -v mods=" $MENUBAR_CC_MODULES " -v keep=" $MENUBAR_CC_KEEP " \
-    -v ccdom="$MENUBAR_CC" -v openS="$MENUBAR_SEP_OPEN_S" -v SPC="$MENUBAR_SPACING" \
+    -v ccdom="$MENUBAR_CC" -v openS="$MENUBAR_SEP_OPEN_S" -v SPC="$MENUBAR_SPACING" -v termids=" ${TERMINAL_FOUND_IDS//$'\n'/ } " \
     "$SYSMON_PDF_AWK$MENUBAR_TEXT_AWK$MENUBAR_SAME_AWK$MENUBAR_RENDER_AWK" "$probe"
 }
 
@@ -738,6 +751,6 @@ END {
 }
 function impkey(dm) {
   if (dm == "com.apple.controlcenter" || dm == "com.apple.systemuiserver") return "imp_cc"; if (dm == "com.ameba.SwiftBar") return "imp_swiftbar"
-  if (dm == "com.cmuxterm.app" || dm ~ /anthropic|claude|Claude|openai|codex/) return "imp_excluded"; if (dm == "com.raycast.macos") return "imp_raycast"
+  if (dm == "com.cmuxterm.app" || index(termids, " " dm " ") || dm ~ /anthropic|claude|Claude|openai|codex/) return "imp_excluded"; if (dm == "com.raycast.macos") return "imp_raycast"
   if (dm == "com.google.drivefs") return "imp_drive"; if (dm == "ru.keepcoder.Telegram") return "imp_telegram"; return "imp_app" }
 '

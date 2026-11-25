@@ -74,7 +74,7 @@ close_collect_branches() { # branche<TAB>révision<TAB>PR ou -<TAB>état[<TAB>#P
     case "$branch" in feat/*|fix/*|chore/*) ;; *) die "branch unreadable in $name: nothing removed" ;; esac
     valid_slug "${branch#*/}" || die "invalid branch in $name"
     case "$name" in lot-*-"${branch#*/}") ;; *) die "branch does not match $name: nothing removed" ;; esac
-    printf '%s\n' "$seen" | grep -Fxq "$branch" && die "branch $branch announced by two batches: nothing removed"
+    grep -Fxq "$branch" <<<"$seen" && die "branch $branch announced by two batches: nothing removed"
     seen="$seen
 $branch"
     if [ "$branch" = "$CLOSE_BRANCH" ]; then
@@ -375,7 +375,7 @@ close_bilan_offside() {
   files="$(close_bilan_files kept)"
   others="$(printf '%s\n' "$files" | awk -v r="$rel" 'NF && $0 != r' | sync_join)"
   [ -z "$others" ] || { printf '%s\n' "$others"; return 1; }
-  [ -n "$rel" ] && printf '%s\n' "$files" | grep -Fxq -- "$rel" || return 0
+  [ -n "$rel" ] && grep -Fxq -- "$rel" <<<"$files" || return 0
   git -C "$WT" cat-file -e "$CLOSE_PR_HEAD:$rel" 2>/dev/null \
     && [ "$(git -C "$WT" show "$CLOSE_PR_HEAD:$rel" | recette_filter strip)" = "$(git -C "$WT" show "$CLOSE_HEAD:$rel" | recette_filter strip)" ] \
     || { printf '%s (outside its lane acceptance section)\n' "$rel"; return 1; }
@@ -397,7 +397,8 @@ close_bilan_aside() { close_bilan_files aside; }
 close_bilan_wanted() {
   [ "$CLOSE_PR_STATE" = MERGED ] && [ "$CLOSE_PR_HEAD" != "$CLOSE_HEAD" ] || return 1
   case "$CLOSE_LOT" in "$WT"/*) ;; *) return 1 ;; esac
-  git -C "$WT" -c core.quotePath=false diff --name-only "$CLOSE_PR_HEAD" "$CLOSE_HEAD" | grep -Fxq -- "${CLOSE_LOT#"$WT"/}"
+  local changed
+  changed="$(git -C "$WT" -c core.quotePath=false diff --name-only "$CLOSE_PR_HEAD" "$CLOSE_HEAD")" && grep -Fxq -- "${CLOSE_LOT#"$WT"/}" <<<"$changed"
 }
 close_verify_delivery() { # [commit qui porte la fiche livrée, défaut : la fusion du lot — la fusion de la PR de bilan sinon]
   local proof="${1:-$CLOSE_MERGED}"
@@ -499,9 +500,11 @@ close_bilan_deliver() {
   printf '%s' "$result" | jq -e '.merged == true' >/dev/null || die "summary PR not merged: lane kept"
   CLOSE_BILAN_MERGED="$(printf '%s' "$result" | jq -er '.sha')" || die "summary merge proof unreadable: lane kept"
 }
-# ---------- suite complète à la remise en recette (lot 02 de ci-sobre) ----------
+# ---------- jobs de la suite complète (lot 02 de ci-sobre) ----------
+# Lot 02 de restes-cloud : lab close ne pose plus l'étiquette full-suite et n'attend plus la suite complète (la nuit et le tag la
+# jouent) ; seule la CI de la PR décide. Reste la lecture des jobs gardés, pour la mesure HEAVY_PR_JOBS (lib/ci_measure.sh).
 # close_full_suite_jobs <révision> : début du nom (avant toute expression de matrice) de chaque job que les workflows de la révision
-# ne jouent qu'avec l'étiquette full-suite — contains(…labels…, 'full-suite') non nié dans son if: ; vide : rien à exiger.
+# ne jouent qu'avec l'étiquette full-suite — contains(…labels…, 'full-suite') non nié dans son if: ; vide : aucun.
 # rc 1 si un workflow cite l'étiquette sans pouvoir être lu (ruby absent, YAML invalide).
 close_full_suite_jobs() {
   local files text
@@ -523,59 +526,13 @@ close_full_suite_jobs() {
       end
     end' "$WT" "$1" 2>/dev/null || { warn "workflow citing full-suite unreadable at ${1:0:12}"; return 1; }
 }
-# close_full_suite_read <révision> <noms> → green | red | pending : derniers passages (check-runs) de ces jobs sur la révision exacte ;
-# un passage de matrice sauté (nom à expression) ne compte pas ; vert = chaque job passé au moins une fois, aucun en cours ni en échec.
-# Un passage annulé ne compte pas quand le même job (nom exact) a réussi ou tourne encore sur la révision : deux CI parties à la même
-# seconde à la pose de full-suite, la première annulée par la concurrence (cas réel : FULL_SUITE=red sur un job pourtant vert).
-close_full_suite_read() {
-  local runs
-  runs="$(with_timeout 30 gh api "repos/$CLOSE_REPO/commits/$1/check-runs?per_page=100" --paginate \
-    --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv' 2>/dev/null)" || { echo pending; return 0; }
-  # shellcheck disable=SC2016 # ${{ littéral : le nom d'un passage de matrice sauté
-  printf '%s\n' "$runs" | JOBS="$2" awk -F '\t' 'BEGIN { n = split(ENVIRON["JOBS"], p, "\n") }
-    $1 != "" && index($1, "${{") == 0 { for (i = 1; i <= n; i++) if (p[i] != "" && index($1, p[i]) == 1) {
-      if ($2 != "completed") { pend = 1; live[$1] = 1 } else if ($3 == "success") { ok[i]++; won[$1] = 1 }
-      else if ($3 == "cancelled") lost[$1] = 1; else if ($3 != "skipped" && $3 != "neutral") red = 1; break } }
-    END { for (j in lost) if (!won[j] && !live[j]) red = 1
-      if (red) { print "red"; exit } for (i = 1; i <= n; i++) if (p[i] != "" && !ok[i]) pend = 1; print (pend ? "pending" : "green") }'
-}
-# close_full_suite <révision> <attente en s> → none | unlabeled | green | red | pending : un workflow de la révision garde des jobs
-# par l'étiquette full-suite → elle est posée sur la PR quand elle manque (--dry-run, CLOSE_DRY=1 : unlabeled, rien posé), puis leurs
-# passages sur cette révision sont lus jusqu'au vert ou au rouge, au plus <attente> s. rc 1 (message dit) si gh ou le workflow refuse.
-close_full_suite() {
-  local jobs labels state deadline=$((SECONDS + $2))
-  jobs="$(close_full_suite_jobs "$1")" || return 1
-  [ -n "$jobs" ] || { echo none; return 0; }
-  labels="$(with_timeout 20 gh api "repos/$CLOSE_REPO/issues/$CLOSE_NUM/labels" --jq '.[].name' 2>/dev/null)" \
-    || { warn "labels of PR #$CLOSE_NUM unreadable by gh"; return 1; }
-  if ! printf '%s\n' "$labels" | grep -qx 'full-suite'; then
-    [ "${CLOSE_DRY:-0}" != 1 ] || { echo unlabeled; return 0; }
-    with_timeout 20 gh api --method POST "repos/$CLOSE_REPO/issues/$CLOSE_NUM/labels" -f 'labels[]=full-suite' >/dev/null 2>&1 \
-      || { warn "label full-suite refused by gh on PR #$CLOSE_NUM (permissions?)"; return 1; }
-    printf 'lab: label full-suite added to PR #%s: the full suite starts on %s\n' "$CLOSE_NUM" "${1:0:12}" >&2
-  fi
-  while :; do
-    state="$(close_full_suite_read "$1" "$jobs")"
-    # revue du lot 02 : un rouge de la PR (rapide…) saute les parts sous un nom à expression, jamais vertes — rouge tout de suite ;
-    # les contrôles de la PR seulement : un passage de nuit lancé à la main sur la même révision n'en est pas (écran réel du lot 02)
-    [ "$state" != pending ] || [ "$(pr_checks_now "$WT" "$CLOSE_NUM" "$1" "${CLOSE_BRANCH:-}" "${CLOSE_BASE:-}" 2>/dev/null)" != red ] || state=red
-    if [ "$state" != pending ] || [ "$SECONDS" -ge "$deadline" ]; then echo "$state"; return 0; fi
-    sleep "${LAB_CHECKS_POLL:-10}"
-  done
-}
 close_deliver() { # déjà validé et confirmé : aucun auto-merge différé
-  local head="$CLOSE_HEAD" base="$CLOSE_BASE" records="$CLOSE_RECORDS" document checks result full
+  local head="$CLOSE_HEAD" base="$CLOSE_BASE" records="$CLOSE_RECORDS" document checks result
   document="$(git hash-object "$CLOSE_LOT")"
   delivery_guard
   if [ "$CLOSE_PR_STATE" = OPEN ]; then
     pr_make_ready "$WT" "$CLOSE_NUM"
-    # lot 02 de ci-sobre : la suite complète, une fois par couloir, verte sur cette révision exacte avant toute fusion
-    full="$(close_full_suite "$head" "${LAB_CHECKS_TIMEOUT:-900}")" || die "full suite not checked on PR #$CLOSE_NUM: lane kept; run lab close $P_NAME $SLUG again"
-    [ "$full" = none ] || kv FULL_SUITE "$full"
-    case "$full" in
-      red) die "full suite red on ${head:0:12}: fix it; lane kept" ;;
-      pending) die "full suite pending on ${head:0:12}: no merge; run lab close $P_NAME $SLUG again once green" ;;
-    esac
+    # lot 02 de restes-cloud : seule la CI de la PR décide ; la suite complète tourne la nuit et au tag, jamais attendue ici
     checks="$(pr_checks_wait "$WT" "$CLOSE_NUM" "$head" "$CLOSE_BRANCH" "$base")"; kv CHECKS "$checks"
     if [ "$checks" = none ] && pr_ci_none "$WT" "$head" "$CLOSE_BRANCH" "$base" 2>/dev/null; then
       kv CI "none (no pull request workflow)"
@@ -705,7 +662,7 @@ close_words_notify() { deploy_tower_project || return 0; close_alone_notify "$1"
 close_caller_tab() {
   [ -n "${CLOSE_CALLER_TAB:-}" ] || return 0
   log "the calling session's tab (${CLOSE_CALLER_TAB#* }) closes with it: the conversation stays resumable"
-  close_top_load
+  close_top_load; cmux_spare_tab "${CLOSE_CALLER_TAB%% *}" "${CLOSE_CALLER_TAB#* }" "$P_ROOT"
   top_cmux close-surface --workspace "${CLOSE_CALLER_TAB%% *}" --surface "${CLOSE_CALLER_TAB#* }" --force >/dev/null 2>&1 \
     || warn "the calling session's tab was not closed by cmux: exit that session yourself"
   CLOSE_CALLER_TAB=""
@@ -720,6 +677,7 @@ close_tab() { # <workspace> <surface> <nom> : ferme l'onglet du couloir par sa r
   case "$(cmux_tab_field "$tab" way)" in
     reference|name)
       cmx clear-status "lab-lane-$SLUG" --workspace "$ws" >/dev/null 2>&1 || true
+      cmux_spare_tab "$ws" "$surface" "$P_ROOT"
       if ! cmux_close_named_surface "$ws" "$surface" "$3"; then warn "tab kept: cmux did not close $surface ($3); close it yourself"
       elif [ "$(cmux_tab_field "$tab" way)" = name ]; then log "tab $3 found by its name ($2 → $surface) and closed"; fi ;;
     ambiguous)
@@ -740,7 +698,8 @@ close_tab() { # <workspace> <surface> <nom> : ferme l'onglet du couloir par sa r
 # peut avoir été réattribué.
 # chargement à la demande, non suivi par shellcheck : il confondrait les tableaux locaux de lib/top.sh (pr) avec ceux de cmd_close
 # shellcheck source=/dev/null
-close_top_load() { declare -F top_stop >/dev/null || { . "$LAB_ROOT/lib/top.sh"; . "$LAB_ROOT/lib/top_cut.sh"; }; }
+# les apps de terminal posées (le fork de cmux, lot 02 d'app-treelab) y sont la famille cmux, jamais arrêtées : top_terminals
+close_top_load() { declare -F top_stop >/dev/null || { . "$LAB_ROOT/lib/top.sh"; . "$LAB_ROOT/lib/top_cut.sh"; }; top_terminals; }
 # close_lane_procs → « genre<TAB>pid<TAB>nom<TAB>âge<TAB>session[<TAB>lien] » par processus du dossier $WT ; genre : agent (session du
 # couloir), caller (la session appelante, dans le dossier), sub (agent lancé par une session), proc (hors agent) ; session : la plus
 # proche session parmi ses parents, sinon celle de son terminal (une copie du shell de l'onglet n'est pas l'enfant de l'agent mais
@@ -870,6 +829,7 @@ close_procs_stop() {
   while IFS=$'\t' read -r g pid nm age sv sw o; do
     case "$g" in
       tab)
+        cmux_spare_tab "$sw" "$sv" "$P_ROOT"
         if out="$(top_cmux close-surface --workspace "$sw" --surface "$sv" --force 2>&1)"; then
           log "session $pid ($nm, $age): its tab is closed, the conversation stays resumable"
           [ -z "$lane_id" ] || [ "$sv" != "$lane_id" ] || CLOSE_LANE_TAB_CLOSED=1
@@ -964,20 +924,25 @@ lane_leftovers() {
 # un lsof par commande et par racine (cache LIVE_AGENTS_ROOT). rc 2 si ps ou lsof est illisible : état incertain, l'appelant ne
 # refuse jamais sur ce doute (même règle que pid_state).
 lane_live_agents_load() {
-  local root="$1" real ps_out agents self="" cwds rc=0
+  local root="$1" real agents self="" cwds rc=0 rest pids=""
   if [ "${LIVE_AGENTS_ROOT:-}" = "$root" ]; then return "${LIVE_AGENTS_RC:-0}"; fi
   LIVE_AGENTS_ROOT="$root"; LIVE_AGENTS=""; LIVE_AGENTS_RC=2
   close_top_load
   real="$(cd "$root" 2>/dev/null && pwd -P)" || real="$root"
   self="$(agent_pid_found 2>/dev/null)" || self=""
-  ps_out="$(LC_ALL=en_US.UTF-8 ps -axww -o pid=,ppid=,uid=,stat=,rss=,%cpu=,etime=,args= 2>/dev/null)" || return 2
-  [ -n "$ps_out" ] || return 2
+  # lue par awk directement : la table entière d'un Mac chargé (2 000 processus, 700 Ko) ne passe plus par une variable du shell
+  agents="$({ LC_ALL=en_US.UTF-8 ps -axww -o pid=,ppid=,uid=,stat=,rss=,%cpu=,etime=,args= 2>/dev/null || printf '\034\n'; } | LC_ALL=C awk -v uid="$EUID" "$TOP_AWK_LIB"'
+    $0 == "\034" { bad = 1 }
+    NF { n++ }
+    (index($0, "claude") || index($0, "codex")) && ps_parse($0) && P_UID == uid { a = agent_of(P_ARGS); if (a == "claude" || a == "codex") out = out P_PID "\t" a "\n" }
+    END { if (bad || !n) print "\034"; else printf "%s", out }')" || return 2
+  [ "$agents" != $'\034' ] || return 2
   command -v lsof >/dev/null 2>&1 || return 2
-  agents="$(printf '%s\n' "$ps_out" | LC_ALL=C awk -v uid="$(id -u)" "$TOP_AWK_LIB"'
-    ps_parse($0) && P_UID == uid { a = agent_of(P_ARGS); if (a == "claude" || a == "codex") print P_PID "\t" a }')"
   [ -n "$agents" ] || { LIVE_AGENTS_RC=0; return 0; }
   # lsof rend 1 dès qu'un des pid a disparu entre ps et lui : seul un échec sans aucune ligne vaut table illisible (revue du lot)
-  cwds="$(LC_ALL=en_US.UTF-8 lsof -a -d cwd -p "$(printf '%s\n' "$agents" | cut -f1 | paste -sd, -)" -Fpn 2>/dev/null)" || rc=$?
+  rest="$agents"$'\n'
+  while [ -n "$rest" ]; do pids="$pids${pids:+,}${rest%%$'\t'*}"; rest="${rest#*$'\n'}"; done
+  cwds="$(LC_ALL=en_US.UTF-8 lsof -a -d cwd -p "$pids" -Fpn 2>/dev/null)" || rc=$?
   if [ "$rc" != 0 ] && [ -z "$cwds" ]; then return 2; fi
   LIVE_AGENTS_RC=0
   LIVE_AGENTS="$(printf '%s\n' "$cwds" \
@@ -993,13 +958,19 @@ lane_live_agents_load() {
 # compté qu'avec « caller » : status et doctor ne le nomment jamais ; next, launch et open, si (lab next ne remplace que la session
 # qui tient le verrou). Hors substitution : le cache sert à toute la commande (lab status lit chaque couloir).
 lane_unlocked_live() {
-  local wt="$1" with="${2:-}" root lane row; UNLOCKED_LIVE=""
-  case "$(lock_state "$wt")" in free|dead:*) ;; *) return 1 ;; esac
-  root="$(dirname "$(dirname "$wt")")"; lane="$(basename "$wt")"
+  local wt="$1" with="${2:-}" root lane rest row pid agent l self; UNLOCKED_LIVE=""
+  if [ "${3:-}" = locked-checked ]; then :   # état du verrou déjà lu par l'appelant (describe_wt)
+  else lock_state_set "$wt"; case "$LOCK_STATE" in free|dead:*) ;; *) return 1 ;; esac; fi
+  root="${wt%/*}"; root="${root%/*}"; lane="${wt##*/}"
   lane_live_agents_load "$root" || return 2
-  row="$(printf '%s\n' "$LIVE_AGENTS" | awk -F '\t' -v l="$lane" -v w="$with" '$3 == l && ($4 == 0 || w == "caller") { print $1 ":" $2; exit }')"
-  [ -n "$row" ] || return 1
-  UNLOCKED_LIVE="$row"
+  rest="$LIVE_AGENTS"
+  while [ -n "$rest" ]; do
+    row="${rest%%$'\n'*}"
+    case "$rest" in *$'\n'*) rest="${rest#*$'\n'}" ;; *) rest='' ;; esac
+    IFS=$'\t' read -r pid agent l self <<<"$row" || true
+    if [ "$l" = "$lane" ] && { [ "$self" = 0 ] || [ "$with" = caller ]; }; then UNLOCKED_LIVE="$pid:$agent"; return 0; fi
+  done
+  return 1
 }
 # unlocked_live_refuse <worktree> : refus des commandes qui ouvrent une session (next, launch, open) — aucune seconde session
 unlocked_live_refuse() {
@@ -1021,7 +992,7 @@ close_lane_branches() { # branche courante puis celles annoncées par les fiches
     [ -f "$file" ] || file="$(lots_dir "$(docs_dir "$WT")")/$name.md"
     [ -f "$file" ] || continue
     branch="$(close_branch_of "$file")"; [ -n "$branch" ] || continue
-    printf '%s\n' "$seen" | grep -Fxq "$branch" && continue
+    grep -Fxq "$branch" <<<"$seen" && continue
     has_local_branch "$P_ROOT" "$branch" || continue
     printf '%s\n' "$branch"; seen="$seen
 $branch"
@@ -1102,7 +1073,7 @@ close_abandon() { # <confirmation> <posée=0|1>
   services_close "$WT"   # le crochet du projet voit encore son dossier (lot 01 de services-couloir)
   close_procs_stop "$ws" "$surface"
   git -C "$P_ROOT" worktree remove --force "$WT" || die "branches removed but folder kept: git -C $WT switch <branch> is no longer possible, remove the folder with git -C $P_ROOT worktree remove --force $WT"
-  agreement_clear "$SLUG"; rm -f "$(night_agreed_file)"
+  agreement_clear "$SLUG"; rm -f "$(night_agreed_file)" "$(close_retire_file)"
   codex_trust_remove "$WT" || die "lane removed, Codex entry to check"
   close_tab "$ws" "$surface" "$name"
   cloud_close_vm "$vm" "$SLUG" "$cws"   # après le retrait seulement : un refus plus haut garde la VM (lot 05)
@@ -1135,6 +1106,38 @@ close_recheck() {
     die "colliding migration on the fresh base: nothing merged, lane kept; run lab close $P_NAME $SLUG again after the rename"
   fi
   [ "$rc" != 2 ] || { kv MIGRATIONS not-checkable; warn "migrations check impossible ($ref unreadable): numbers not checked"; }
+}
+
+# ---------- lot 04 d'onglet-tower : un seul « oui ferme » ----------
+# --retire gardé : chaque SHA d'un lab close confirmé dont le contrôle de régression est passé (jamais un essai à blanc, ni une
+# fermeture refusée avant l'accord) est rangé hors du couloir, dans $LAB_STATE/<projet>/retire/<couloir> (700/600), puis relu par
+# chaque lab close de ce couloir, celui de la tour compris, qui le nomme (RETIRE_KEPT=) ; parti avec le couloir. Un SHA devenu
+# illisible est sauté, nommé.
+close_retire_file() { printf '%s/%s/retire/%s\n' "$LAB_STATE" "$P_NAME" "$SLUG"; }
+close_retire_keep() {
+  local f; f="$(close_retire_file)"
+  [ "${#CLOSE_RETIRE[@]}" -gt 0 ] || return 0
+  ( umask 077; mkdir -p "$(dirname "$f")" && { cat "$f" 2>/dev/null || true; printf '%s\n' "${CLOSE_RETIRE[@]}"; } | sort -u >"$f.tmp.$$" \
+    && mv "$f.tmp.$$" "$f" && chmod 600 "$f" ) 2>/dev/null || warn "--retire not kept for the tower ($f): give it again at the next lab close"
+}
+close_retire_load() {
+  local f r h have kept=""; f="$(close_retire_file)"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  while IFS= read -r r; do
+    [[ "$r" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || continue
+    git -C "$WT" cat-file -e "$r^{commit}" 2>/dev/null || { warn "kept --retire ${r:0:7} unreadable in $WT: skipped"; continue; }
+    have=0; for h in "${CLOSE_RETIRE[@]+"${CLOSE_RETIRE[@]}"}"; do [ "$h" != "$r" ] || have=1; done
+    [ "$have" = 1 ] || CLOSE_RETIRE+=("$r")
+    kept="${kept:+$kept }${r:0:7}"
+  done <"$f"
+  [ -z "$kept" ] || kv RETIRE_KEPT "$kept"
+}
+# close_after_set : CLOSE_AFTER, ce qui a changé après le oui de l'utilisateur (accord par les mots seulement) ; vide sinon
+close_after_set() {
+  CLOSE_AFTER=""
+  agreement_by_words "$WT" || return 0
+  local lot; lot="$(wt_lot_file "$WT")"
+  CLOSE_AFTER="$(recette_after_agreement "$WT" "$(recette_revision_of "$(recette_field "$lot" 'Révision essayée')")" "$lot")"
 }
 
 # ---------- lab close --dry-run (lot 01 de livrer-sans-friction) : tous les obstacles d'un coup, rien modifié ----------
@@ -1184,6 +1187,7 @@ close_obstacles() {
     if [ "$(recette_status "$WT" "$(wt_lot_file "$WT")")" = unversioned ] && close_recette_pending; then
       kv NOTE "acceptance: only the acceptance section is uncommitted — lab close will commit it in the batch files repository (DOCS_COMMIT) before its checks"
     else close_try acceptance close_recette_check || true; fi
+    close_after_set; [ -z "$CLOSE_AFTER" ] || kv AFTER_AGREEMENT "$CLOSE_AFTER"   # lot 04 d'onglet-tower
     close_try session close_session_guard || true
     # lot 03 de ci-sobre : nuit de la base rouge, lue ici (le cache seul s'écrit) ; l'accord n'est écrit que par lab close
     night_refresh || true
@@ -1197,6 +1201,8 @@ close_obstacles() {
         kv NOTE "night red: $(night_words_reason): lab close will record the agreement in the acceptance section"
       elif night_agreed_here "$(wt_lot_file "$WT")"; then
         kv NOTE "night red: agreement for this night already in the acceptance section"   # revue du lot 10 : relance
+      elif agreement_by_words "$WT"; then   # lot 04 d'onglet-tower : le oui de fermer couvre la nuit
+        kv NOTE "night red: $(night_order_reason): lab close will record the agreement in the acceptance section"
       else close_obstacle night "$(night_refusal_for_caller)"; fi
     fi
     close_branch_values
@@ -1231,14 +1237,6 @@ close_obstacles() {
         if [ "$CLOSE_PR_STATE" = OPEN ]; then
           checks="$(pr_checks_now "$WT" "$CLOSE_NUM" "$CLOSE_HEAD" "$CLOSE_BRANCH" "$CLOSE_BASE")"; kv CHECKS "$checks"
           [ "$checks" != red ] || close_obstacle ci "red checks: fix them; lane kept"
-          # lot 02 de ci-sobre : la suite complète lue, l'étiquette jamais posée ici
-          if full="$(close_full_suite "$CLOSE_HEAD" 0 2>/dev/null)"; then
-            [ "$full" = none ] || kv FULL_SUITE "$full"
-            case "$full" in
-              unlabeled) kv NOTE "full suite: label full-suite missing on PR #$CLOSE_NUM — lab close adds it, then waits for the full suite on ${CLOSE_HEAD:0:12}" ;;
-              red) close_obstacle full-suite "full suite red on ${CLOSE_HEAD:0:12}: fix it; lane kept" ;;
-            esac
-          else close_obstacle full-suite "full suite cannot be checked on PR #$CLOSE_NUM (gh or workflow unreadable); run lab close $P_NAME $SLUG --dry-run again"; fi
         fi
       fi
     fi
@@ -1276,7 +1274,7 @@ cmd_close() {
   split_project_slug "${pos[@]+"${pos[@]}"}"; load_project "$PROJECT"
   valid_slug "$SLUG" || die "invalid lane name"
   WT="$(worktree_path "$SLUG")"
-  if [ ! -d "$WT" ]; then kv ACTION absent; log "Lane $SLUG already gone: nothing else removed."; return; fi
+  if [ ! -d "$WT" ]; then rm -f "$(close_retire_file)"; kv ACTION absent; log "Lane $SLUG already gone: nothing else removed."; return; fi
   [ ! -L "$WT" ] && same_path "$(main_root "$WT")" "$P_ROOT" && [ "$(wt_lane "$WT")" = "$SLUG" ] || die "folder does not match the expected lane: nothing removed"
   # lot 06 d'autonomie-tours : projet doté d'une tour — la fermeture est un geste de la tour, sur le oui de l'utilisateur
   local role="" alone=0 words=0; [ "$dry" = 1 ] || role="$(tower_guard_role)"
@@ -1311,6 +1309,7 @@ cmd_close() {
     r="$(git -C "$WT" rev-parse --verify --quiet "$r^{commit}" 2>/dev/null)" || die "--retire: unknown commit in $WT; run git fetch, then give the SHA named by the refusal"
     CLOSE_RETIRE+=("$r")
   done
+  close_retire_load   # lot 04 d'onglet-tower : ceux qu'un lab close confirmé a déjà gardés pour ce couloir, nommés (RETIRE_KEPT)
   if [ "$dry" = 1 ]; then close_obstacles; return; fi
   close_abandon_scan   # un couloir vide n'a rien à livrer : la fermeture normale renvoie vers le retrait explicite
   [ -n "$CLOSE_ABANDON_OBSTACLE" ] || die "lane $SLUG has no commit and no PR: nothing to deliver — lab close $P_NAME $SLUG --abandon removes it after a named confirmation"
@@ -1323,6 +1322,7 @@ cmd_close() {
   [ "$CLOSE_PR_STATE" != EMPTY ] || { dest="$base (no PR: batch without commits, already contained)"; pr_kv=none; }
   [ -z "$CLOSE_STACK" ] || dest="$base (PR #$CLOSE_NUM via $CLOSE_PR_BASE, PR #$(printf '%s' "$CLOSE_STACK" | sed -n 's/.* by PR #\([0-9]*\).*/\1/p'))"
   kv PROJECT "$P_NAME"; kv LANE "$SLUG"; kv REVISION "$head"; kv PR "$pr_kv"; kv TARGET "$base"
+  close_after_set; [ -z "$CLOSE_AFTER" ] || kv AFTER_AGREEMENT "$CLOSE_AFTER"   # lot 04 d'onglet-tower : ce qui a changé après le oui
   [ -z "$CLOSE_STACK" ] || kv NOTE "stack: $CLOSE_STACK"
   [ -z "$CLOSE_DELIVERED" ] || kv NOTE "delivered: $CLOSE_DELIVERED"
   printf 'Close the lane %s\nBatches:\n' "$SLUG" >&2
@@ -1343,6 +1343,9 @@ cmd_close() {
   elif [ "$words" = 1 ] && [ "$confirmation_set" = 0 ]; then kv CLOSED_BY words; log_wrap "closing $SLUG on the user's words (\"$AG_SAID\"): no --confirm."
   else close_confirm "$confirmation" "$confirmation_set" close || return 0; fi
   CLOSE_CONFIRMED=1
+  # lot 04 d'onglet-tower (revue de sécurité) : --retire gardé seulement ici — fermeture confirmée (mots, --confirm ou tour seule) et
+  # contrôle de régression déjà passé avec eux ; jamais par un essai à blanc ni par une fermeture refusée plus haut
+  close_retire_keep
   # lot 14 : la main est rendue — CI déjà verte (ou PR déjà fusionnée) → fermeture sur place ; CI en cours → veilleur qui fusionne
   # à la révision confirmée puis retire le couloir, en revérifiant tout (close_finish) ; rouge → rien
   # bilan (lot 01 de close-apres-fusion) : la PR dédiée est ouverte sur place ; ses contrôles décident comme ceux d'une PR ouverte
@@ -1352,34 +1355,26 @@ cmd_close() {
     pr="$CLOSE_BILAN_NUM" sha="$CLOSE_BILAN_HEAD" br="$CLOSE_BILAN_BRANCH" state="$CLOSE_BILAN_STATE"
   fi
   if [ "$state" = OPEN ]; then
-    local checks full=none
+    local checks
     [ "$CLOSE_BILAN" = 1 ] || { delivery_guard; pr_make_ready "$WT" "$CLOSE_NUM"; }
-    # lot 02 de ci-sobre : étiquette full-suite posée ici, une lecture ; en cours → le veilleur attend aussi la suite complète
-    if [ "$CLOSE_BILAN" != 1 ]; then
-      full="$(close_full_suite "$head" 0)" || die "full suite not checked on PR #$CLOSE_NUM: lane kept; run lab close $P_NAME $SLUG again"
-      [ "$full" = none ] || kv FULL_SUITE "$full"
-    fi
+    # lot 02 de restes-cloud : seule la CI de la PR décide (verte → sur place, en cours → veilleur, rouge → refus)
     checks="$(pr_checks_now "$WT" "$pr" "$sha" "$br" "$base")"; kv CHECKS "$checks"
     [ "$checks" != none ] || pr_ci_kv "$WT" "$sha" "$br" "$base"
-    case "$full:$checks" in
-      red:*) die "full suite red on ${head:0:12}: fix it; lane kept" ;;
-      pending:green|pending:none) checks=pending ;;
-    esac
     case "$checks" in
       red) die "red checks${CLOSE_BILAN_NUM:+ on summary PR #$CLOSE_BILAN_NUM}: fix them; lane kept" ;;
       pending)
         local f; f="$(watch_file "$CLOSE_BRANCH")"; mkdir -p "$(dirname "$f")"; printf '%s\n' "$records" >"$f.records"
         watch_arm close "$CLOSE_BRANCH" pr="$pr" sha="$sha" head="$head" base="$base" document="$document" ws="$ws" surface="$surface" name="$name" \
-          retire="${CLOSE_RETIRE[*]+"${CLOSE_RETIRE[*]}"}" alone="$alone" words="$words"
+          retire="${CLOSE_RETIRE[*]+"${CLOSE_RETIRE[*]}"}" alone="$alone" words="$words" after="${CLOSE_AFTER:-}"
         kv ACTION armed; log "lab close hands back: the watcher will merge #$pr at ${sha:0:12} after green CI, then remove $SLUG — outcome in lab status $P_NAME"
         [ "$alone" = 0 ] || close_alone_notify "closing alone: $SLUG at ${head:0:7}, the watcher merges #$pr after green CI"
-        [ "$words" = 0 ] || close_words_notify "closing on the user's words: $SLUG at ${head:0:7}, the watcher merges #$pr after green CI"
+        [ "$words" = 0 ] || close_words_notify "closing on the user's words: $SLUG at ${head:0:7}, the watcher merges #$pr after green CI${CLOSE_AFTER:+ — after the yes: $CLOSE_AFTER}"
         return 0 ;;
     esac
   fi
   close_finish "$head" "$base" "$records" "$document" "$ws" "$surface" "$name"
   [ "$alone" = 0 ] || close_alone_notify "closed alone: $SLUG delivered at ${head:0:7} to $dest — acceptance, served revision verified, prod check green"
-  [ "$words" = 0 ] || close_words_notify "closed on the user's words: $SLUG delivered at ${head:0:7} to $dest"
+  [ "$words" = 0 ] || close_words_notify "closed on the user's words: $SLUG delivered at ${head:0:7} to $dest${CLOSE_AFTER:+ — after the yes: $CLOSE_AFTER}"
   close_caller_tab   # lot 10 : en tout dernier — la session appelante, celle du couloir, part avec son onglet
 }
 # close_finish <révision> <base> <branches> <fiche> <workspace> <surface> <nom> : après confirmation, revérifie tout, livre, puis retire.
@@ -1412,7 +1407,7 @@ close_finish() {
   close_procs_stop "$ws" "$surface"
   git -C "$P_ROOT" worktree remove ${SERVICES_FORCE:+--force} "$WT" || die "delivery done but folder kept: run lab close $P_NAME $SLUG again"
   agreement_clear "$SLUG"; words_clear "$SLUG"   # lots 09 et 10 : accord et mots partent avec le couloir, jamais hérités d'un homonyme
-  rm -f "$(night_agreed_file)"
+  rm -f "$(night_agreed_file)" "$(close_retire_file)"   # lot 04 d'onglet-tower : --retire gardé aussi
   codex_trust_remove "$WT" || die "lane removed, Codex entry to check"
   close_tab "$ws" "$surface" "$name"
   cloud_close_vm "$vm" "$SLUG" "$cws"   # après le retrait seulement (lot 05)

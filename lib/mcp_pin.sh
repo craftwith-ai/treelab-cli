@@ -68,15 +68,15 @@ mcp_npx_version() {
   d="${npm_config_cache:-$HOME/.npm}/_npx/$(printf '%s' "$spec" | shasum -a 512 | cut -c1-16)"
   jq -e --arg n "$name" '.dependencies | has($n)' "$d/package.json" >/dev/null 2>&1 || return 1
   v="$(jq -r '.version // ""' "$d/node_modules/$name/package.json" 2>/dev/null)" || return 1
-  printf '%s\n' "$v" | grep -Eq "$MCP_SEMVER" || return 1
+  grep -Eq "$MCP_SEMVER" <<<"$v" || return 1
   printf '%s\n' "$v"
 }
 # mcp_npm_latest <paquet> → dernière version publiée (npm view, 20 s au plus) ; rc 1 si npm ne répond pas
 mcp_npm_latest() {
   local v
-  printf '%s\n' "$1" | grep -Eq "$MCP_NPM_NAME" || return 1   # un nom du registre, jamais une URL, un dépôt git ou un chemin
+  grep -Eq "$MCP_NPM_NAME" <<<"$1" || return 1   # un nom du registre, jamais une URL, un dépôt git ou un chemin
   v="$(with_timeout 20 "${LAB_MCP_NPM:-npm}" view -- "$1" version 2>/dev/null | tail -1)" || return 1
-  printf '%s\n' "$v" | grep -Eq "$MCP_SEMVER" || return 1
+  grep -Eq "$MCP_SEMVER" <<<"$v" || return 1
   printf '%s\n' "$v"
 }
 

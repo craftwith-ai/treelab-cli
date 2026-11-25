@@ -15,7 +15,11 @@ WIDGET_WRAP=60   # largeur d'une ligne d'impact dans un sous-menu
 # Modules système (lot 04), dans l'ordre d'affichage à droite de la pastille ; temp exige macmon (posé par install)
 WIDGET_MODULES='cpu mem disk net battery temp'
 WIDGET_MACMON_BREW='brew install macmon'
-WIDGET_SYSMON_TTL=8   # secondes : au-delà, un greffon rafraîchit le cache ; en deçà, il lit le cache de la passe précédente
+# Rythme des modules (lot 04 de charge-processeur) : 30 s, nom lab-<m>.30s.sh ; une pose à 10 s passe à 30 s d'elle-même
+# (widget_migrate). Un greffon collecte quand il a déjà montré la passe en cache : une génération, sans horloge ni programme.
+WIDGET_MODULE_PERIOD=30
+WIDGET_MODULE_OLD_PERIOD=10
+WIDGET_WAIT_S="${LAB_WIDGET_WAIT_S:-8}"   # attente du collecteur par les autres greffons, en secondes de read -t ; au-delà, son verrou est abandonné
 # Position mémorisée par macOS pour l'élément du greffon (distance au bord droit, en points) : sans elle, un nouvel élément se pose
 # à gauche des autres, sous l'encoche d'une barre pleine, invisible et impossible à glisser (vrai poste, 2026-10-24). Lot 06 : ce
 # sont des distances, pas des rangs — chaque élément commence où finit le précédent (largeurs mesurées à l'espacement 16 du
@@ -50,8 +54,9 @@ widget_render() {
   local blocks last="" lab
   # sous SwiftBar, les clics passent par l'enveloppe posée : SwiftBar lance une action sans l'environnement du greffon (LAB_HOME,
   # PATH figés), et un lab sans LAB_HOME écrivait son état ailleurs (vrai poste, 2026-10-24)
-  lab="$(widget_lab)"; [ ! -x "${SWIFTBAR_PLUGIN_PATH:-}" ] || lab="$SWIFTBAR_PLUGIN_PATH"
-  [ -z "$(find "$(widget_state)/last" -mmin -10 2>/dev/null)" ] || last="$(head -1 "$(widget_state)/last")"
+  if [ -x "${SWIFTBAR_PLUGIN_PATH:-}" ]; then lab="$SWIFTBAR_PLUGIN_PATH"; else lab="$(widget_lab)"; fi
+  # le dernier clic : un find, la ligne lue sans head (lot 04 de charge-processeur)
+  [ -z "$(exec find "$LAB_STATE/widget/last" -mmin -10 2>/dev/null)" ] || { IFS= read -r last <"$LAB_STATE/widget/last" || :; }
   . "$LAB_ROOT/lib/top.sh"
   blocks="$(top_snapshot 1 2>/dev/null)" || blocks=""
   printf '%s\n' "$blocks" | LC_ALL=C awk -v lab="$lab" -v last="$last" -v wrapw="$WIDGET_WRAP" '
@@ -138,14 +143,14 @@ widget_render() {
 # widget_module_render <module> <blocs KEY=value> [historique] : le texte SwiftBar d un module, au style des maquettes validées du
 # lot 05 (variante A). L élément de barre est une seule image PDF (lib/sysmon.sh) : étiquette empilée sur la valeur, petit
 # graphique de la dernière minute (6 points) ou camembert, teinté vert → ambre → rouge selon le niveau ; le menu ouvre sur un
-# graphique de 10 min (60 points), puis un tableau en chasse fixe aligné sur WIDGET_COLS colonnes, titres de section discrets,
+# graphique de 10 min (SYSMON_HIST_MAX points), puis un tableau en chasse fixe aligné sur WIDGET_COLS colonnes, titres de section discrets,
 # libellés et nombres dans la langue du Mac (WIDGET_LANG, table FR/EN ci-dessous). Un menu de module ne porte aucun clic
 # destructif : rien que des chiffres, qui consomme, et Actualiser. Apparences : WIDGET_BAR (texte de la barre, sombre
 # depuis le lot 06) et WIDGET_MENU (menus, celle du système) ; light par défaut.
 WIDGET_COLS=34
 widget_module_render() {
-  printf '%s\n' "$2" | LC_ALL=C awk -v m="$1" -v hist="${3:-}" -v lang="${WIDGET_LANG:-en}" -v bar="${WIDGET_BAR:-light}" \
-    -v menu="${WIDGET_MENU:-light}" -v cols="$WIDGET_COLS" -v bp="$SYSMON_BAR_POINTS" -v macmonbrew="$WIDGET_MACMON_BREW" "$SYSMON_PDF_AWK"'
+  LC_ALL=C awk -v m="$1" -v hist="${3:-}" -v lang="${WIDGET_LANG:-en}" -v bar="${WIDGET_BAR:-light}" \
+    -v menu="${WIDGET_MENU:-light}" -v cols="$WIDGET_COLS" -v bp="$SYSMON_BAR_POINTS" -v hm="$SYSMON_HIST_MAX" -v macmonbrew="$WIDGET_MACMON_BREW" "$SYSMON_PDF_AWK"'
     BEGIN { RS = ""; FS = "\n"; pdf_init(); tr_init() }
     function d(k, f, e) { FR[k] = f; EN[k] = e }
     function t(k) { return (lang == "fr") ? FR[k] : EN[k] }
@@ -244,8 +249,8 @@ widget_module_render() {
       pdf_begin(266, GH); x = 0; w = 266
       if (pie) { track_disc(28, 28, 26.25, menu); pdf_fill(menu, pcolor); pdf_wedge(28, 28, 26.25, pct); x = 66; w = 200 }
       pdf_push(); pdf_alpha(12); pdf_fill(menu, "ink"); pdf_rrect(x, 0, w, 56, 3, "f"); pdf_pop()
-      pdf_series(x, 0, w, 56, col(k, 60), (NH > 60) ? 60 : NH, max, menu, color, 1)
-      if (k2) pdf_series(x, 0, w, 56, col(k2, 60), (NH > 60) ? 60 : NH, max, menu, color2, 0)
+      pdf_series(x, 0, w, 56, col(k, hm), (NH > hm) ? hm : NH, max, menu, color, 1)
+      if (k2) pdf_series(x, 0, w, 56, col(k2, hm), (NH > hm) ? hm : NH, max, menu, color2, 0)
       legend(x, w, mid)
       # taille explicite : sans elle, SwiftBar 2.1.1 réduit l image d un menu à la hauteur d une ligne (vrai poste, 2026-10-24)
       line("| image=" pdf_end() " width=266 height=" GH)
@@ -341,7 +346,7 @@ widget_module_render() {
       printf "%s", body
       print "---"
       print t("refresh") " | refresh=true"
-    }'
+    }' <<<"$2"
 }
 
 # widget_sysmon_dir → dossier du cache des modules (blocs collectés + un fichier pré-rendu par module)
@@ -358,6 +363,18 @@ widget_modules_enabled() {
   for m in $(widget_modules_all); do grep -qxF "$m" "$f" && printf '%s\n' "$m"; done
 }
 widget_module_known() { case " $WIDGET_MODULES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+# widget_modules_enabled_set : WIDGET_ON, les modules actifs séparés par des espaces (ordre canonique), comme widget_modules_enabled,
+# lus sans programme ni sous-shell (le collecteur, à chaque passe)
+widget_modules_enabled_set() {
+  local f m l; local -a lines=()
+  f="$LAB_STATE/widget/modules"
+  if [ ! -f "$f" ]; then WIDGET_ON="$WIDGET_MODULES"; return 0; fi
+  while IFS= read -r l || [ -n "$l" ]; do lines+=("$l"); done <"$f"
+  WIDGET_ON=""
+  for m in $WIDGET_MODULES; do
+    for l in "${lines[@]+"${lines[@]}"}"; do [ "$l" != "$m" ] || { WIDGET_ON="$WIDGET_ON${WIDGET_ON:+ }$m"; break; }; done
+  done
+}
 
 # Apparences. Barre (lot 06) : une seule palette sombre — macOS 26 dessine la barre transparente, son texte suit le fond d'écran, et
 # le fond d'écran foncé est gardé (décision du grill-me) ; la sonde d'apparence du lot 05 est retirée. Menus : l'apparence du
@@ -376,30 +393,41 @@ widget_bar_appearance() { printf '%s\n' "${LAB_WIDGET_BAR:-dark}"; }
 
 # widget_lang → fr|en… : la langue des menus, celle du Mac (lab_lang_detect) gardée WIDGET_CACHE_TTL minutes — sa lecture par defaults
 # coûte ≈ 0,02 s, payée une fois par fenêtre et non à chaque passe (budget C6) ; LAB_LANG posé l'emporte sans cache
-widget_lang() {
-  local f l
-  [ -z "${LAB_LANG:-}" ] || { lab_lang_detect; return; }
-  f="$(widget_sysmon_dir)/lang"
-  if [ -n "$(find "$f" -mmin "-$WIDGET_CACHE_TTL" 2>/dev/null)" ] && l="$(cat "$f" 2>/dev/null)" && [ -n "$l" ]; then printf '%s\n' "$l"; return; fi
-  l="$(lab_lang_detect)"; printf '%s\n' "$l" >"$f" 2>/dev/null || true
-  printf '%s\n' "$l"
+widget_lang() { widget_lang_set; printf '%s\n' "$WIDGET_LANG"; }
+# widget_lang_set : WIDGET_LANG, la même langue, le cache lu sans cat (un seul find par passe)
+widget_lang_set() {
+  local f="$LAB_STATE/widget/sysmon/lang" l=""
+  [ -z "${LAB_LANG:-}" ] || { WIDGET_LANG="$(lab_lang_detect)"; return 0; }
+  if [ -n "$(exec find "$f" -mmin "-$WIDGET_CACHE_TTL" 2>/dev/null)" ] && { read -r l <"$f" || [ -n "$l" ]; } 2>/dev/null && [ -n "$l" ]; then
+    WIDGET_LANG="$l"; return 0
+  fi
+  WIDGET_LANG="$(lab_lang_detect)"; printf '%s\n' "$WIDGET_LANG" >"$f" 2>/dev/null || true
+}
+# widget_menu_set : WIDGET_MENU, comme widget_menu_appearance, sans sous-shell quand SwiftBar donne OS_APPEARANCE
+widget_menu_set() {
+  if [ -n "${LAB_WIDGET_MENU:-}" ]; then WIDGET_MENU="$LAB_WIDGET_MENU"; return 0; fi
+  case "${OS_APPEARANCE:-}" in Dark) WIDGET_MENU=dark ;; Light) WIDGET_MENU=light ;; *) WIDGET_MENU="$(widget_menu_appearance)" ;; esac
 }
 
 # widget_collect : une passe de collecte, son point dans l'historique (10 min), puis un fichier SwiftBar pré-rendu par module actif
-# (écritures atomiques). Appelé une fois par cycle par le greffon qui tient le verrou ; les cinq autres lisent le cache. Toujours
-# rc 0 (une passe en échec laisse le cache précédent). Un seul lab par cycle (budget mesuré, rapport de preuves).
+# (écritures atomiques), et les blocs en dernier : un greffon qui voit des blocs neufs trouve leurs modules déjà rendus. Appelé une
+# fois par cycle par le greffon qui tient le verrou ; les cinq autres lisent le cache. Toujours rc 0 (une passe en échec laisse le
+# cache précédent). Un seul lab par cycle, aucun sous-shell hors des sondes (budget mesuré, rapport de preuves du lot 04 de
+# charge-processeur).
 widget_collect() {
   local dir blocks m
   . "$LAB_ROOT/lib/top.sh"; . "$LAB_ROOT/lib/sysmon.sh"
-  dir="$(widget_sysmon_dir)"; mkdir -p "$dir" || return 0
+  dir="$LAB_STATE/widget/sysmon"; [ -d "$dir" ] || mkdir -p "$dir" || return 0
+  [ -p "$dir/tick" ] || mkfifo "$dir/tick" 2>/dev/null || true
+  widget_migrate
   blocks="$(sysmon_collect 2>/dev/null)" || blocks=""
   [ -n "$blocks" ] || return 0
-  printf '%s\n' "$blocks" >"$dir/.blocks.$$" && mv "$dir/.blocks.$$" "$dir/blocks"
   sysmon_history_push "$dir/history" "$blocks" 2>/dev/null || true
-  WIDGET_LANG="$(widget_lang)"; WIDGET_BAR="$(widget_bar_appearance)"; WIDGET_MENU="$(widget_menu_appearance)"
-  for m in $(widget_modules_enabled); do
+  widget_lang_set; WIDGET_BAR="${LAB_WIDGET_BAR:-dark}"; widget_menu_set; widget_modules_enabled_set
+  for m in $WIDGET_ON; do
     widget_module_render "$m" "$blocks" "$dir/history" >"$dir/.module-$m.$$" 2>/dev/null && mv "$dir/.module-$m.$$" "$dir/module-$m.txt"
   done
+  printf '%s\n' "$blocks" >"$dir/.blocks.$$" && mv "$dir/.blocks.$$" "$dir/blocks"
 }
 
 # widget_render_module <module> : le texte SwiftBar d un module, collecte fraîche à l appui, historique lu sans être écrit. Pour
@@ -500,8 +528,8 @@ widget_brew() {
   if [ "${LAB_BREW+set}" = set ]; then [ -x "$LAB_BREW" ] && printf '%s\n' "$LAB_BREW"; return 0; fi
   command -v brew 2>/dev/null || true
 }
-# widget_module_plugin_name <module> → nom de fichier SwiftBar du module (rafraîchi toutes les 10 s)
-widget_module_plugin_name() { printf 'lab-%s.10s.sh\n' "$1"; }
+# widget_module_plugin_name <module> [rythme] → nom de fichier SwiftBar du module (rafraîchi toutes les 30 s ; 10 : la pose d'avant)
+widget_module_plugin_name() { printf 'lab-%s.%ss.sh\n' "$1" "${2:-$WIDGET_MODULE_PERIOD}"; }
 # widget_module_position <module> → position mémorisée (distance au bord droit) ; les modules groupés juste à droite de la pastille,
 # dans l'ordre de WIDGET_MODULES : le dernier à WIDGET_POSITION_BASE, chacun des autres au bord gauche de son voisin de droite
 widget_module_position() {
@@ -513,33 +541,50 @@ widget_module_position() {
 # comme à un modules on ultérieur ; lignes KEY=value, une valeur par ligne
 widget_plugin_ctx_file() { printf '%s/plugin-ctx\n' "$(widget_state)"; }
 widget_plugin_ctx_get() { sed -n "s/^$1=//p" "$(widget_plugin_ctx_file)" 2>/dev/null | head -1; }
+# widget_plugin_dir_set : WIDGET_PLUGIN_DIR, la ligne dir= du contexte, lue sans programme (le collecteur, à chaque passe)
+widget_plugin_dir_set() {
+  local l; WIDGET_PLUGIN_DIR=""
+  [ -f "$LAB_STATE/widget/plugin-ctx" ] || return 0
+  while IFS= read -r l || [ -n "$l" ]; do case "$l" in dir=*) WIDGET_PLUGIN_DIR="${l#dir=}"; return 0 ;; esac; done <"$LAB_STATE/widget/plugin-ctx"
+}
 
-# widget_module_plugin_write <module> : écrit (ou réécrit) le greffon SwiftBar d'un module dans le dossier posé, en bash pur — il
-# ne relance lab que pour collecter, sous un verrou (un seul lab par cycle, le budget mesuré l'exige), et lit sinon le cache
-# pré-rendu. Pose aussi sa position si l'utilisateur ne l'a pas déjà choisie. Sans contexte posé (barre non installée) : ne fait rien.
+# widget_module_plugin_write <module> : écrit (ou réécrit) le greffon SwiftBar d'un module dans le dossier posé, en bash pur, sans
+# un seul programme quand il lit le cache (lot 04 de charge-processeur). Il ne relance lab que pour collecter : quand ce module a
+# déjà montré la passe en cache (une génération : les blocs ne sont pas plus récents que sa dernière lecture, -nt), qu'il n'y en a
+# pas, ou que son texte manque (module activé après la passe). Le premier greffon prend le verrou (fichier créé sous set -C,
+# atomique, qui porte son pid) et lance « lab widget collect », puis ne retire le verrou que s'il porte encore son pid ; les autres
+# l'attendent par read -t sur un tube nommé, jamais par sleep, au plus WIDGET_WAIT_S s, puis lisent le cache. Le verrou d'un
+# collecteur mort (kill -0, sans programme) est retiré aussitôt, celui d'un collecteur vivant et lent jamais (revue du lot) ; un
+# verrou encore vide après l'attente, aussi. Pose aussi sa position si l'utilisateur ne l'a pas déjà choisie. Sans contexte posé
+# (barre non installée) : ne fait rien.
 widget_module_plugin_write() {
-  local m="$1" dir lab env path sysdir plugin ttl posk pos
+  local m="$1" dir lab env path sysdir plugin posk pos
   dir="$(widget_plugin_ctx_get dir)"; [ -n "$dir" ] && [ -d "$dir" ] || return 0
   lab="$(widget_plugin_ctx_get lab)"; env="$(widget_plugin_ctx_get env)"; path="$(widget_plugin_ctx_get path)"
-  sysdir="$(widget_sysmon_dir)"; ttl="$WIDGET_SYSMON_TTL"
+  sysdir="$(widget_sysmon_dir)"
   plugin="$dir/$(widget_module_plugin_name "$m")"
   mkdir -p "$sysdir" 2>/dev/null || true
-  # shellcheck disable=SC2016 # corps du greffon généré : $D, $blk, $TTL… doivent rester littéraux (développés à l'exécution du greffon)
+  [ -p "$sysdir/tick" ] || mkfifo "$sysdir/tick" 2>/dev/null || true
+  # shellcheck disable=SC2016 # corps du greffon généré : $D, $blk, $s… doivent rester littéraux (développés à l'exécution du greffon)
   {
     printf '#!/bin/bash\n# Treelab system module (%s), written by lab widget install; lab widget remove takes it away.\n' "$m"
     printf '# <swiftbar.hideAbout>true</swiftbar.hideAbout>\n# <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>\n'
     printf '# <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>\n# <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>\n'
     printf 'export PATH=%s\n' "$(shell_quote "$path")"
-    printf 'D=%s; M=%s; TTL=%s; f="$D/module-$M.txt"; blk="$D/blocks"; now=$(date +%%s)\n' "$(shell_quote "$sysdir")" "$(shell_quote "$m")" "$ttl"
-    # un seul collecteur par cycle : le premier greffon dont le cache est périmé prend le verrou et lance « lab widget collect » ;
-    # les autres attendent qu'il finisse (≤ 2 s) puis lisent le cache ; un verrou bloqué plus de 30 s est volé
-    printf 'need=1; if [ -f "$blk" ]; then a=$(( now - $(stat -f %%m "$blk" 2>/dev/null || echo 0) )); [ "$a" -ge "$TTL" ] || need=0; fi\n'
-    printf 'if [ "$need" = 1 ]; then got=0\n'
-    printf '  if mkdir "$D/lock" 2>/dev/null; then got=1\n'
-    printf '  else la=$(( now - $(stat -f %%m "$D/lock" 2>/dev/null || echo "$now") )); [ "$la" -lt 30 ] || { rmdir "$D/lock" 2>/dev/null || true; mkdir "$D/lock" 2>/dev/null && got=1; }\n  fi\n'
-    printf '  if [ "$got" = 1 ]; then env %s %s widget collect >/dev/null 2>&1 || true; rmdir "$D/lock" 2>/dev/null || true\n' "$env" "$(shell_quote "$lab")"
-    printf '  else i=0; while [ -d "$D/lock" ] && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i + 1)); done; fi\nfi\n'
-    printf 'cat "$f" 2>/dev/null || printf "%%s … | ansi=false\\n" "$M"\n'
+    printf 'D=%s; M=%s; f="$D/module-$M.txt"; s="$D/.seen-$M"; blk="$D/blocks"\n' "$(shell_quote "$sysdir")" "$(shell_quote "$m")"
+    printf '# a new pass is due once this module has shown the cached one: the first plugin collects, the others wait for it\n'
+    printf 'if [ ! -f "$blk" ] || [ ! -f "$f" ] || { [ -f "$s" ] && [ ! "$blk" -nt "$s" ]; }; then\n  set -C\n'
+    printf '  if { printf "%%s\\n" "$$" >"$D/collecting"; } 2>/dev/null; then set +C\n'
+    printf '    env %s %s widget collect >/dev/null 2>&1 || true; h=""; read -r h <"$D/collecting" 2>/dev/null || :; [ "$h" != "$$" ] || rm -f "$D/collecting"\n' "$env" "$(shell_quote "$lab")"
+    printf '  else set +C; i=0; [ ! -p "$D/tick" ] || exec 9<>"$D/tick"\n'
+    printf '    while [ -f "$D/collecting" ] && [ "$i" -lt %s ]; do\n' "$WIDGET_WAIT_S"
+    printf '      h=""; read -r h <"$D/collecting" 2>/dev/null || :; [ -z "$h" ] || kill -0 "$h" 2>/dev/null || break\n'
+    printf '      if [ -p "$D/tick" ]; then read -r -t 1 -u 9 _ || :; else break; fi; i=$((i + 1))\n    done\n'
+    printf '    # a dead collector, or a lock still empty after the wait: removed, the next pass collects; a live slow one keeps its lock\n'
+    printf '    h=""; [ ! -f "$D/collecting" ] || read -r h <"$D/collecting" 2>/dev/null || :\n'
+    printf '    if [ -f "$D/collecting" ] && { [ -z "$h" ] || ! kill -0 "$h" 2>/dev/null; }; then rm -f "$D/collecting"; fi\n  fi\nfi\n'
+    printf 'if [ -f "$f" ]; then while IFS= read -r l || [ -n "$l" ]; do printf "%%s\\n" "$l"; done <"$f"; : >"$s"\n'
+    printf 'else printf "%%s … | ansi=false\\n" "$M"; fi\n'
   } >"$plugin.tmp" || return 0
   if ! chmod 755 "$plugin.tmp" || ! mv "$plugin.tmp" "$plugin"; then rm -f "$plugin.tmp"; return 0; fi
   posk="$(widget_position_key "$plugin")"; pos="$(widget_module_position "$m")"
@@ -547,17 +592,51 @@ widget_module_plugin_write() {
     defaults write "$WIDGET_DOMAIN" "$posk" -float "$pos" >/dev/null 2>&1 && printf '%s\n' "$plugin" >>"$(widget_state)/module-positions"
   fi
 }
-# widget_module_plugin_remove <module> : retire le greffon d'un module (s'il est de lab) et la position que lab avait posée
+# widget_module_plugin_remove <module> : retire le greffon d'un module (s'il est de lab) et la position que lab avait posée, au rythme
+# de 30 s comme à celui d'une pose d'avant (10 s, jamais migrée)
 widget_module_plugin_remove() {
-  local m="$1" dir plugin
+  local m="$1" dir plugin period
   dir="$(widget_plugin_ctx_get dir)"; [ -n "$dir" ] || return 0
-  plugin="$dir/$(widget_module_plugin_name "$m")"
-  [ ! -f "$plugin" ] || ! grep -q 'Treelab system module' "$plugin" || rm -f "$plugin"
-  if [ -f "$(widget_state)/module-positions" ] && grep -qxF "$plugin" "$(widget_state)/module-positions" 2>/dev/null; then
-    defaults delete "$WIDGET_DOMAIN" "$(widget_position_key "$plugin")" >/dev/null 2>&1 || true
-    grep -vxF "$plugin" "$(widget_state)/module-positions" >"$(widget_state)/module-positions.tmp" 2>/dev/null || true
-    mv "$(widget_state)/module-positions.tmp" "$(widget_state)/module-positions" 2>/dev/null || true
-  fi
+  for period in "$WIDGET_MODULE_PERIOD" "$WIDGET_MODULE_OLD_PERIOD"; do
+    plugin="$dir/$(widget_module_plugin_name "$m" "$period")"
+    [ ! -f "$plugin" ] || ! grep -q 'Treelab system module' "$plugin" || rm -f "$plugin"
+    if [ -f "$(widget_state)/module-positions" ] && grep -qxF "$plugin" "$(widget_state)/module-positions" 2>/dev/null; then
+      defaults delete "$WIDGET_DOMAIN" "$(widget_position_key "$plugin")" >/dev/null 2>&1 || true
+      grep -vxF "$plugin" "$(widget_state)/module-positions" >"$(widget_state)/module-positions.tmp" 2>/dev/null || true
+      mv "$(widget_state)/module-positions.tmp" "$(widget_state)/module-positions" 2>/dev/null || true
+    fi
+  done
+}
+# widget_migrate : une pose d'avant le lot 04 de charge-processeur (modules lab-<m>.10s.sh) passe à 30 s d'elle-même — au premier
+# collect de la nouvelle version, que ses anciens greffons appellent, ou à install. Pour chaque module : sa position (macOS la range
+# sous le chemin du greffon) recopiée sous le nouveau nom, nouveau greffon écrit, ancien retiré ; la liste des positions posées par
+# lab et la photo d'ordre (order save) suivent le nouveau nom, le cache des positions est oublié, SwiftBar relit ses greffons.
+# Aucune pose à 10 s : aucun processus.
+widget_migrate() {
+  local dir m old new pos moved=0 f
+  widget_plugin_dir_set; dir="$WIDGET_PLUGIN_DIR"; [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  for m in $WIDGET_MODULES; do
+    old="$dir/lab-$m.$WIDGET_MODULE_OLD_PERIOD""s.sh"; [ -f "$old" ] || continue
+    grep -q 'Treelab system module' "$old" 2>/dev/null || continue
+    new="$dir/$(widget_module_plugin_name "$m")"
+    pos="$(defaults read "$WIDGET_DOMAIN" "$(widget_position_key "$old")" 2>/dev/null)" || pos=""
+    [ -z "$pos" ] || defaults write "$WIDGET_DOMAIN" "$(widget_position_key "$new")" -float "$pos" >/dev/null 2>&1 || true
+    widget_module_plugin_write "$m"
+    [ -f "$new" ] || continue   # nouveau greffon non écrit : l'ancien reste, la prochaine passe réessaie
+    rm -f "$old"; [ -z "$pos" ] || defaults delete "$WIDGET_DOMAIN" "$(widget_position_key "$old")" >/dev/null 2>&1 || true
+    moved=1
+  done
+  [ "$moved" = 1 ] || return 0
+  for f in "$(widget_state)/module-positions" "$(widget_state)/bar/order"; do
+    [ -f "$f" ] || continue
+    LC_ALL=C awk -v mods="$WIDGET_MODULES" -v o=".$WIDGET_MODULE_OLD_PERIOD""s.sh" -v n=".$WIDGET_MODULE_PERIOD""s.sh" '
+      BEGIN { k = split(mods, M, " ") }
+      { for (i = 1; i <= k; i++) { a = "/lab-" M[i] o; j = index($0, a); if (j) $0 = substr($0, 1, j - 1) "/lab-" M[i] n substr($0, j + length(a)) } print }' \
+      "$f" >"$f.$$" && mv "$f.$$" "$f"
+  done
+  rm -f "$(widget_state)/bar/positions"
+  [ ! -d "$LAB_STATE/widget/sysmon/lock" ] || rmdir "$LAB_STATE/widget/sysmon/lock" 2>/dev/null || true   # verrou des greffons à 10 s
+  open -g 'swiftbar://refreshallplugins' >/dev/null 2>&1 || true
 }
 
 # widget_login_has → rc 0 si SwiftBar ouvre déjà à la connexion (élément d'ouverture de System Events)
@@ -610,6 +689,7 @@ widget_install() {
   # six modules actifs par défaut (décision 2) ; une pose ultérieure respecte la liste déjà choisie
   [ -f "$(widget_modules_file)" ] || widget_modules_all >"$(widget_modules_file)"
   mkdir -p "$(widget_sysmon_dir)"
+  widget_migrate   # une pose à 10 s : positions et photo d'ordre reportées sur les greffons à 30 s
   for m in $(widget_modules_enabled); do widget_module_plugin_write "$m"; done
   # séparateur (lot 06) : juste à gauche de la pastille ; tout ce qui est à sa gauche se range derrière lui
   if menubar_sep_install "$dir" "$env" "$lab" "$PATH"; then sep=installed; else sep=failed; warn "menu bar separator not written in $dir"; fi
@@ -631,7 +711,7 @@ widget_install() {
   [ -f "$LAB_ROOT/.release" ] || warn "the plugin calls the lab of a checkout ($lab): run lab widget install again with the installed lab before this checkout goes away"
   kv WIDGET installed; kv PLUGIN "$plugin"; kv PLUGIN_DIR "$dir"; kv PLUGIN_DIR_SOURCE "$src"; kv LOGIN_ITEM "$login"; kv POSITION "$position"; kv LAB "$lab"
   kv MODULES "$(widget_modules_enabled | paste -sd, -)"; kv MACMON "$macmon"; kv SEPARATOR "$sep"
-  log "menu bar plugin installed: $plugin and $(widget_modules_enabled | paste -sd, -) refreshed every 10 s; lab widget remove takes them away"
+  log "menu bar plugin installed: $plugin and $(widget_modules_enabled | paste -sd, -) refreshed every 30 s; lab widget remove takes them away"
 }
 widget_remove() {
   local state rec="" plugin="" login=kept m pdir
@@ -643,7 +723,7 @@ widget_remove() {
   for m in $WIDGET_MODULES; do widget_module_plugin_remove "$m"; done
   local sysdir; sysdir="$(widget_sysmon_dir)"
   rm -f "$sysdir"/blocks "$sysdir"/module-*.txt "$sysdir"/.blocks.* "$sysdir"/.module-* "$sysdir"/history "$sysdir"/history.* \
-    "$sysdir"/bar-appearance "$sysdir"/lang 2>/dev/null || true   # historique et caches du lot 05 (bar-appearance : pose antérieure)
+    "$sysdir"/bar-appearance "$sysdir"/lang "$sysdir"/.seen-* "$sysdir"/tick "$sysdir"/collecting 2>/dev/null || true   # historique et caches du lot 05 (bar-appearance : pose antérieure), générations et verrou du lot 04 de charge-processeur
   rmdir "$sysdir/lock" "$sysdir" 2>/dev/null || true
   rm -f "$(widget_plugin_ctx_file)" "$(widget_modules_file)" "$state/module-positions" "$state/net-raw"
   [ ! -f "$state/installed" ] || rec="$(sed -n 's/^plugin=//p' "$state/installed" | head -1)"

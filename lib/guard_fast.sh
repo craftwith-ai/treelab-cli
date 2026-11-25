@@ -214,11 +214,13 @@ guard_fast_lock() {
 
 # ---------- pré-filtres, communs aux deux chemins ----------
 # guard_bash_ordinary <commande> : rc 0 si aucune règle ne peut la viser — ni git, ni rm, ni mise en ligne, ni migration, ni fusion,
-# ni envoi cmux, ni le premier mot d'une deploy.<cible> déclarée. Pose DEPLOY_SIGS
+# ni envoi cmux, ni Docker (lot 02 de docker-menage), ni le premier mot d'une deploy.<cible> déclarée. Pose DEPLOY_SIGS
 guard_bash_ordinary() {
   deploy_sigs_set
   case "$1" in
-    *git*|*rm*|*deploy*|*publish*|*rsync*|*vercel*|*migrations*|*supabase*|*"pr merge"*|*/merge*|*mergePullRequest*|*LAB_AGENT_SCAN*|*cmux*|*cmx*) return 1 ;;
+    *git*|*rm*|*deploy*|*publish*|*rsync*|*vercel*|*migrations*|*supabase*|*"pr merge"*|*/merge*|*mergePullRequest*|*LAB_AGENT_SCAN*|*cmux*|*cmx*|*docker*) return 1 ;;
+    # lot 02 du couloir app-treelab : la commande du fork peut porter un autre nom — tout envoi de texte passe par le chemin complet
+    *send*|*paste*|*set-buffer*) return 1 ;;
   esac
   ! deploy_sig_hint "$1"
 }
@@ -297,10 +299,28 @@ guard_main() {
   guard_load project
   if guard_fields && guard_ordinary "$1"; then exit 0; fi
   set -euo pipefail
-  guard_load log git lock codex words tower hooks
+  guard_load log git lock codex words tower terminal hooks
   # shellcheck disable=SC2034 # lu par git_places (lib/git.sh)
   GP_MEMO=1
   cmd_hook "$1"
+}
+
+# session_main : le crochet de démarrage, avec les seules bibliothèques qu'il utilise (leur fermeture est contrôlée par tests/hooks.bats) ;
+# les mêmes en mode mesure (LAB_DRY=1) : une bibliothèque absente change la réponse sans un mot (la recette lit sync_ref, revue du lot 02)
+session_main() {
+  CDPATH=''
+  guard_load kv
+  if [ -z "${LAB_HOME:-}" ] && [ ! -f "$LAB_ROOT/.release" ]; then guard_load git; real_path_set "$LAB_ROOT"; LAB_ROOT="$REAL_PATH"; fi   # comme guard_main
+  export LAB_ROOT
+  set -euo pipefail
+  guard_load log git project lock docs recette merge watch tower cmux cloud sync migrations ressource deploy night entitlement hooks
+  # [pid du crochet] : hooks/session-start.sh passe le sien — les ancêtres se lisent depuis lui, comme depuis « bin/lab hook », son
+  # enfant avant #239 : sans agent, le verrou est au crochet, mort à la fin, pas à son lanceur vivant (nuit rouge du 2026-11-24) ;
+  # « bin/lab hook session-start » n'en passe pas : $PPID, son lanceur, comme avant. Non exportée : lib/lock.sh l'a retirée de
+  # l'environnement à son chargement
+  # shellcheck disable=SC2034 # lu par agent_pid_found (lib/lock.sh)
+  LAB_AGENT_FROM="${1:-}"
+  cmd_hook session-start
 }
 
 # ---------- notify (prompt envoyé, fin de tour) ----------

@@ -5,6 +5,7 @@
 # Entrée d'attente d'un couloir : <couloir>/.lab/waits-for (kind=question|permission|acceptance|blocked, why=, at=), posée par les
 # crochets Claude (question, autorisation) et par lab next (recette prête, refus) ; dans tous les projets, avec ou sans tour.
 declare -F kv_value >/dev/null || . "${BASH_SOURCE[0]%/*}/kv.sh"
+declare -F snap_mark >/dev/null || . "${BASH_SOURCE[0]%/*}/snapshot.sh"   # instantané de Treelab.app (lot 03 d'app-treelab)
 TOWER_LANE=tower
 lane_role() { wt_meta "$1" role; }
 # la marque role=tower vit dans le couloir, que son agent peut écrire : la tour n'est reconnue que si la marque posée par lab tower
@@ -26,6 +27,7 @@ waits_set() {
   why="$(printf '%s' "$3" | tr '\n\r\t' '   ' | cut -c1-200)"
   ( umask 077; { printf 'kind=%s\nwhy=%s\nat=%s\n' "$2" "$why" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; [ -z "${4:-}" ] || printf 'source=%s\n' "$4"; } >"$f.tmp.$$" \
     && mv "$f.tmp.$$" "$f" )
+  snap_mark "$1"
 }
 # waits_idle <wt> : l'entrée d'attente est celle d'une session au repos — source=idle, ou entrée ancienne sans source dont le motif
 # est exactement le message d'attente au repos de Claude Code (règle de transition du lot 09)
@@ -43,6 +45,7 @@ waits_clear() {
   local f="$1/.lab/waits-for" q="$1/.lab/waits-question.json"
   if [ ! -e "$f" ] && [ ! -L "$f" ] && [ ! -e "$q" ] && [ ! -L "$q" ]; then return 0; fi
   rm -f "$f" "$q"
+  snap_mark "$1"
 }
 # la boîte AskUserQuestion entière (lot 02 de pilotage-voix) : questions, choix, descriptions, multiSelect — lue par lab ginkgo question
 waits_question_file() { printf '%s/.lab/waits-question.json\n' "$1"; }
@@ -104,43 +107,45 @@ next_blocked_note() {
 # tower_waits_for <wt> → pose TW_WAITS (you|merge|close|acceptance|date|ci|nothing), TW_WHY, TW_SESSION (live|none) et, en recette,
 # TW_EVIDENCE (check | check screens : preuves typées que la tour réunit avant lab acceptance --accept, lot 07 ; words : les mots de
 # l'utilisateur déjà lus par lab, lot 10) ; TW_PHASE, la phase
-# lue (vide quand une entrée d'attente ou une fusion en file a suffi), qui sépare recette, fermeture et suite à clarifier (Ginkgo)
+# lue (vide quand une entrée d'attente ou une fusion en file a suffi), qui sépare recette, fermeture et suite à clarifier (Ginkgo).
+# --no-session (Ginkgo, qui ne lit ni TW_SESSION ni le motif d'un couloir qui n'attend rien) : le verrou de session n'est pas lu.
+# Nom du couloir, phase, attente et veilleurs lus sans sous-shell (lot 04 de charge-processeur) : mêmes valeurs.
 tower_waits_for() {
-  local wt="$1" kind phase w f issue
+  local wt="$1" kind phase w f issue lane
   TW_WAITS=nothing; TW_WHY=""; TW_SESSION=none; TW_EVIDENCE=""; TW_PHASE=""
-  ! lock_alive "$(lock_file "$wt")" || TW_SESSION=live
+  [ "${2:-}" = --no-session ] || ! lock_alive "$wt/.lab/session.lock" || TW_SESSION=live
+  wt_lane_set "$wt"; lane="$WT_LANE"
   # recette acceptée : l'accord de l'utilisateur est l'ordre de fermeture, la tour ferme sans second oui (#217). Lot 09 : une vraie
   # question, une autorisation ou un blocage passent avant (une session au repos, « waiting for your input », ne bloque pas) ; puis
   # seul l'accord gardé par lab au registre ferme — jamais la ligne Validated by de la fiche, que l'agent du couloir peut écrire.
-  phase="$(lane_phase "$wt")"
+  lane_phase_set "$wt"; phase="$LANE_PHASE"
+  kv_value "$wt/.lab/waits-for" kind || true; kind="$KV_VALUE"
   if [ "$phase" = 'acceptance passed' ]; then
     TW_PHASE="$phase"
-    kind="$(waits_get "$wt" kind)"
     case "$kind" in
       question|permission|blocked)
         if ! waits_idle "$wt"; then TW_WAITS=you; TW_WHY="$(waits_label "$kind"): $(waits_get "$wt" why)"; return; fi ;;
     esac
     # fermeture déjà confiée à un veilleur (CI en cours) : la tour attend, elle ne relance pas lab close (revue du lot 08)
-    for f in "$LAB_STATE/watch/$P_NAME/$(wt_lane "$wt")"/*; do
-      [ -f "$f" ] && [ "$(watch_get "$f" action)" = close ] || continue; case "$f" in *.log|*.records|*.body|*.tmp.*) continue ;; esac
-      issue="$(watch_state "$f")"
+    for f in "$LAB_STATE/watch/$P_NAME/$lane"/*; do
+      [ -f "$f" ] && kv_value "$f" action && [ "$KV_VALUE" = close ] || continue; case "$f" in *.log|*.records|*.body|*.tmp.*) continue ;; esac
+      watch_state_set "$f"; issue="$WATCH_STATE"
       case "$issue" in armed|waiting|dead) TW_WAITS=ci; TW_WHY="closing handed to the watcher: $(watch_get "$f" branch) $issue — $(watch_get "$f" detail)"; return ;; esac
     done
     # lot 10 : l'accord venu des mots de l'utilisateur est nommé, ses mots sont l'ordre de fermer
-    if agreement_by_words "$wt"; then TW_WAITS=close; TW_WHY="acceptance passed on the user's words (\"$AG_SAID\"): the tower closes it, no second yes: lab close $P_NAME $(wt_lane "$wt")"
-    elif agreement_valid "$wt"; then TW_WAITS=close; TW_WHY="acceptance passed: the tower closes it, no second yes: lab close $P_NAME $(wt_lane "$wt")"
+    if agreement_by_words "$wt"; then TW_WAITS=close; TW_WHY="acceptance passed on the user's words (\"$AG_SAID\"): the tower closes it, no second yes: lab close $P_NAME $lane"
+    elif agreement_valid "$wt"; then TW_WAITS=close; TW_WHY="acceptance passed: the tower closes it, no second yes: lab close $P_NAME $lane"
     else TW_WAITS=you; TW_WHY="closing: $AG_WHY — the tower asks you"; fi
     return
   fi
-  kind="$(waits_get "$wt" kind)"
   case "$kind" in
     question|permission|blocked) TW_WAITS=you; TW_WHY="$(waits_label "$kind"): $(waits_get "$wt" why)"; return ;;
   esac
-  # lot 06 : une fusion inscrite par l'agent du couloir attend la tour, qui l'exécute sans question
-  f="$(merge_queue_list "$(wt_lane "$wt")")"; f="${f%%$'\n'*}"
+  # lot 06 : une fusion inscrite par l'agent du couloir attend la tour, qui l'exécute sans question (aucune file : aucun processus)
+  f=""; [ ! -d "$LAB_STATE/$P_NAME/merge-queue/$lane" ] || { f="$(merge_queue_list "$lane")"; f="${f%%$'\n'*}"; }
   if [ -n "$f" ]; then
     TW_WAITS=merge
-    TW_WHY="merge queued: $(state_field "$f" branch)$(pr="$(state_field "$f" pr)"; [ "$pr" = - ] || printf ' PR #%s' "$pr") at $(state_field "$f" rev | cut -c1-7) — the tower merges it: lab merge $P_NAME $(wt_lane "$wt")"
+    TW_WHY="merge queued: $(state_field "$f" branch)$(pr="$(state_field "$f" pr)"; [ "$pr" = - ] || printf ' PR #%s' "$pr") at $(state_field "$f" rev | cut -c1-7) — the tower merges it: lab merge $P_NAME $lane"
     return
   fi
   # shellcheck disable=SC2034 # lu par ginkgo_waits (lib/ginkgo.sh, chargé à la demande)
@@ -148,59 +153,208 @@ tower_waits_for() {
   case "$phase" in
     'in acceptance') TW_WAITS=acceptance
       # lot 10 : les mots de l'utilisateur déjà lus par lab — la tour accepte puis ferme, sans rien lui redemander
-      if words_valid "$wt"; then TW_EVIDENCE=words; TW_WHY="the user's words (\"$WD_SAID\", $(words_where)) recorded by lab: the tower accepts then closes: lab acceptance $P_NAME $(wt_lane "$wt") --accept, then lab close $P_NAME $(wt_lane "$wt")"
-      else acceptance_waits_why "$wt" "$(wt_lane "$wt")"; fi
+      if words_valid "$wt"; then TW_EVIDENCE=words; TW_WHY="the user's words (\"$WD_SAID\", $(words_where)) recorded by lab: the tower accepts then closes: lab acceptance $P_NAME $lane --accept, then lab close $P_NAME $lane"
+      else acceptance_waits_why "$wt" "$lane"; fi
       return ;;
-    'to clarify') TW_WAITS=you; TW_WHY="next step to clarify: lab next $P_NAME $(wt_lane "$wt") names it"; return ;;
+    'to clarify') TW_WAITS=you; TW_WHY="next step to clarify: lab next $P_NAME $lane names it"; return ;;
     waiting) w="$(wait_lane_first "$wt")"; TW_WAITS='date'; TW_WHY="$(wait_summary "$w")"; return ;;
   esac
-  for f in "$LAB_STATE/watch/$P_NAME/$(wt_lane "$wt")"/*; do
+  for f in "$LAB_STATE/watch/$P_NAME/$lane"/*; do
     [ -f "$f" ] || continue; case "$f" in *.log|*.records|*.body|*.tmp.*) continue ;; esac
-    issue="$(watch_state "$f")"
+    watch_state_set "$f"; issue="$WATCH_STATE"
     case "$issue" in armed|waiting|dead) TW_WAITS=ci; TW_WHY="$(watch_get "$f" branch) $issue — $(watch_get "$f" detail)"; return ;; esac
   done
   if [ "$TW_SESSION" = live ]; then TW_WHY="session working"
-  else TW_WHY="no session: lab next $P_NAME $(wt_lane "$wt") starts the next step"; fi
+  else TW_WHY="no session: lab next $P_NAME $lane starts the next step"; fi
 }
-# tower_view : un bloc par couloir hors tour (LANE, WAITS_FOR, WHY, SESSION), puis WAITING_FOR_YOU, sur stderr une phrase repliée
+# tower_yours : rc 0 si l'attente posée par tower_waits_for est l'affaire de l'utilisateur — une recette sur check: seul ou sur ses
+# mots est l'affaire de la tour ; des captures à montrer attendent son oui (lot 07). La vue de la tour et lab app lisent cette règle
+tower_yours() { case "$TW_WAITS:$TW_EVIDENCE" in acceptance:check|acceptance:words) return 1 ;; you:*|acceptance:*) return 0 ;; esac; return 1; }
+# tower_view [point] : un bloc par couloir hors tour (LANE, WAITS_FOR, WHY, SESSION), puis WAITING_FOR_YOU, sur stderr une phrase repliée ;
+# point (lab tower seul, jamais Ginkgo) : l'onglet main et ses passations, puis la santé de la prod (tower_health), avant LANES ; la
+# phrase de la santé après celle des couloirs
 tower_view() {
-  local wt lane yours="" n=0
+  local wt lane yours="" n=0 s
+  TH_RED=''; TH_SAY=()
   for wt in "$P_ROOT"/.worktrees/*/; do
     [ -d "$wt" ] || continue; wt="${wt%/}"
     ! lane_is_tower "$wt" || continue
     lane="$(wt_lane "$wt")"; n=$((n + 1))
     tower_waits_for "$wt"
     kv LANE "$lane"; kv WAITS_FOR "$TW_WAITS"; kv WHY "$TW_WHY"; [ -z "$TW_EVIDENCE" ] || kv EVIDENCE "$TW_EVIDENCE"; kv SESSION "$TW_SESSION"; sep
-    # une recette sur check: seul est l'affaire de la tour ; des captures à montrer attendent le oui de l'utilisateur (lot 07)
-    case "$TW_WAITS:$TW_EVIDENCE" in acceptance:check|acceptance:words) ;; you:*|acceptance:*) yours="${yours:+$yours }$lane" ;; esac
+    ! tower_yours || yours="${yours:+$yours }$lane"
   done
   deploy_queue_status_kv   # file de prod de chaque cible, après les couloirs (lot 05)
-  kv LANES "$n"; kv WAITING_FOR_YOU "$yours"
-  if [ -n "$yours" ]; then log_wrap "Waiting for you: $yours."; else log_wrap "Nothing waits for you in $P_NAME."; fi
+  # point : l'onglet main et ses passations (lots 02 et 03 d'onglet-tower) — rien sans main ni passation ; lancé par la tour, le point
+  # agit seul (main_tab_view point) ; une tour plus vieille que sa skill reçoit « relis ta skill » ; lab ginkgo state garde sa lecture
+  # sans aucun appel cmux
+  if [ "${1:-}" = point ]; then main_tab_load; main_tab_skill_nudge; main_tab_view point; [ -z "$MT_YOURS" ] || yours="${yours:+$yours }$MT_YOURS"; fi
+  [ "${1:-}" != point ] || tower_health || true   # un rouge de santé ne bloque rien, pas même lab tower
+  kv LANES "$n"; kv WAITING_FOR_YOU "$yours"   # des couloirs (et main, au point de lab tower) : Ginkgo et la tour la lisent
+  if [ -n "$yours" ]; then log_wrap "Waiting for you: $yours."; elif [ -z "$TH_RED" ]; then log_wrap "Nothing waits for you in $P_NAME."; fi
+  for s in "${TH_SAY[@]+"${TH_SAY[@]}"}"; do log_wrap "$s"; done
   tower_propose_kv
 }
 
+# main_tab_load : lib/main_tab.sh, chargé à la demande (jamais la ligne des modules de bin/lab, lot 02 d'onglet-tower)
+main_tab_load() { declare -F main_tab_read >/dev/null || . "$LAB_ROOT/lib/main_tab.sh"; }
+
+# ---------- santé de la prod (lot 02 de conformite) ----------
+# health.<cible>= (config du projet, écrite à la main, en lecture seule) : rc 0 = vert ; rc ≠ 0 avec une dernière ligne de paires
+# nom=entier = rouge chiffré ; rc ≠ 0 sans elle, ou délai dépassé = lecture ratée, rouge à la deuxième de suite. Un verrou par cible
+# (shlock, $LAB_STATE/<projet>/health/.lock-<cible>) : une lecture à la fois. Lue par lab tower au
+# plus une fois par LAB_HEALTH_EVERY s (600), depuis le checkout principal, sous LAB_HEALTH_TIMEOUT s (60). $LAB_STATE/<projet>/health/
+# <cible> (KEY=value, 600 : state green|failing|red, since, last, rc, numbers, fails, notified) et <cible>.log (sortie entière, 600,
+# réécrit à chaque lecture). Un rouge ne bloque rien (ni entrée d'attente, ni file de prod) : une notification cmux vers l'onglet de la
+# tour au passage au rouge, une par épisode. Aucun texte venu de la prod n'atteint la tour hors des paires nom=entier (health_pairs).
+HEALTH_WORD='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_'   # listé, jamais en plage : même lecture quelle que soit la locale
+HEALTH_NAME='abcdefghijklmnopqrstuvwxyz0123456789_'   # noms des paires en minuscules : aucune ne se lit comme une clé KEY=value de lab
+# health_pairs <ligne> → HEALTH_PAIRS, les paires séparées par une espace ; rc 1 et vide pour toute autre ligne : 8 paires et 200 octets
+# au plus, nom en minuscules de 40 caractères au plus qui ne commence pas par un chiffre, entier sans zéro de tête de 9 chiffres au plus
+health_pairs() {
+  local p n v; local -a a=()
+  HEALTH_PAIRS=''
+  [ -n "$1" ] && [ "${#1}" -le 200 ] || return 1
+  case "$1" in *[!"$HEALTH_NAME"=\ ]*) return 1 ;; esac
+  IFS=' ' read -r -a a <<<"$1"
+  [ "${#a[@]}" -ge 1 ] && [ "${#a[@]}" -le 8 ] || return 1
+  for p in "${a[@]}"; do
+    case "$p" in *=*) ;; *) return 1 ;; esac
+    n="${p%%=*}"; v="${p#*=}"
+    case "$n" in ''|[0123456789]*) return 1 ;; esac
+    case "$v" in ''|*[!0123456789]*|0?*) return 1 ;; esac
+    [ "${#n}" -le 40 ] && [ "${#v}" -le 9 ] || return 1
+  done
+  for p in "${a[@]}"; do HEALTH_PAIRS="${HEALTH_PAIRS:+$HEALTH_PAIRS }$p"; done
+}
+# health_load <fichier d'état> : HS_STATE HS_SINCE HS_LAST HS_RC HS_NUMBERS HS_FAILS HS_NOTIFIED, relus et revérifiés ; vides sans état
+health_load() {
+  local k v
+  HS_STATE=''; HS_SINCE=''; HS_LAST=''; HS_RC=''; HS_NUMBERS=''; HS_FAILS=0; HS_NOTIFIED=''
+  [ -f "$1" ] || return 0
+  while IFS='=' read -r k v; do
+    case "$k" in state) HS_STATE="$v" ;; since) HS_SINCE="$v" ;; last) HS_LAST="$v" ;; rc) HS_RC="$v" ;; numbers) HS_NUMBERS="$v" ;;
+      fails) HS_FAILS="$v" ;; notified) HS_NOTIFIED="$v" ;; esac
+  done <"$1"
+  case "$HS_STATE" in green|failing|red) ;; *) HS_STATE='' ;; esac
+  case "$HS_SINCE" in ''|*[!0123456789]*) HS_SINCE='' ;; esac
+  case "$HS_LAST" in ''|*[!0123456789]*) HS_LAST='' ;; esac
+  case "$HS_RC" in ''|*[!0123456789]*) HS_RC='' ;; esac
+  case "$HS_FAILS" in ''|*[!0123456789]*) HS_FAILS=0 ;; esac
+  if [ -n "$HS_NUMBERS" ]; then health_pairs "$HS_NUMBERS" || true; HS_NUMBERS="$HEALTH_PAIRS"; fi
+}
+# health_due <maintenant> <cadence> : la lecture est due (jamais lue, état illisible, cadence passée ou horloge revenue en arrière)
+health_due() { [ -z "$HS_LAST" ] || [ -z "$HS_STATE" ] || [ $(($1 - HS_LAST)) -ge "$2" ] || [ "$1" -lt "$HS_LAST" ]; }
+# health_read <cible> <commande> <fichier d'état> <maintenant> <délai> : une lecture, puis l'état suivant (HS_*) écrit ; HEALTH_NOTIFY=1
+# quand ce passage au rouge doit être notifié — décidé ici, sous le verrou, et marqué seulement si cmux peut le recevoir
+health_read() {
+  local t="$1" f="$3" now="$4" limit="$5" dir="${3%/*}" rc=0 line=''
+  ( umask 077; mkdir -p "$dir" && : >"$dir/.out.$$" && printf '# health.%s at %s\n' "$t" "$now" >"$dir/.log.$$" ) || return 0
+  (cd "$P_ROOT" && with_timeout "$limit" bash -c "$2") </dev/null >"$dir/.out.$$" 2>>"$dir/.log.$$" || rc=$?
+  { printf -- '--- stdout\n'; cat "$dir/.out.$$"; printf -- '\n--- rc=%s\n' "$rc"; } >>"$dir/.log.$$" 2>/dev/null || true
+  line="$(tail -n 1 "$dir/.out.$$" 2>/dev/null | head -c 512)" || true
+  rm -f "$dir/.out.$$"; mv -f "$dir/.log.$$" "$f.log" 2>/dev/null || rm -f "$dir/.log.$$"
+  health_pairs "$line" || true
+  if [ "$rc" = 0 ]; then
+    [ "$HS_STATE" = green ] || HS_SINCE="$now"; HS_STATE=green; HS_FAILS=0; HS_NOTIFIED=''; HS_NUMBERS="$HEALTH_PAIRS"
+  elif [ "$rc" != 124 ] && [ -n "$HEALTH_PAIRS" ]; then   # délai dépassé : lecture ratée, même après des paires écrites
+    [ "$HS_STATE" = red ] || HS_SINCE="$now"; HS_STATE=red; HS_FAILS=0; HS_NUMBERS="$HEALTH_PAIRS"
+  else
+    HS_FAILS=$((HS_FAILS + 1))
+    if [ "$HS_STATE" = red ]; then :   # un rouge en cours le reste, avec ses derniers nombres lus
+    elif [ "$HS_FAILS" -ge 2 ]; then HS_STATE=red; HS_SINCE="$now"; HS_NUMBERS=''
+    else [ "$HS_STATE" = failing ] || HS_SINCE="$now"; HS_STATE=failing; HS_NOTIFIED=''; HS_NUMBERS=''; fi
+  fi
+  HS_RC="$rc"; HS_LAST="$now"
+  if [ "$HS_STATE" = red ] && [ -z "$HS_NOTIFIED" ] && has_cmux; then HS_NOTIFIED="$now"; HEALTH_NOTIFY=1; fi
+  health_save "$f"
+}
+health_save() {
+  state_write "$1" "$(printf 'state=%s\nsince=%s\nlast=%s\nrc=%s\nnumbers=%s\nfails=%s\nnotified=%s' "$HS_STATE" "$HS_SINCE" "$HS_LAST" \
+    "$HS_RC" "$HS_NUMBERS" "$HS_FAILS" "$HS_NOTIFIED")"$'\n'
+}
+# tower_health : pour chaque clé health.<cible>= (nom [A-Za-z0-9][A-Za-z0-9._-]*, première occurrence), la lecture quand elle est due,
+# puis HEALTH=<cible> <état> since <UTC> <nombres|unreadable rc=N> et HEALTH_RED=<cibles> ; TH_RED et TH_SAY (phrases du rouge) pour
+# tower_view. Aucune clé : rien, ni ligne ni processus de plus.
+tower_health() {
+  local line t cmd f now='' every="${LAB_HEALTH_EVERY:-600}" limit="${LAB_HEALTH_TIMEOUT:-60}" d when detail say wt; local -a ts=() cmds=()
+  [ -f "$LAB_PROJECTS/$P_NAME/config" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in health.*=*) ;; *) continue ;; esac
+    t="${line#health.}"; t="${t%%=*}"
+    # .log en toute casse : le disque du Mac ne la distingue pas, l'état d'une telle cible écraserait le journal d'une autre
+    case "$t" in ''|[!"$HEALTH_WORD"]*|_*|*[!"$HEALTH_WORD".-]*|*.[lL][oO][gG]) continue ;; esac
+    cmd="${line#health."$t"=}"
+    case "$cmd" in *[![:space:]]*) ;; *) continue ;; esac   # commande vide : rien à lire, jamais un vert
+    ! in_words "$t" "${ts[@]+"${ts[@]}"}" || continue
+    ts+=("$t"); cmds+=("$cmd")
+  done <"$LAB_PROJECTS/$P_NAME/config"
+  [ "${#ts[@]}" -gt 0 ] || return 0
+  case "$every" in ''|*[!0123456789]*) every=600 ;; esac
+  case "$limit" in ''|*[!0123456789]*) limit=60 ;; esac
+  now="$(cloud_epoch)"; wt="$(worktree_path "$TOWER_LANE")"
+  for d in "${!ts[@]}"; do
+    t="${ts[$d]}"; cmd="${cmds[$d]}"; f="$LAB_STATE/$P_NAME/health/$t"
+    health_load "$f"; HEALTH_NOTIFY=0
+    # une lecture à la fois par cible : un second lab tower qui trouve le verrou pris affiche l'état sans relire ; celui qui le prend
+    # relit l'état, qu'un autre a pu écrire entre-temps
+    if health_due "$now" "$every" && ( umask 077; mkdir -p "${f%/*}" && /usr/bin/shlock -f "${f%/*}/.lock-$t" -p "$$" ) 2>/dev/null; then
+      health_load "$f"; ! health_due "$now" "$every" || health_read "$t" "$cmd" "$f" "$now" "$limit"
+      rm -f "${f%/*}/.lock-$t"
+    fi
+    [ -n "$HS_STATE" ] || continue
+    when="$(date -u -r "${HS_SINCE:-$now}" '+%Y-%m-%dT%H:%M:%SZ|%Y-%m-%d %H:%M')" || when="?|?"
+    if [ -n "$HS_NUMBERS" ]; then detail="$HS_NUMBERS"; elif [ "$HS_STATE" != green ]; then detail="unreadable rc=${HS_RC:-?}"; else detail=''; fi
+    kv HEALTH "$t $HS_STATE since ${when%%|*}${detail:+ $detail}"
+    [ "$HS_STATE" = red ] || continue
+    TH_RED="${TH_RED:+$TH_RED }$t"
+    if [ -n "$HS_NUMBERS" ]; then say="$HS_NUMBERS"
+    elif [ "$HS_RC" = 124 ]; then say="unreadable twice in a row (timeout after $limit s)"
+    else say="unreadable twice in a row (rc ${HS_RC:-?})"; fi
+    say="Health of $t red since ${when#*|} UTC: $say — nothing blocked."
+    TH_SAY+=("$say")
+    [ "$HEALTH_NOTIFY" != 1 ] || cmux_notify "$P_NAME · $TOWER_LANE" "$say" "$(wt_ws "$wt")" "$(wt_surface "$wt")"
+  done
+  kv HEALTH_RED "$TH_RED"
+}
+
 # ---------- lab tower [projet] ----------
+# Un seul geste par appel : --lift-deny, --main-tab (avec --yes|--no, ou --all), --handover, --handover-done <fichier>
 cmd_tower() {
-  local agent="" all=0 lift="" answer=list; local -a pos=() opts=()
+  local agent="" all=0 lift="" mt="" ho="" hod="" answer=list; local -a pos=() opts=()
   while [ "$#" -gt 0 ]; do
     case "$1" in --agent) [ "$#" -ge 2 ] || usage; agent="$2"; shift 2 ;; --all) all=1; shift ;; --no-install) opts+=(--no-install); shift ;;
-      --lift-deny) lift=1; shift ;; --yes) answer=yes; shift ;; --no) answer=no; shift ;; -*) usage ;; *) pos+=("$1"); shift ;; esac
+      --lift-deny) lift=1; shift ;; --yes) answer=yes; shift ;; --no) answer=no; shift ;;
+      --main-tab) mt=1; shift ;; --handover) ho=1; shift ;; --handover-done) [ "$#" -ge 2 ] || usage; hod="$2"; shift 2 ;;
+      -*) usage ;; *) pos+=("$1"); shift ;; esac
   done
   [ "${#pos[@]}" -le 1 ] || usage
-  [ -n "$lift" ] || [ "$answer" = list ] || usage   # --yes et --no ne répondent qu'à --lift-deny
-  [ -z "$lift" ] || { [ "$all" = 0 ] && [ -z "$agent" ] && [ "${#opts[@]}" = 0 ]; } || usage
-  if [ "$all" = 1 ]; then [ "${#pos[@]}" = 0 ] && [ -z "$agent" ] || usage; tower_all "${opts[@]+"${opts[@]}"}"; return; fi
+  [ -n "$lift$mt" ] || [ "$answer" = list ] || usage   # --yes et --no ne répondent qu'à --lift-deny ou --main-tab
+  [ "$(printf '%s' "$lift$mt$ho${hod:+1}" | wc -c | tr -d ' ')" -le 1 ] || usage
+  [ -z "$lift$mt$ho$hod" ] || { [ -z "$agent" ] && [ "${#opts[@]}" = 0 ]; } || usage
+  [ "$all" = 0 ] || [ -z "$lift$ho$hod" ] || usage
+  if [ "$all" = 1 ]; then
+    [ "${#pos[@]}" = 0 ] && [ -z "$agent" ] || usage
+    if [ -n "$mt" ]; then [ "$answer" = list ] || usage; main_tab_load; main_tab_all; return; fi
+    tower_all "${opts[@]+"${opts[@]}"}"; return
+  fi
   local p wt; p="$(resolve_project "${pos[0]:-}")"; load_project "$p"
   [ -z "$agent" ] || [ "$agent" = claude ] || die "the tower runs under Claude only (agent $agent refused): lab tower $p"
   wt="$(worktree_path "$TOWER_LANE")"
   if [ -d "$wt" ]; then
     lane_is_tower "$wt" || die "lane $TOWER_LANE of $p is not a tower (not created by lab tower): rename or close it (lab permanent $p $TOWER_LANE off, then lab close $p $TOWER_LANE), then lab tower $p"
     if [ -n "$lift" ]; then tower_lift "$wt" "$answer"; return 0; fi
+    if [ -n "$mt$ho$hod" ]; then
+      main_tab_load
+      if [ -n "$mt" ]; then main_tab_act "$answer"; elif [ -n "$ho" ]; then main_tab_handover; else main_tab_done "$hod"; fi
+      return 0
+    fi
     kv PROJECT "$p"; kv TOWER present; kv WORKTREE "$wt"; sep
-    tower_view; return 0
+    watch_prune_gone   # chaque passage de la tour retire les dossiers de veilleurs des couloirs retirés (lot 01 de restes-cloud)
+    tower_view point; return 0
   fi
   [ -z "$lift" ] || die "no tower in $p: lab tower $p creates it, then lab tower $p --lift-deny"
+  [ -z "$mt$ho$hod" ] || die "no tower in $p: its main tab hands over to the tower only — lab tower $p creates it"
   # shellcheck disable=SC2034 # lu par cmd_new (bin/lab)
   NEW_ROLE=tower; cmd_new "$p" "$TOWER_LANE" --permanent --agent claude --title Tower "${opts[@]+"${opts[@]}"}"   # variable non exportée : rien n'en hérite
   wake_install alarm || true   # lot 04 : lab wake relance une tour sans session dans l'heure — encore faut-il son alarme horaire
@@ -302,8 +456,10 @@ merge_queue_put() {
   mkdir -p "$(dirname "$f")"
   if [ "$7" != - ]; then cp "$7" "$f.body"; else rm -f "$f.body"; fi
   state_write "$f" "$(printf 'lane=%s\nbranch=%s\npr=%s\nrev=%s\nstart=%s\nat=%s\ntitle=%s\nretire=%s' "$1" "$2" "$3" "$4" "$5" "$(cloud_epoch)" "$title" "${*:8}")"
+  snap_mark_lane "$P_NAME" "$1"
 }
-merge_queue_drop() { [ -z "${1:-}" ] || rm -f "$1" "$1.body"; }
+# merge_queue_drop <demande> : retirée ; son couloir, le dossier qui la contient, est réécrit dans l'instantané
+merge_queue_drop() { [ -z "${1:-}" ] || { rm -f "$1" "$1.body"; local d="${1%/*}"; snap_mark_lane "$P_NAME" "${d##*/}"; }; }
 # merge_queue_cause <message> → la cause d'un refus durable, écrite pour l'utilisateur sans commande git (C7) ; vide : panne passagère
 # (gh, réseau, doctor du projet), la demande reste en file pour le point suivant (revue du lot 06)
 merge_queue_cause() {

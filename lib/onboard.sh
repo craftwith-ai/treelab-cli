@@ -89,7 +89,7 @@ Nothing becomes public: if your project is not on GitHub yet, the agent offers t
 
 In doubt? lab doctor checks the installation and says what to fix. lab help lists the commands.
 
-Next: this repository is registered in Treelab, without touching your files. Its tower opens in a "tower" tab: it watches your lanes and tells you what waits for you. Then an agent opens in the project's "main" tab and asks for your first need.
+Next: this repository is registered in Treelab, without touching your files. Its tower opens in a "tower" tab, pinned first: it watches your lanes and tells you what waits for you. Then an agent opens in a "welcome" tab and asks for your first need; that tab closes by itself once your first lane is open.
 SCREEN
       ;;
   esac
@@ -116,7 +116,7 @@ onboard_screens() {
 # onboard_tower : lab onboard d'un projet neuf lui crée sa tour (lot 04 d'autonomie-tours), par lab tower dans un processus à part
 # (tower_spawn), sans installation ; seuls TOWER= et TOWER_WHY= sortent. Sans cmux, sans Claude (la tour tourne sous Claude seul,
 # même dans un projet Codex) ou copie principale modifiée : l'accueil continue, TOWER=skipped, la cause et le remède. L'onglet de la
-# tour s'ouvre en fond : l'appelant rend ensuite le focus à main.
+# tour s'ouvre en fond, épinglé en tête : l'appelant rend ensuite le focus à welcome.
 onboard_tower() {   # [cause imposée par l'appelant]
   local why="${1:-}" fix="lab tower $P_NAME"
   if [ -n "$why" ]; then :
@@ -145,6 +145,77 @@ onboard_prompt() {
   # shellcheck disable=SC2016 # « $onboarding » est le texte que Codex lit, pas une variable
   case "$1" in claude) call='/onboarding' ;; codex) call='$onboarding' ;; *) die "unknown agent: $1" ;; esac
   printf "%s Project %s: guide me to my first lane." "$call" "$2"
+}
+
+# ---------- l'onglet d'accueil (lot 01 d'onglet-tower) ----------
+# welcome porte l'agent de lab onboard et se ferme seul une fois le premier couloir ouvert : lab new, lancé depuis cet onglet, détache
+# un processus (nouvelle session POSIX, patron de watch_spawn : la fermeture de l'onglet ne le tue pas) qui attend la fin du tour de
+# l'agent, LAB_WELCOME_WAIT secondes au plus, puis ferme ce seul onglet par son identifiant. La conversation reste reprenable.
+ONBOARD_TAB=welcome
+WELCOME_WAIT_S=120
+# welcome_tab_id <workspace> <référence> → l'identifiant de l'onglet, stable quand cmux renumérote ses références
+welcome_tab_id() {
+  cmx tree --workspace "$1" --json --id-format both 2>/dev/null | jq -r --arg s "$2" \
+    '[.. | objects | select(.ref? == $s or .id? == $s) | .id // empty] | first // empty' 2>/dev/null || true
+}
+# welcome_closable <workspace> <identifiant de welcome> <identifiant du couloir> : l'onglet s'appelle toujours welcome et celui du
+# couloir est ouvert à côté — jamais un autre onglet, jamais le dernier ; lecture en échec : non
+welcome_closable() {
+  cmx tree --workspace "$1" --json --id-format both 2>/dev/null | jq -e --arg t "$2" --arg l "$3" --arg n "$ONBOARD_TAB" '
+    [.. | objects | select((.ref? // "") | startswith("surface:"))]
+    | any(.[]; .id == $t and .title == $n) and any(.[]; .id == $l)' >/dev/null 2>&1
+}
+# welcome_close_later <workspace> <onglet du couloir> : sans couloir ouvert dans cmux, hors de l'onglet welcome de ce même espace ou
+# avec un couloir nommé welcome (créé avant que ce nom soit réservé) : rien
+welcome_close_later() {
+  local ws="$1" here tab lane pid=- transcript=- f since; f="$LAB_STATE/$P_NAME/welcome.log"
+  [ -n "$ws" ] && [ -n "$2" ] && has_cmux && [ ! -e "$(worktree_path "$ONBOARD_TAB")" ] || return 0
+  here="$(cmux_identify)"; [ -n "$here" ] || return 0
+  tab="${here#*$'\t'}"; here="${here%%$'\t'*}"; here="${here:-${CMUX_WORKSPACE_ID:-}}"
+  [ -n "$here" ] && cmux_same_workspace "$here" "$ws" || return 0
+  tab="$(welcome_tab_id "$ws" "$tab")"; lane="$(welcome_tab_id "$ws" "$2")"
+  [ -n "$tab" ] && [ -n "$lane" ] && [ "$tab" != "$lane" ] && welcome_closable "$ws" "$tab" "$lane" || return 0
+  if [ "${LAB_AGENT_SCAN:-1}" != 0 ] && pid="$(agent_pid_found)"; then
+    [ "$(detect_agent "$pid")" != claude ] || transcript="$(welcome_transcript)"
+  else pid=-; fi
+  since="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  kv WELCOME closing
+  if [ "$pid" = - ]; then log_wrap "this $ONBOARD_TAB tab closes by itself: what follows happens in the lane's tab."
+  else log_wrap "this $ONBOARD_TAB tab closes by itself after your reply, $WELCOME_WAIT_S s at most: keep it short, what follows happens in the lane's tab. The conversation stays resumable."; fi
+  mkdir -p "$LAB_STATE/$P_NAME"
+  if [ "${LAB_WATCH_SYNC:-0}" = 1 ]; then welcome_close_run "$ws" "$tab" "$lane" "$pid" "${transcript:--}" "$since" >"$f" 2>&1 || true; return 0; fi
+  ( cd /; exec perl -e 'use POSIX (); POSIX::setsid(); exec @ARGV or exit 127' /bin/bash -c '
+      set -euo pipefail
+      for f in log git cmux onboard; do . "$LAB_ROOT/lib/$f.sh"; done
+      welcome_close_run "$@"' _ "$ws" "$tab" "$lane" "$pid" "${transcript:--}" "$since" </dev/null >"$f" 2>&1 3>&- ) &
+}
+# welcome_transcript → la conversation de la session Claude appelante, d'après son identifiant ; vide si elle n'est pas trouvée
+welcome_transcript() {
+  local f sid="${CLAUDE_CODE_SESSION_ID:-}"
+  (LC_ALL=C; case "$sid" in ''|*[!A-Za-z0-9-]*) exit 1 ;; esac) || return 0
+  for f in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$sid".jsonl; do [ ! -f "$f" ] || { printf '%s\n' "$f"; return 0; }; done
+}
+# welcome_turn_over <conversation> <depuis> : la dernière réponse de l'agent depuis cette date finit son tour (end_turn)
+welcome_turn_over() {
+  tail -n 200 "$1" 2>/dev/null | jq -cR 'fromjson? | select(.type == "assistant")' 2>/dev/null | jq -es --arg since "$2" \
+    '[.[] | select((.timestamp // "") > $since)] | last | .message.stop_reason == "end_turn"' >/dev/null 2>&1
+}
+# welcome_close_run <workspace> <welcome> <couloir> <pid de l'agent|-> <conversation|-> <depuis> : agent vivant, fermeture de force (sans
+# elle cmux refuse un onglet où un programme vit) ; agent parti ou absent, jamais de force : un autre programme y serait protégé
+welcome_close_run() {
+  local ws="$1" tab="$2" lane="$3" pid="$4" end; local -a force=()
+  end=$(($(date +%s) + ${LAB_WELCOME_WAIT:-$WELCOME_WAIT_S}))
+  if [ "$pid" != - ]; then
+    while kill -0 "$pid" 2>/dev/null && [ "$(date +%s)" -lt "$end" ]; do
+      if [ "$5" != - ] && welcome_turn_over "$5" "$6"; then break; fi
+      sleep 1
+    done
+    ! kill -0 "$pid" 2>/dev/null || force=(--force)
+  fi
+  welcome_closable "$ws" "$tab" "$lane" \
+    || { log "welcome tab kept: renamed, already closed, or the lane's tab is no longer open"; return 0; }
+  if cmx close-surface --workspace "$ws" --surface "$tab" "${force[@]+"${force[@]}"}" >/dev/null 2>&1; then log "welcome tab closed"
+  else log "welcome tab kept: cmux refused to close it, close it yourself"; fi
 }
 
 # ---------- lab help ----------
@@ -183,7 +254,7 @@ lab — from need to delivery, one lane at a time
 Details of a command: lab help <command>
 Words, with their former French names: lab help glossary
 
-Other commands: init, open, launch, list, merge, sync, promote, batch, handoff, now, due, account, cloud, proof, lock, unlock, served, services, deploy, watch, wake, hook, uninstall.
+Other commands: init, open, launch, list, merge, sync, promote, batch, handoff, now, due, account, cloud, proof, lock, unlock, served, services, deploy, watch, wake, hook, app, docker, uninstall.
 
 Full technical reference: lab --help
 PAGE
@@ -208,7 +279,7 @@ lab onboard — guided tour, from your repository to the first lane
 
   lab onboard [--agent claude|codex]
 
-Run it in your git repository's folder. Three screens present the words, the cycle and the guarantees. Then the repository is registered as a project, without touching your files, the project's tower opens in its "tower" tab (lab help tower), and an agent opens in the project's "main" tab: it asks for your need and opens your first lane. Without cmux, without Claude or with uncommitted changes in the main checkout, the tower is skipped (TOWER=skipped) with its cause and the command that creates it later.
+Run it in your git repository's folder. Three screens present the words, the cycle and the guarantees. Then the repository is registered as a project, without touching your files, the project's tower opens in its "tower" tab, pinned first (lab help tower), and an agent opens in a "welcome" tab: it asks for your need and opens your first lane, then that tab closes by itself (WELCOME=closing); its conversation stays resumable. Without cmux, without Claude or with uncommitted changes in the main checkout, the tower is skipped (TOWER=skipped) with its cause and the command that creates it later.
 
 Running the command again creates nothing twice. Without cmux, it prints the command to run yourself (NEXT_COMMAND).
 
@@ -322,14 +393,22 @@ lab tower — the tower: what each lane waits for
   lab tower [project] [--no-install]
   lab tower --all
   lab tower [project] --lift-deny [--yes|--no]
+  lab tower [project] --main-tab [--yes|--no]
+  lab tower [project] --handover
+  lab tower [project] --handover-done <file>
+  lab tower --all --main-tab
 
-Every project has a tower: lab onboard creates it for a new project. The first call creates the tower of the project: the permanent lane tower, started under Claude in bypassPermissions mode (the first start may ask you once to confirm that mode). Its session applies the tower skill: about every 30 minutes it checks every lane, relaunches a stopped one, delivers what is ready, and lists what waits for you. It never answers a question in your place. TOWER=created gives the result; a tower under Codex is refused.
+Every project has a tower: lab onboard creates it for a new project. The first call creates the tower of the project: the permanent lane tower, started under Claude in bypassPermissions mode (the first start may ask you once to confirm that mode). Its tab is the only one lab pins, first in the project's workspace. Its session applies the tower skill: about every 30 minutes it checks every lane, relaunches a stopped one, delivers what is ready, and lists what waits for you. It never answers a question in your place. TOWER=created gives the result; a tower under Codex is refused.
 
 Next calls print TOWER=present, then one block per lane: LANE=, WAITS_FOR= (you, merge, acceptance, close, date, ci or nothing), WHY= and SESSION= (live or none); WAITING_FOR_YOU= names the lanes that wait for you. merge: the lane's agent queued its batch, the tower merges it without asking you. close: acceptance passed, the tried revision is served and verified, and its prod check is green — the tower closes the lane alone.
 
 In a project with a tower, only the tower merges, deploys and closes; a lane agent is queued (lab merge, lab deploy) or refused with a pointer to the tower (lab close, a raw merge or push to the main branches). If the shared .claude/settings.json forbids agents to push or merge, PROPOSE=lift-deny names those rules once: --lift-deny lists them, --yes removes only them in the tower (the lab guard replaces them), --no keeps them; the answer is written and never asked again.
 
 In every project, with or without a tower, a question, a permission request, an acceptance ready or a refused lab next sends a cmux alert to the tab of its lane.
+
+A project opened by an older lab may still have a main tab: it hands over to the tower, then closes, by itself, and nothing is ever typed in it nor asked to you. MAIN_TAB= tells what lives there (shell, agent, busy, unreadable); no line once it is gone. Each check run by the tower acts (MAIN_TAB_ACTION=): an idle terminal closes, never the last tab nor the one you are looking at; a busy or unreadable tab is never closed and waits for you. A Claude session at rest is never disturbed: a copy of its conversation, without a screen and never saved, writes its handover under three headings (10 minutes and 2 dollars at most; otherwise lab keeps your last 10 messages and says why), stored outside the repository, then the tab closes and the tower is told. A Codex session is invited once by a cmux message; without its handover 24 hours later, lab writes it from your last messages. --main-tab does the same at once; --no keeps the tab for good. --handover is run by that session, or by the same conversation resumed elsewhere, text on standard input. HANDOVER= points to a handover to read: the tower sums it up in three lines and asks you which needs open a lane, then --handover-done. A tower session started before its skill was updated is told once to read it again (TOWER_SKILL=told). --all --main-tab, under main_tab=handover in ~/.lab/config only, creates the tower of each project that has a main tab and none.
+
+Production health: health.<target>=, written by hand in the project configuration, is a read-only command that lab tower runs at most once every LAB_HEALTH_EVERY seconds (600), from the main checkout, within LAB_HEALTH_TIMEOUT seconds (60). Exit code 0: green. Another exit code with a last output line made of lowercase name=integer pairs only: red, with those numbers. Another exit code without that line, or the timeout: an unreadable read, red at the second in a row. One read at a time per target. Each target prints HEALTH=<target> green|failing|red since <UTC time> <numbers>, then HEALTH_RED= names the red ones. A red health waits for you with its numbers and sends one cmux alert to the tower's tab when it turns red; it blocks nothing, and no other text from production reaches the tower: the full output of the last read stays in lab's state, <project>/health/<target>.log, readable by you only.
 
 --all offers a tower to each registered project that has none: CANDIDATE= names it, SKIPPED= names a project that cannot get one yet, with its cause (uncommitted changes, a branch feat/tower already there). In a terminal, one question [y/N] per project, and only the yes get their tower (CREATED=, DECLINED=); without a terminal, nothing is created and CONFIRM=needed asks the agent to put these questions to you. --no-install skips the installation of the project's dependencies. lab wake restarts within the hour a tower without a session, and lab doctor shows the tower of each project (absent, no session or alive), as information only.
 
@@ -361,7 +440,7 @@ The voice engine is only ears and mouth: the work stays with the tower and the l
 
 Ginkgo also settles what the lanes wait for. lab ginkgo question reads the exact question of a lane: its whole choice box (questions, choices, descriptions, several choices, the recommended one, and a QID), or the end of the last message of a session that waits, or WAITS=none. lab ginkgo answer types the answers of the whole box in the lane's tab, one question after the other, the extra words going into "Other"; a question changed since it was read (QID), an unknown choice or a question left out are refused before any key. lab ginkgo order types an order in the tower's tab ("Ginkgo, voice of the user: ..."), and lab ginkgo reply reads the tower's answer. Closing a lane is never a free order: lab ginkgo close reads it back first (READBACK=, TOKEN=) and sends it to the tower only with that token, said back within 120 seconds.
 
-Ginkgo also speaks first when a lane starts waiting for you: a question, a permission, a blocked lane, an acceptance ready or a close to confirm; merges, CI and dates stay silent. Every 10 seconds the app reads lab ginkgo news. With the conversation open, it says out loud which lane asks and what, in a few words; closed, a Ginkgo notification with a sound opens the conversation when clicked, and the conversation starts with that news. Each wait is announced once, a new question again; what already waits when Ginkgo starts is not announced (lab ginkgo news --baseline), and a news Ginkgo could not say before the conversation closed is decided again (--forget). ginkgo_speak=always|conversation|never in ~/.lab/config: always by default (out loud when open, a notification when closed), conversation (out loud only), never. Quiet hours, ginkgo_quiet=21:00-08:00 by default, Mac time (off for none): nothing while the conversation is closed, then one notification sums up what still waits; a conversation you open yourself gets the news as usual.
+Ginkgo also speaks first when a lane starts waiting for you: a question, a permission, a blocked lane, an acceptance ready or a close to confirm; merges, CI and dates stay silent. Every 30 seconds the app reads lab ginkgo news. With the conversation open, it says out loud which lane asks and what, in a few words; closed, a Ginkgo notification with a sound opens the conversation when clicked, and the conversation starts with that news. Each wait is announced once, a new question again; what already waits when Ginkgo starts is not announced (lab ginkgo news --baseline), and a news Ginkgo could not say before the conversation closed is decided again (--forget). ginkgo_speak=always|conversation|never in ~/.lab/config: always by default (out loud when open, a notification when closed), conversation (out loud only), never. Quiet hours, ginkgo_quiet=21:00-08:00 by default, Mac time (off for none): nothing while the conversation is closed, then one notification sums up what still waits; a conversation you open yourself gets the news as usual.
 
 Ginkgo.app comes with treelab, built and signed: nothing to install, on an Apple Silicon Mac with macOS 14 or later (elsewhere, lab ginkgo refuses and the rest of treelab works); a development checkout builds it from its sources. Your own OpenAI API key is used: the first lab ginkgo in a terminal asks for it, hidden, and stores it in the macOS keychain (lab ginkgo key openai does the same at any time); lab ginkgo status says whether it is there (KEY=present), never the key itself, and where the app comes from (SOURCE=release|checkout). macOS asks once for the microphone (again after each update); lab doctor says whether the shipped app is in place. ginkgo_model= in ~/.lab/config picks another OpenAI realtime model.
 
@@ -395,12 +474,13 @@ HELP
     status) cat <<'HELP'
 lab status — see a project's detailed state
 
-  lab status [project]
+  lab status [project] [lane]
 
-The project (folder, branch, merge target, default agent), then each lane as in lab list, the pending deliveries and the files touched by two lanes at once. Read only, except a finished watcher whose pull request was merged or closed outside it: its outcome is updated.
+The project (folder, branch, merge target, default agent), then each lane as in lab list, the pending deliveries and the files touched by two lanes at once. With a lane: the project, that lane alone and the files it shares with another one; an unknown lane is refused with the names of the open ones. GitHub is asked once for the whole project: without an answer after 20 seconds, PR= stays empty and one line says so. Read only, except a finished watcher whose pull request was merged or closed outside it: its outcome is updated. A removed lane still shows its last watcher outcome, PATH=(removed), until the next lab next or tower pass: its finished watchers are then deleted, one line each in watch-removed.log, in the lab state folder.
 
 Example:
   lab status myproject
+  lab status myproject mylane
 HELP
       ;;
     top) cat <<'HELP'
@@ -422,6 +502,27 @@ One gesture at a time, without confirmation: lab takes a fresh snapshot, checks 
 Example:
   lab top
   lab top --cut idle
+HELP
+      ;;
+    app) cat <<'HELP'
+lab app — what Treelab.app reads, and the tab it brings forward
+
+  lab app lanes [project [lane…]]
+  lab app snapshot [--reader <pid>] [project [lane…]]
+  lab app focus <project> <lane>
+
+lanes reads every registered project, one project or some of its lanes, as the tower sees them: per lane outside the tower, what it waits for (WAITS_FOR=, WHY=), whether a session runs (SESSION=), its current batch (BATCH=, BATCH_STATE=) and whether it waits for you (FOR_YOU=yes|no, the tower's rule); per project, its lane count, how many wait for you (WAITING=) and the terminal app that opens its lanes (TERMINAL_APP=, and TERMINAL_SOURCE= for where that choice comes from: project, global, cmux, fork or none); then the total (WAITING_FOR_YOU=), lab's language (LANG=en|fr) and each terminal app installed on the Mac (TERMINAL_FOUND=). Each block also names the exact files and folders whose change can change its answer (WATCH=, WATCH_ENTRIES=), and per lane the paths lab keeps up to date itself (WRITTEN=), the processes whose end changes it (WATCH_PID=) and the first date it can change without a file (WAKE_AT=, epoch). Read only: no network, no tower created, nothing written.
+
+snapshot keeps these blocks for Treelab.app under ~/.lab/state/app-snapshot: one file per lane, one per project and the total, each rewritten only when it changes. Each lab write (wait, session lock, merge queue, agreement, words, watcher) redoes its lane's file in the background, without slowing the hook, and only while the app lives: --reader sets its mark (its pid, checked alive); without a live reader nothing is written (READER=none). The app reads these files without running lab, and runs snapshot only for a changed document, the end of a process or a date reached, limited to the lane or project touched, never on a timer (SNAPSHOT=, WRITTEN=, UNCHANGED=, REMOVED=).
+
+focus brings the lane's cmux tab to the front (ACTION=tab), otherwise its project's workspace (ACTION=workspace). It goes through the cmux socket, or through cmux's AppleScript when the socket refuses a program cmux did not start (WAY=socket or applescript): macOS then asks once to let Treelab control cmux. APP= names the app to bring forward. It never starts an agent, a session or a tab: lab next opens a lane. An unknown project or lane, or cmux out of reach, is refused by name.
+
+The terminal app: lab drives cmux, or another app that keeps the cmux command, socket and AppleScript, such as the Treelab app built from cmux. terminal_app= followed by the path of the .app, in a project's config, then in ~/.lab/config, picks it; without the line, cmux itself (its command in the PATH, never the one of another app), otherwise a Treelab.app installed with its command (in /Applications or ~/Applications). terminal_cli= and terminal_socket=, in the same file as the line, set its command and its socket. Tabs, focus and notifications of that project then go to that app; projects without the line stay on cmux. A line naming a missing app is reported with its file and key, and nothing opens elsewhere. From the terminal of another app, its socket and tab are never passed on: drive a project from a terminal of its own app. Remove the line to go back to cmux.
+
+Examples:
+  lab app lanes myproject
+  lab app snapshot myproject payment
+  lab app focus myproject payment
 HELP
       ;;
     sysmon) cat <<'HELP'
@@ -448,7 +549,7 @@ lab widget — the Mac in the macOS menu bar
   lab widget order stow <name> [--relaunch]
   lab widget tidy [--confirm] [spacing|duplicates|istat]
 
-install puts in place the lab top dot (every 60 seconds: colored by memory pressure, the number of agent sessions and the number of cuts; its menu cuts with one click) and six system modules — processor, memory, disks, network, battery, temperatures — refreshed every 10 seconds, each its own bar item with a detailed menu (figures and, for processor and memory, the top five consumers). A single collector feeds the six modules, as the cost budget requires. lab installs macmon through brew for temperatures and power; without it the native modules still work. modules list shows the active modules, off removes one and on puts it back; the state is kept.
+install puts in place the lab top dot (every 60 seconds: colored by memory pressure, the number of agent sessions and the number of cuts; its menu cuts with one click) and six system modules — processor, memory, disks, network, battery, temperatures — refreshed every 30 seconds, each its own bar item with a detailed menu (figures and, for processor and memory, the top five consumers). A single collector feeds the six modules, as the cost budget requires. lab installs macmon through brew for temperatures and power; without it the native modules still work. modules list shows the active modules, off removes one and on puts it back; the state is kept.
 
 SwiftBar is never installed by lab: without it, install shows brew reinstall --cask swiftbar and stops. The plugins go into the plugin folder SwiftBar already uses, otherwise into a folder of lab registered in its preferences; SwiftBar opens at login. The items are placed near the right end of the menu bar, grouped, so that a full bar does not hide them behind the notch; a place you chose by dragging stays. remove takes the dot and the six modules away, and the login item if lab added it; macmon, the preferences and the other plugins stay. KEY=value on stdout: WIDGET=, PLUGIN=, MODULES=, MACMON=, LOGIN_ITEM=, SEPARATOR=.
 
@@ -507,13 +608,13 @@ lab close — deliver then remove a finished lane
 
 Shows what will be delivered and removed, then asks for a confirmation by typing the lane's name again. It requires your trial of the result and your agreement, recorded by the agent. Then it merges the last batch, removes the working copy, the branches and the lane's tab.
 
-Right before the merge, the main branch is read again up to date: if the merge would remove lines added by another lane, lab refuses and names them. Restore them, or confirm that removal with --retire <sha>.
+Right before the merge, the main branch is read again up to date: if the merge would remove lines added by another lane, lab refuses and names them. Restore them, or confirm that removal with --retire <sha>: lab keeps it for this lane, so the next lab close, the tower's included, does not ask for it again.
 
 If the last nightly CI of the main branch is red, lab close refuses and suggests a fix lane, unless the lane proves its fix: a green manual run of the same workflow, on a revision that contains the first red commit and comes before the lane head; for such a lane, the count of red nights in lab doctor (ci.night_red_days) does not stop the delivery either. To close anyway, give your reason with --night-red-ok "<reason>": in both cases a dated agreement line (citing the green run for a proof) is committed in the acceptance section of the batch file, before the confirmation, and stays there if the closing stops.
 
 --abandon removes a lane that has nothing to deliver, after the same confirmation.
 
-You never have to type it. Write in the lane's tab, or in the tower's, that the acceptance is validated and the lane can be closed (for example "acceptance validated, close the lane"), or click the button the agent shows you: lab reads your words and the agent closes without --confirm, delivered then removed; from the lane's own tab, that tab closes with its session at the very end. On a red night the agent asks you with one button, "Close <lane> despite the red night": your click is the agreement, its reason written by lab.
+You never have to type it. Write in the lane's tab, or in the tower's, that the acceptance is validated and the lane can be closed (for example "acceptance validated, close the lane"), or click the button the agent shows you: lab reads your words and the agent closes without --confirm, delivered then removed; from the lane's own tab, that tab closes with its session at the very end. Your words are enough once: they also cover a red night (lab writes the reason) and the commits that come after them, such as a sync with the main branch or a fix the CI asks for, as long as the tree is clean and the PR's CI is green; lab close names those commits (AFTER_AGREEMENT=). A question without a negation never takes your words back. Without your words, on a red night the agent asks you with one button, "Close <lane> despite the red night": your click is the agreement, its reason written by lab.
 
 In a project with a tower, the tower closes the lane on its own once the acceptance is passed, without asking again; the agent of a lane is refused unless your words were read by lab (--dry-run stays allowed).
 Without --confirm, the tower closes only on the agreement recorded by lab acceptance (kept outside the lane, on the tried revision; a hand-written acceptance section never counts) and when three things are green for every target that serves the lane: the acceptance, the tried revision served and verified, and the prod check on it (run again if older than 24 hours); it prints CLOSED_BY=tower and posts a cmux alert in its tab, otherwise lab close names what is missing. --dry-run shows CLOSE_ALONE=.
@@ -778,7 +879,7 @@ Declare a target: --add writes its block in the project configuration from a tem
 
 Deploys a target declared in the project configuration (deploy.<target>= and probe.<target>=). It always starts from the up-to-date main branch; from a lane, its branch is added, and --with adds others. The assembly is pushed to serve/<target>.
 
-A registry records what is served. If the target serves an unmerged lane that you do not include, lab refuses and names it: include it with --with, or remove it with --retire. The probe then checks the served revision. --record registers what exists without deploying; --dry-run shows the plan.
+A registry records what is served. If the target serves an unmerged lane that you do not include, lab refuses and names it: include it with --with, or remove it with --retire. The probe then checks the served revision: while the target still serves another one, it is read again every 5 seconds, 2 minutes at most (LAB_DEPLOY_PROBE_EVERY, LAB_DEPLOY_PROBE_WAIT); never right, lab refuses and the registry says verified=no. --record registers what exists without deploying; --dry-run shows the plan.
 
 One go-live per target at a time. In a project with a tower, lab deploy from another lane goes into the target's queue (DEPLOY=queued POSITION=n): nothing is deployed, and the tower's round, lab deploy <project> --queue, deploys each request in order at its queued revision, staging and production apart. A red CI or a failed go-live stops that target's queue and marks the lane blocked (DEPLOY_STOPPED=) until the lane asks again; --cancel removes its request. Without a tower, a target already being deployed is waited for, 30 minutes at most (LAB_DEPLOY_WAIT_MAX), then lab gives up and names the lane holding it. lab status and lab tower show the queues (DEPLOY_QUEUE=).
 
@@ -814,6 +915,21 @@ Internal command: you do not have to run it. Claude Code and Codex call it at a 
 
 To check that they are in place:
   lab doctor
+HELP
+      ;;
+    docker) cat <<'HELP'
+lab docker — free space of the Docker machine, and the project's leftovers
+
+  lab docker [project]
+  lab docker clean [project]
+  lab docker prepare [project]
+
+Without a verb: reads the free space of the Docker machine with one throwaway container (2 s at most) and counts the project's leftovers: stopped containers and images older than 7 days that carry the label sh.treelab.project=<project>, and the build cache of its own builder lab-<project>. ROOM=short below 10 GB free or from 85% used. Resources without that label are counted, never touched.
+
+clean removes those leftovers one identifier at a time, then the build cache older than 7 days of the builder lab-<project> only: a running container, another project's resource and an unlabelled one stay. LAB_DOCKER_IMAGE_DAYS changes the 7 days. prepare creates that builder once and fetches the small image that reads the free space. Without Docker, or when it does not answer, nothing is removed and the command ends without error.
+
+Example:
+  lab docker clean
 HELP
       ;;
     setup) cat <<'HELP'

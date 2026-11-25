@@ -24,7 +24,7 @@ age_of() {
   elif [ "$s" -lt 86400 ]; then printf '%d h\n' $((s / 3600))
   else printf '%d d\n' $((s / 86400)); fi
 }
-state_field() { [ -f "$1" ] && sed -n "s/^$2=//p" "$1" | head -1; return 0; }
+state_field() { if kv_value "$1" "$2"; then printf '%s\n' "$KV_VALUE"; fi; }
 # state_write <fichier> <contenu> : écriture atomique, mode 600 ; le temporaire est caché (.tmp.*) : le glob * des lectures ne le voit
 # jamais, et aucun nom de ressource ou de couloir n'est filtré par erreur (revue du lot 18)
 state_write() { local tmp; mkdir -p "$(dirname "$1")"; tmp="$(mktemp "$(dirname "$1")/.tmp.XXXXXX")"; printf '%s' "$2" >"$tmp"; chmod 600 "$tmp"; mv "$tmp" "$1"; }

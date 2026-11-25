@@ -1,32 +1,40 @@
 # shellcheck shell=bash
 # lock.sh — verrou de session par worktree : <wt>/.lab/session.lock (pid, agent, since).
 declare -F kv_value >/dev/null || . "${BASH_SOURCE[0]%/*}/kv.sh"
+declare -F snap_mark >/dev/null || . "${BASH_SOURCE[0]%/*}/snapshot.sh"   # instantané de Treelab.app (lot 03 d'app-treelab)
 lock_file() { printf '%s/.lab/session.lock\n' "$1"; }
 lock_field() { kv_print "$1" "$2"; }
 # pid_state <pid> → vivant | mort | incertain. kill -0 seul ne prouve rien : sous sandbox il répond « Operation not permitted » sur un
 # processus vivant d'un autre arbre, et lab status supprimait alors un verrou de session vivante (retour 4, 2026-09-14). Mort seulement
 # si ps, exécuté sans erreur, ne trouve rien (rc 1, aucune sortie) ; ps refusé ou en erreur = incertain. Un pid absent ou non numérique
 # n'a aucun processus à protéger : mort. Même règle pour _preflight_lock (lib/preflight.sh) : une seule définition.
-pid_state() {
+pid_state() { pid_state_set "${1:-}"; printf '%s\n' "$PID_STATE"; }
+pid_state_set() { # <pid> : PID_STATE, sans processus pour un pid vivant ; un ps sinon
   local pid="${1:-}" observed rc=0
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { printf 'dead\n'; return; }
-  if kill -0 "$pid" 2>/dev/null; then printf 'alive\n'; return; fi
+  PID_STATE=dead
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then PID_STATE=alive; return 0; fi
   observed="$(ps -p "$pid" -o pid= 2>&1)" || rc=$?
-  if [ "$rc" = 0 ] && [ -n "$observed" ]; then printf 'alive\n'   # visible sans droit de signal : sandbox
-  elif [ "$rc" = 1 ] && [ -z "$observed" ]; then printf 'dead\n'
-  else printf 'uncertain\n'; fi
+  if [ "$rc" = 0 ] && [ -n "$observed" ]; then PID_STATE=alive   # visible sans droit de signal : sandbox
+  elif [ "$rc" = 1 ] && [ -z "$observed" ]; then PID_STATE=dead
+  else PID_STATE=uncertain; fi
 }
-pid_alive() { [ "$(pid_state "${1:-}")" = alive ]; }
-pid_dead()  { [ "$(pid_state "${1:-}")" = dead ]; }
-lock_alive() { pid_alive "$(lock_field "$1" pid || true)"; }
-lock_dead()  { pid_dead "$(lock_field "$1" pid || true)"; }
+pid_alive() { pid_state_set "${1:-}"; [ "$PID_STATE" = alive ]; }
+pid_dead()  { pid_state_set "${1:-}"; [ "$PID_STATE" = dead ]; }
+lock_alive() { kv_value "$1" pid || true; pid_alive "$KV_VALUE"; }   # comme pid_alive "$(lock_field …)", sans sous-shell
+lock_dead()  { kv_value "$1" pid || true; pid_dead "$KV_VALUE"; }
 # Remonte les ancêtres du processus courant jusqu'au binaire de l'agent ; sans agent trouvé, le pid de départ (toujours rc 0).
 # shellcheck disable=SC2120 # [pid] : seuls les tests en passent un (tests/lock.bats)
 agent_pid() { agent_pid_found "$@" || true; }
 # agent_pid_found [pid] : même remontée, rc 1 sans agent parmi les ancêtres (le pid de départ est quand même écrit) — la garde ne
-# prend un verrou que pour un vrai agent (lot 01 de reprise-apres-migration)
+# prend un verrou que pour un vrai agent (lot 01 de reprise-apres-migration). Départ : le pid donné, sinon LAB_AGENT_FROM, posé dans
+# son processus par le crochet de démarrage (session_main, lib/guard_fast.sh : lui-même, comme $PPID de « bin/lab hook » avant #239 —
+# sans agent, le verrou revient au crochet mort, que SessionEnd retire ; lot 01 de fix-nuit-2026-11-24), sinon $PPID. Jamais hérité :
+# l'environnement ne choisit pas le processus qu'un verrou désigne.
+unset LAB_AGENT_FROM
 agent_pid_found() {
-  local pid="${1:-$PPID}" comm seen=' '
+  local from="${1:-${LAB_AGENT_FROM:-$PPID}}" pid comm seen=' '
+  pid="$from"
   while [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ "$pid" != 1 ]; do
     # La profondeur dépend du lanceur ; une boucle ou un parent illisible
     # arrête la recherche sans attribuer le verrou à un autre processus.
@@ -37,7 +45,7 @@ agent_pid_found() {
     pid="$(ps -o ppid= -p "$pid" 2>/dev/null)" || pid=''
     pid="${pid// /}"
   done
-  printf '%s\n' "${1:-$PPID}"
+  printf '%s\n' "$from"
   return 1
 }
 # detect_agent [pid de l'agent] : le pid déjà trouvé évite une seconde remontée des ancêtres (claim, lot 01 de reprise-apres-migration)
@@ -90,6 +98,7 @@ claim() {
   fi
   tmp="$lock.$$"; printf 'pid=%s\nagent=%s\nsince=%s\nworktree=%s\n' "$pid" "$agent" "$since" "$wt" >"$tmp"; mv "$tmp" "$lock"
   operation_release; umask "$mask"
+  snap_mark "$wt"
   printf 'CLAIMED\n'
 }
 
@@ -184,34 +193,38 @@ operation_release() {
 release() { local lock pid; lock="$(lock_file "$1")"; [ -f "$lock" ] || return 0
   pid="$(lock_field "$lock" pid)"
   if lock_dead "$lock" || [ "$pid" = "$(agent_pid)" ]; then
-    rm -f "$lock"
+    rm -f "$lock"; snap_mark "$1"
     if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && operation_paths && [ ! -L "$LAB_SESSION_DIRECTORY" ]; then
       rm -f "$LAB_SESSION_DIRECTORY/$pid"
     fi
   fi; }
 # lock_state <wt> → libre | vivant:<pid>:<agent>:<since> | mort:… | incertain:… — lecture pure, jamais d'écriture.
-lock_state() {
-  local lock; lock="$(lock_file "$1")"
-  [ -f "$lock" ] || { echo free; return; }
-  printf '%s:%s:%s:%s\n' "$(pid_state "$(lock_field "$lock" pid || true)")" "$(lock_field "$lock" pid || true)" "$(lock_field "$lock" agent || true)" "$(lock_field "$lock" since || true)"
+lock_state() { lock_state_set "$1"; printf '%s\n' "$LOCK_STATE"; }
+lock_state_set() { # <wt> : LOCK_STATE
+  local lock="$1/.lab/session.lock" pid agent
+  [ -f "$lock" ] || { LOCK_STATE=free; return 0; }
+  kv_value "$lock" pid || true; pid="$KV_VALUE"
+  kv_value "$lock" agent || true; agent="$KV_VALUE"
+  kv_value "$lock" since || true
+  pid_state_set "$pid"; LOCK_STATE="$PID_STATE:$pid:$agent:$KV_VALUE"
 }
 # lock_status <wt> : lock_state, plus une note sur stderr. Ne supprime jamais rien : l'auto-réparation à la lecture (lot 10, 2026-09-03,
 # pour un SessionEnd Codex qui ne relâchait pas) a coûté un verrou de session vivante sous sandbox (retour 4). Un verrou mort n'est
 # retiré que par lock_reclaim, dans une commande qui écrit ; la reprise par le hook de démarrage (claim) couvre le cas de Codex.
-lock_status() {
-  local st; st="$(lock_state "$1")"
-  case "$st" in
-    dead:*) log "dead lock: $1 (${st#dead:}) — kept by this read; lab next, launch or open will remove it" ;;
-    uncertain:*) log "lock undeterminable from here: $1 (${st#uncertain:}) — neither alive nor proven dead (sandbox?), kept" ;;
+lock_status() { lock_status_set "$1"; printf '%s\n' "$LOCK_STATE"; }
+lock_status_set() { # <wt> : LOCK_STATE, la note sur stderr
+  lock_state_set "$1"
+  case "$LOCK_STATE" in
+    dead:*) log "dead lock: $1 (${LOCK_STATE#dead:}) — kept by this read; lab next, launch or open will remove it" ;;
+    uncertain:*) log "lock undeterminable from here: $1 (${LOCK_STATE#uncertain:}) — neither alive nor proven dead (sandbox?), kept" ;;
   esac
-  printf '%s\n' "$st"
 }
 # lock_reclaim <wt> → libre | vivant:… | incertain:… : retire un verrou dont le processus est prouvé mort, avec une note. Réservé aux
 # commandes qui ouvrent une session (next, launch, open) ; jamais à une lecture (status, plan, sweep, doctor).
 lock_reclaim() {
   local st; st="$(lock_state "$1")"
   case "$st" in
-    dead:*) log "dead lock removed: $1 (${st#dead:})"; rm -f "$(lock_file "$1")"; echo free ;;
+    dead:*) log "dead lock removed: $1 (${st#dead:})"; rm -f "$(lock_file "$1")"; snap_mark "$1"; echo free ;;
     *) printf '%s\n' "$st" ;;
   esac
 }
@@ -248,7 +261,7 @@ handoff_wait() {
   while :; do
     if [ "$(pid_state "$pid")" = dead ]; then HANDOFF_PROOF="pid $pid dead"; break; fi
     if [ "$seen" = 1 ] && pids="$(cmux_surface_pids "$ws" "$surface")"; then
-      if printf '%s\n' "$pids" | grep -qx "$pid"; then absent=0; else absent=$((absent + 1)); fi
+      if grep -qx "$pid" <<<"$pids"; then absent=0; else absent=$((absent + 1)); fi
       if [ "$absent" -ge 2 ]; then HANDOFF_PROOF="pid $pid missing from tab $surface on two reads"; break; fi
     else absent=0; fi
     HANDOFF_WAITED_MS=$(($(now_ms) - start))

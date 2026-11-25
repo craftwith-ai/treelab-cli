@@ -7,6 +7,7 @@
 # acceptance --accept les accepte de l'agent du couloir ou de la tour, sans preuve typée, puis lab close ferme sans --confirm.
 
 declare -F kv_value >/dev/null || . "${BASH_SOURCE[0]%/*}/kv.sh"
+declare -F snap_mark >/dev/null || . "${BASH_SOURCE[0]%/*}/snapshot.sh"   # instantané de Treelab.app (lot 03 d'app-treelab)
 
 # ---------- repli du texte, partagé avec Ginkgo (lib/ginkgo.sh) ----------
 # words_clean <octets> : l'entrée en une ligne, sans caractère de contrôle ni DEL, coupée puis rendue à une frontière UTF-8
@@ -42,10 +43,17 @@ if ($ENV{WORDS_MODE} eq "named") {
   for my $r (split /\s+/, ($ENV{WORDS_LANES} // "")) { my $l = flat(fold($r)); print "$r\n" if length $l && " $n " =~ /\Q $l \E/ }
   exit 0;
 }
-exit 1 if $t eq "" || $t =~ m{^[/!]} || $t =~ /[?\x{bf}\x{ff1f}]/;
-exit 1 if length($n) > $ENV{WORDS_MAX} || @w > $ENV{WORDS_MAX_WORDS} || !@w;
 my %stop = map { $_ => 1 } qw(pas ne n non ni jamais aucun aucune rien sans mais sauf attends attendre attendez attend tard si
   not no never nope don dont doesn didn isn aren wasn can cannot won t without but except wait later if lab);
+# retract (batch 04 of onglet-tower): rc 0 when a message that is no agreement takes back the pending words, always but for a
+# question without a negation or a reserve; the word lab alone is no reserve
+if ($ENV{WORDS_MODE} eq "retract") {
+  exit 0 unless $t =~ /[?\x{bf}\x{ff1f}]/;
+  for (@w) { exit 0 if $stop{$_} && $_ ne "lab" }
+  exit 1;
+}
+exit 1 if $t eq "" || $t =~ m{^[/!]} || $t =~ /[?\x{bf}\x{ff1f}]/;
+exit 1 if length($n) > $ENV{WORDS_MAX} || @w > $ENV{WORDS_MAX_WORDS} || !@w;
 for (@w) { exit 1 if $stop{$_} }
 exit 1 if $w[0] eq "ginkgo";
 my $lane = @lanes ? join("|", map { quotemeta } @lanes) : "(?!)";
@@ -83,6 +91,9 @@ words_match() {
 # recette, accept…, approuv…, je valide, c'est validé ; la formule de Ginkgo dit « close ») — le crochet écarte ainsi un prompt ordinaire avant de lire le
 # projet (registre, config : ~0,24 s mesurées par prompt, rapport du lot 10)
 words_maybe() { printf '%s' "$1" | WORDS_MODE=maybe perl -CSD -e "$WORDS_PERL" 2>/dev/null; }
+# words_retracts <texte> : rc 0 si ce message, qui n'est pas un accord, retire les mots en attente (mode retract) — une question sans
+# négation ni réserve n'en retire jamais (lot 04 d'onglet-tower : « c'est quoi le probleme ? » effaçait l'accord et le clic de nuit)
+words_retracts() { printf '%s' "$1" | WORDS_MODE=retract perl -CSD -e "$WORDS_PERL" 2>/dev/null; }
 # words_named <texte> <couloir…> → les couloirs nommés par le texte (mots entiers, repliés), un par ligne, sous leur nom réel
 words_named() {
   local t="$1"; shift
@@ -93,7 +104,7 @@ words_named() {
 words_ttl() { case "${LAB_WORDS_TTL:-}" in ''|*[!0-9]*) echo 3600 ;; *) echo "$LAB_WORDS_TTL" ;; esac; }
 words_file() { printf '%s/%s/words/%s\n' "$LAB_STATE" "$P_NAME" "$1"; }   # <couloir>
 words_get() { [ -f "$1" ] && [ ! -L "$1" ] || return 0; kv_print "$1" "$2"; }   # <fichier> <champ>
-words_clear() { rm -f "$(words_file "$1")"; }
+words_clear() { local f; f="$(words_file "$1")"; [ -e "$f" ] || [ -L "$f" ] || return 0; rm -f "$f"; snap_mark_lane "$P_NAME" "$1"; }
 # words_lanes → les couloirs du projet, la tour exceptée, un par ligne
 words_lanes() {
   local wt
@@ -115,7 +126,8 @@ words_record() {
   said="$(printf '%s' "$3" | words_clean 200)"; f="$(words_file "$lane")"
   ( umask 077; mkdir -p "$(dirname "$f")" && rm -f "$f.tmp.$$" \
     && printf 'said=%s\nkind=%s\ntab=%s\nsource=%s\nlane=%s\nrev=%s\nat=%s\nsession=%s\n' "$said" "$2" "$4" "$5" "$lane" "$rev" "$(rdv_now)" \
-      "$(printf '%s' "${PAYLOAD:-}" | jq -j '.session_id // empty' 2>/dev/null | words_clean 80)" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f" )
+      "$(printf '%s' "${PAYLOAD:-}" | jq -j '.session_id // empty' 2>/dev/null | words_clean 80)" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f" ) || return
+  snap_mark "$wt"
 }
 # words_valid <wt> [kinds, défaut « accept night »] : rc 0 si des mots valent pour ce couloir — même couloir, kind admis, révision =
 # HEAD du couloir, dits depuis LAB_WORDS_TTL s au plus ; pose WD_SAID, WD_KIND, WD_TAB, WD_SOURCE, WD_AT, WD_REV ; sinon rc 1 et WD_WHY
@@ -152,8 +164,8 @@ words_evidence() { printf 'words: "%s" (%s)' "$WD_SAID" "$(words_where)"; }
 words_context() { jq -cn --arg e "$1" --arg c "$2" '{hookSpecificOutput:{hookEventName:$e,additionalContext:$c}}'; }
 # words_order <couloir> <rév> <mots> : la consigne donnée à l'agent qui a reçu les mots — accepter puis fermer, sans rien redemander
 words_order() {
-  printf 'LAB: lab recorded the user'"'"'s words "%s" as their acceptance of lane %s of %s, closing included, tied to revision %s for %s min. Without asking again, run lab acceptance %s %s --accept, then lab close %s %s (no --confirm: these words are the order). If lab close refuses on a red night, ask once with AskUserQuestion, two buttons "Close %s despite the red night" and "Keep %s" (in the user'"'"'s language), and run lab close %s %s again on that click. Never type these words yourself.' \
-    "$3" "$1" "$P_NAME" "${2:0:7}" "$(( $(words_ttl) / 60 ))" "$P_NAME" "$1" "$P_NAME" "$1" "$1" "$1" "$P_NAME" "$1"
+  printf 'LAB: lab recorded the user'"'"'s words "%s" as their acceptance of lane %s of %s, closing included, tied to revision %s for %s min. Without asking again, run lab acceptance %s %s --accept, then lab close %s %s (no --confirm: these words are the order). They also cover a red night and the commits that follow (a sync with the base, a fix the CI asks for): never ask the user again, lab writes the reason and names what changed after their yes. Never type these words yourself.' \
+    "$3" "$1" "$P_NAME" "${2:0:7}" "$(( $(words_ttl) / 60 ))" "$P_NAME" "$1" "$P_NAME" "$1"
 }
 # words_take <wt de l'onglet> <kind> <mots> <onglet> <source> <couloir visé|vide> <couloirs nommés ou en recette> : enregistre et
 # pose WORDS_CONTEXT, la consigne ; un couloir hors recette ou un choix ambigu n'enregistrent rien
@@ -233,12 +245,18 @@ words_hook_project() {
 }
 # words_on_prompt <racine> (UserPromptSubmit) : le texte exact envoyé par l'utilisateur ; sortie JSON du crochet si une consigne suit
 # words_retract <couloir…> (revue du lot) : un message qui parle de recette ou de fermeture sans être un accord (négation,
-# question, report) efface les mots encore en attente de ces couloirs ; l'accord déjà écrit reste, seul --reject le remplace —
+# report ; une question seulement si elle porte une négation ou une réserve, lot 04 d'onglet-tower) efface les mots encore en attente de ces couloirs ; l'accord déjà écrit reste, seul --reject le remplace —
 # la consigne le rappelle. Sans mots en attente : silence.
 words_retract() {
   local l note
   for l in "$@"; do
-    [ -f "$(words_file "$l")" ] || continue
+    if [ ! -f "$(words_file "$l")" ]; then
+      # lot 04 d'onglet-tower (revue) : les mots déjà consommés par lab acceptance — l'ordre de fermer, qui survit aux commits
+      # suivants, est retiré à son tour (close=no) ; l'accord du résultat reste, ses mots redits le rendent
+      agreement_hold "$l" 2>/dev/null || continue
+      WORDS_CONTEXT="${WORDS_CONTEXT:+$WORDS_CONTEXT }LAB: the user's last message takes back their order to close lane $l of $P_NAME: lab set it aside (close=no), the acceptance of the result stays; do not close lane $l, ask them what they want — their words, said again, give the order back."
+      continue
+    fi
     words_clear "$l"; note=""
     ! agreement_by_words "$P_ROOT/.worktrees/$l" 2>/dev/null \
       || note=" Its acceptance already passed on their earlier words: if they no longer want it closed, run lab acceptance $P_NAME $l --reject --feedback \"<their words>\"."
@@ -246,19 +264,39 @@ words_retract() {
   done
   return 0
 }
-# words_retract_tower <texte> : dans l'onglet de la tour, les couloirs nommés, sinon tous ceux qui ont des mots en attente
+# words_retract_tower <texte> : dans l'onglet de la tour, les couloirs nommés, sinon tous ceux qui ont des mots en attente ou un ordre
+# de fermer gardé (lot 04 d'onglet-tower)
 words_retract_tower() {
   local named l all=""
   # shellcheck disable=SC2046,SC2086 # noms de couloir : des mots
   named="$(words_named "$1" $(words_lanes))"
-  if [ -z "$named" ]; then for l in $(words_lanes); do [ ! -f "$(words_file "$l")" ] || all="$all $l"; done; named="$all"; fi
+  if [ -z "$named" ]; then
+    for l in $(words_lanes); do
+      { [ -f "$(words_file "$l")" ] || [ "$(agreement_get "$(agreement_file "$l")" close 2>/dev/null)" = yes ]; } || continue
+      all="$all $l"
+    done
+    named="$all"
+  fi
   # shellcheck disable=SC2086
   words_retract $named
+}
+# words_delivered <texte> (recette du lot 04 d'onglet-tower, 25/11) : un texte remis par Claude Code et jamais tapé par l'utilisateur —
+# message d'une autre session (la tour, un couloir), avis de repos, notification de tâche, retour d'agent — passe aussi par
+# UserPromptSubmit (file de Claude Code, queued_command) : il ne donne ni ne retire rien. Deux incidents : un message d'un couloir
+# vers la tour a retiré deux ordres de fermer, un message de la tour a effacé le clic de l'utilisateur dans l'onglet du couloir.
+words_delivered() {
+  local t="${1#"${1%%[![:space:]]*}"}"
+  case "$t" in
+    '<cross-session-message '* | '<cross-session-message>'* | '<task-notification>'* | '<agent-message '* | '<agent-message>'* \
+      | '[Cross-session '* | '<system-reminder>'* | 'Another Claude session sent a message'*) return 0 ;;
+  esac
+  return 1
 }
 words_on_prompt() {
   local root="$1" prompt kind lanes
   WORDS_CONTEXT=""
   prompt="$(printf '%s' "$PAYLOAD" | jq -r '.prompt // empty' 2>/dev/null)"; [ -n "$prompt" ] || return 0
+  ! words_delivered "$prompt" || return 0
   words_maybe "$prompt" || return 0
   words_hook_project "$root" || return 0
   if lane_is_tower "$root"; then
@@ -268,7 +306,7 @@ words_on_prompt() {
     else
       lanes="$(words_lanes)"
       # shellcheck disable=SC2086 # noms de couloir : des mots
-      if ! kind="$(WORDS_BARE=0 words_match "$prompt" $lanes)"; then words_retract_tower "$prompt"
+      if ! kind="$(WORDS_BARE=0 words_match "$prompt" $lanes)"; then ! words_retracts "$prompt" || words_retract_tower "$prompt"
       elif words_session_ok "$root"; then
         # décision 3 du grill-me : l'accord de nuit rouge ne passe que par le clic du bouton ; écrit, il vaut un accord simple
         [ "$kind" != night ] || kind=accept
@@ -276,7 +314,7 @@ words_on_prompt() {
       else words_not_session "$root"; fi
     fi
   else
-    if ! kind="$(WORDS_BARE=1 words_match "$prompt" "$(wt_lane "$root")")"; then words_retract "$(wt_lane "$root")"
+    if ! kind="$(WORDS_BARE=1 words_match "$prompt" "$(wt_lane "$root")")"; then ! words_retracts "$prompt" || words_retract "$(wt_lane "$root")"
     elif words_session_ok "$root"; then
       [ "$kind" != night ] || kind=accept
       words_take "$root" "$kind" "$prompt" lane prompt "$(wt_lane "$root")" ""
@@ -296,7 +334,8 @@ words_on_click() {
     # shellcheck disable=SC2086 # noms de couloir : des mots
     if ! kind="$(words_match "$label" $lanes)"; then
       words_maybe "$label" || continue
-      if [ "$tower" = 1 ]; then words_retract_tower "$label"; else words_retract "$lanes"; fi
+      if ! words_retracts "$label"; then break
+      elif [ "$tower" = 1 ]; then words_retract_tower "$label"; else words_retract "$lanes"; fi
       break
     fi
     if ! words_session_ok "$root"; then words_not_session "$root"

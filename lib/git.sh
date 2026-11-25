@@ -87,6 +87,32 @@ resolve_file() {
 }
 is_worktree() { git_places "$1" && ! same_path "$GP_TOP" "$GP_MAIN"; }
 branch_name() { git -C "${1:-$PWD}" branch --show-current 2>/dev/null || true; }
+# head_branch_set <racine d'un worktree> : HEAD_BRANCH, sa branche (vide : HEAD détachée ou hors dépôt), lue dans son fichier HEAD sans
+# processus (lot 02 de charge-processeur). Au moindre doute — autre disposition, reftable, HEAD lien, GIT_DIR posé — git répond
+# shellcheck disable=SC2034 # HEAD_BRANCH est lu par lib/docs.sh, lib/sync.sh et bin/lab
+head_branch_set() {
+  local d="$1" g='' h='' line=''
+  HEAD_BRANCH=''
+  if [ -z "${GIT_DIR:-}${GIT_WORK_TREE:-}" ]; then
+    if [ -d "$d/.git" ]; then g="$d/.git"
+    elif [ -f "$d/.git" ] && [ -r "$d/.git" ]; then
+      IFS= read -r line <"$d/.git" || true
+      case "$line" in 'gitdir: /'*) g="${line#gitdir: }" ;; 'gitdir: '?*) g="$d/${line#gitdir: }" ;; esac
+    fi
+    # un dépôt d'un autre propriétaire : git peut refuser d'y répondre (safe.directory) — il décide, jamais le fichier
+    if [ -n "$g" ] && [ -f "$g/HEAD" ] && [ ! -L "$g/HEAD" ] && [ -r "$g/HEAD" ] && [ -O "$g/HEAD" ] && [ -O "$d" ]; then
+      IFS= read -r h <"$g/HEAD" || true
+      case "$h" in
+        'ref: refs/heads/.invalid'|'ref: refs/heads/') ;;
+        'ref: refs/heads/'*[[:space:]]*) ;;
+        'ref: refs/heads/'*) HEAD_BRANCH="${h#ref: refs/heads/}"; return 0 ;;
+        *[!0-9a-f]*) ;;
+        ????????????????????????????????????????) return 0 ;;   # révision nue (SHA-1) : HEAD détachée
+      esac
+    fi
+  fi
+  HEAD_BRANCH="$(exec git -C "$d" branch --show-current 2>/dev/null)" || HEAD_BRANCH=''
+}
 is_clean() { [ -z "$(git -C "$1" status --porcelain --untracked-files=all)" ]; }
 # shellcheck disable=SC2034 # DIRTY_LIST est lu par lib/close.sh et bin/lab
 # dirty_report <wt> : pose DIRTY_TRACKED (suivis modifiés ou indexés) et DIRTY_UNTRACKED (non suivis), un chemin par ligne, et
@@ -117,7 +143,7 @@ normalize_slug() {
   valid_slug "$1" || die "invalid slug \"$1\": lowercase letters, digits, hyphens, dots, underscores"
   printf '%s\n' "$1"
 }
-remote_name() { if git -C "$1" remote 2>/dev/null | grep -qx origin; then printf 'origin\n'; else git -C "$1" remote 2>/dev/null | head -1; fi; }
+remote_name() { local r; if r="$(git -C "$1" remote 2>/dev/null)" && grep -qx origin <<<"$r"; then printf 'origin\n'; else git -C "$1" remote 2>/dev/null | head -1; fi; }
 # sous lab sweep, lues dans les références mémorisées du dépôt (sweep_has_ref, rc 2 sans mémo)
 has_remote_branch() { local rc=2; ! command -v sweep_has_ref >/dev/null || { sweep_has_ref "$1" "refs/remotes/${3:-origin}/$2"; rc=$?; }
   [ "$rc" = 2 ] || return "$rc"; git -C "$1" show-ref --verify --quiet "refs/remotes/${3:-origin}/$2"; }
@@ -156,13 +182,17 @@ worktree_list() {
     END{ if (p) print p "\t" b "\t" f }'
 }
 # Dépôt GitHub owner/repo depuis l'URL du remote (git@, https, alias ssh).
-repo_slug() {
-  local url; url="$(git -C "$1" remote get-url "${2:-origin}" 2>/dev/null)" || return 1
+repo_slug() { repo_slug_set "$@" || return 1; printf '%s\n' "$REPO_SLUG"; }
+# repo_slug_set <wt> [remote] : le même dépôt dans REPO_SLUG (vide et rc 1 si illisible), sans substitution autour (lot 05 de
+# charge-processeur)
+repo_slug_set() {
+  local url; REPO_SLUG=''
+  url="$(exec git -C "$1" remote get-url "${2:-origin}" 2>/dev/null)" || return 1
   url="${url%.git}"; url="${url%/}"
   case "$url" in
-    https://github.com/*) printf '%s\n' "${url#https://github.com/}" ;;
-    *github.com:*) printf '%s\n' "${url#*github.com:}" ;;
-    *:*/*) printf '%s\n' "${url#*:}" ;;   # alias ssh « github-perso:owner/repo »
+    https://github.com/*) REPO_SLUG="${url#https://github.com/}" ;;
+    *github.com:*) REPO_SLUG="${url#*github.com:}" ;;
+    *:*/*) REPO_SLUG="${url#*:}" ;;   # alias ssh « github-perso:owner/repo »
     *) return 1 ;;
   esac
 }

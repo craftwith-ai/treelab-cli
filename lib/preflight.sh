@@ -1,5 +1,6 @@
 # shellcheck shell=bash
 # Préparation en lecture seule ; aucun test de droits par création de fichier.
+declare -F terminal_resolve >/dev/null || . "${BASH_SOURCE[0]%/*}/terminal.sh"   # le fork de cmux posé (lot 02 d'app-treelab)
 _preflight_error() { printf 'lab: Blocked: %s. %s\n' "$1" "$2" >&2; LAB_PREFLIGHT_ERRORS=$((LAB_PREFLIGHT_ERRORS + 1)); }
 _preflight_tool() { command -v "$1" >/dev/null 2>&1; }
 _preflight_system() {
@@ -17,7 +18,8 @@ _preflight_system() {
   if [ "${LAB_SETUP_MODE:-setup}" = setup ] && [ "$LAB_SETUP_CLAUDE:$LAB_SETUP_CODEX" = no:no ]; then
     _preflight_error 'no agent available' 'Install the claude or codex command, then try again.'
   fi
-  if [ "${LAB_SETUP_MODE:-setup}" = setup ] && ! _preflight_tool cmux; then
+  # sans cmux, une app de terminal posée (le fork, ou celle de terminal_app= de ~/.lab/config) suffit : rien à proposer
+  if [ "${LAB_SETUP_MODE:-setup}" = setup ] && ! _preflight_tool cmux && ! { terminal_resolve; [ "$TA_OK" = 1 ]; }; then
     if _preflight_tool brew; then LAB_SETUP_BREW=yes
     else _preflight_error 'cmux and Homebrew missing' 'Install cmux, then run the command again.'; fi
   fi

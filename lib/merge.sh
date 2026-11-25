@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2034 # PR_DRAFT et READS_VIEW sont lus par lib/sync.sh et lib/watch.sh
 # merge.sh — PR et détection fiable de « branche mergée » (squash, merge-commit, rebase).
 # mémo de lab sweep : posé par sweep_memo_open et sweep_gh_prefetch seuls, jamais hérité de l'environnement (revue du lot 01 de sweep-rapide)
 LAB_SWEEP_MEMO=""; SWEEP_REFS=""; SWEEP_REFS_ROOT=""; SWEEP_GH_ASKED=""; SWEEP_GH_MERGED=""; SWEEP_GH_ALL_ASKED=""; SWEEP_GH_ALL_MERGED=""
@@ -9,6 +10,10 @@ gh_repo_args() { local s; s="$(repo_slug "$1" "${2:-origin}")" && printf -- '-R\
 # un retrait (lab close --abandon) ne prend jamais une panne pour une absence de PR (revue du lot 02).
 pr_info_strict() {
   has_gh || return 1
+  if reads_pr "$2"; then   # réponse de la demande groupée du projet (lab status, lab list)
+    [ -z "$PR_NUM" ] || printf '%s\t%s\t%s\t%s\n' "$PR_NUM" "$PR_STATE" "$PR_TARGET" "$PR_URL"
+    return 0
+  fi
   local -a rargs=(); local s
   s="$(repo_slug "$1" "${P_REMOTE:-origin}" 2>/dev/null)" && rargs=(-R "$s")
   # une branche dont la PR a été fermée puis recréée en porte plusieurs : l'ouverte d'abord, puis la fusionnée, puis la fermée,
@@ -19,6 +24,96 @@ pr_info_strict() {
 }
 # pr_info <root> <branche> : idem, mais vide (rc 0) sans gh ou sur échec — pour les lectures qui ne retirent rien
 pr_info() { pr_info_strict "$@" || true; }
+# pr_info_set <root> <branche> : PR_NUM, PR_STATE, PR_TARGET, PR_URL — vides sans PR, sans gh ou sur échec — et PR_DRAFT (true ou false
+# quand la demande groupée l'a lu, vide sinon) ; sans processus dans une lecture groupée
+pr_info_set() {
+  local rec
+  PR_NUM='' PR_STATE='' PR_TARGET='' PR_URL='' PR_DRAFT=''
+  has_gh || return 0
+  if reads_pr "$2"; then return 0; fi
+  rec="$(pr_info "$1" "$2")"; [ -n "$rec" ] || return 0
+  IFS=$'\t' read -r PR_NUM PR_STATE PR_TARGET PR_URL <<<"$rec" || true
+}
+
+# ---------- demande groupée d'une lecture (lot 02 de charge-processeur) ----------
+# lab status et lab list demandaient GitHub une fois par couloir, jusqu'à 20 s chacune en panne : une seule requête par projet rend la
+# PR de chaque branche et l'état des PR que suit un veilleur en échec. READS_GH : vide, aucune demande groupée (chaque lecture demande
+# seule, comme toute autre commande) ; asked, réponses lues ; mute, GitHub n'a pas répondu (aucune autre demande). Jamais hérité.
+READS_GH='' READS_GH_I=0
+RG_B=() RG_PR=() RG_W=() RG_WV=()
+# reads_pr <branche> : rc 0 si la demande groupée a répondu pour elle — PR_NUM, PR_STATE, PR_TARGET, PR_URL, PR_DRAFT (vides sans PR, ou
+# si GitHub n'a pas répondu) ; rc 1 sans demande groupée
+reads_pr() {
+  local i="$READS_GH_I" k=0 n
+  case "$READS_GH" in mute) PR_NUM='' PR_STATE='' PR_TARGET='' PR_URL='' PR_DRAFT=''; return 0 ;; asked) ;; *) return 1 ;; esac
+  n="${#RG_B[@]}"
+  while [ "$k" -lt "$n" ]; do
+    if [ "${RG_B[$i]}" = "$1" ]; then
+      READS_GH_I="$i"; PR_NUM='' PR_STATE='' PR_TARGET='' PR_URL='' PR_DRAFT=''
+      IFS=$'\t' read -r PR_NUM PR_STATE PR_TARGET PR_URL PR_DRAFT <<<"${RG_PR[$i]}" || true
+      return 0
+    fi
+    k=$((k + 1)); i=$((i + 1)); [ "$i" -lt "$n" ] || i=0
+  done
+  return 1
+}
+# reads_pr_view <n° de PR> : rc 0 si la demande groupée a répondu — READS_VIEW, « état<TAB>révision de tête », vide si elle est muette
+reads_pr_view() {
+  local i=0
+  READS_VIEW=''
+  case "$READS_GH" in mute) return 0 ;; asked) ;; *) return 1 ;; esac
+  while [ "$i" -lt "${#RG_W[@]}" ]; do
+    if [ "${RG_W[$i]}" = "$1" ]; then READS_VIEW="${RG_WV[$i]}"; return 0; fi
+    i=$((i + 1))
+  done
+  return 1
+}
+# shellcheck disable=SC2016 # requête GraphQL et filtre jq, rien à développer
+READS_GH_JQ='.data.repository // {} | to_entries[] | .key as $k
+  | if ($k | startswith("b")) then ((.value.nodes // [])
+      | sort_by(if .state == "OPEN" then 0 elif .state == "MERGED" then 1 else 2 end) | .[0] // empty
+      | [$k, .number, .state, .baseRefName, .url, .isDraft] | @tsv)
+    else (.value // empty | [$k, .state, .headRefOid] | @tsv) end'
+# reads_gh_load <1 sans aucune branche|0> <branches> <n° de PR> (un par ligne) : la demande. Sans gh, sans dépôt GitHub propriétaire/nom ou sans rien à demander :
+# READS_GH reste vide. Muette : une ligne sur stderr. Réponse partielle (une PR inconnue) : gh rend le JSON brut, filtré ici
+reads_gh_load() {
+  local s b q='' body='' out rc=0 i=0 rest key val; local -a args=()
+  READS_GH='' READS_GH_I=0 RG_B=() RG_PR=() RG_W=() RG_WV=()
+  has_gh || return 0
+  s="$(repo_slug "$P_ROOT" "${P_REMOTE:-origin}" 2>/dev/null)" || return 0
+  case "$s" in */*/*|/*|*/) return 0 ;; ?*/?*) ;; *) return 0 ;; esac
+  if [ "$1" = 0 ]; then while IFS= read -r b; do
+    RG_B[i]="$b"; RG_PR[i]=''
+    # branche vide (HEAD détachée) : toutes les PR du dépôt, comme « gh pr list --head "" »
+    if [ -n "$b" ]; then q="$q, \$h$i: String!"; args+=(-f "h$i=$b"); b="headRefName: \$h$i, "; fi
+    body="$body b$i: pullRequests(${b}first: 20, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number state baseRefName url isDraft } }"
+    i=$((i + 1))
+  done <<<"$2"; fi
+  i=0
+  while IFS= read -r b; do
+    case "$b" in ''|*[!0-9]*) continue ;; esac
+    RG_W[i]="$b"; RG_WV[i]=''
+    q="$q, \$p$i: Int!"; args+=(-F "p$i=$b"); body="$body w$i: pullRequest(number: \$p$i) { state headRefOid }"; i=$((i + 1))
+  done <<<"$3"
+  [ -n "$body" ] || return 0
+  out="$(with_timeout 20 gh api graphql -f query="query(\$o: String!, \$n: String!$q) { repository(owner: \$o, name: \$n) {$body } }" \
+    -f "o=${s%%/*}" -f "n=${s#*/}" "${args[@]+"${args[@]}"}" --jq "$READS_GH_JQ" 2>/dev/null)" || rc=$?
+  # réponse partielle (une PR de veilleur inconnue) : gh rend 1 et le corps brut ; il compte dès que le dépôt y est un objet
+  if [ "$rc" != 0 ] && [ -n "$out" ]; then
+    out="$(jq -r 'if (.data.repository | type) == "object" then . else error("no repository") end | '"$READS_GH_JQ" <<<"$out" 2>/dev/null)" && rc=0
+  fi
+  if [ "$rc" != 0 ]; then
+    READS_GH=mute; warn_wrap "GitHub did not answer: pull requests left out of this reading (PR= empty)."
+    return 0
+  fi
+  READS_GH=asked; rest="$out"
+  while [ -n "$rest" ]; do
+    val="${rest%%$'\n'*}"; case "$rest" in *$'\n'*) rest="${rest#*$'\n'}" ;; *) rest='' ;; esac
+    key="${val%%$'\t'*}"; val="${val#*$'\t'}"
+    case "$key" in b*) RG_PR[${key#b}]="$val" ;; w*) RG_WV[${key#w}]="$val" ;; esac
+  done
+}
+reads_gh_end() { READS_GH='' RG_B=() RG_PR=() RG_W=() RG_WV=(); }   # les réponses ne survivent jamais à la lecture
 pr_merged_via_gh() {
   has_gh || return 1
   local -a rargs=(); local s n
@@ -95,7 +190,7 @@ branch_is_ancestor() {
 # branch_squashed <root> <branche> <base> [staging] [remote] → 0 si un commit de la base (distante si elle existe) porte exactement
 # le diff cumulé de la branche depuis leur ancêtre commun : fusion squash reconnue sans gh (lot 14). Écrit la cible dans BRANCH_IN.
 branch_squashed() {
-  local root="$1" br="$2" remote="${5:-${P_REMOTE:-origin}}" t ref mb want
+  local root="$1" br="$2" remote="${5:-${P_REMOTE:-origin}}" t ref mb want ids
   BRANCH_IN=""
   for t in "$3" "${4:-}"; do
     [ -n "$t" ] || continue
@@ -104,10 +199,11 @@ branch_squashed() {
     want="$(git -C "$root" diff "$mb" "$br" | git patch-id --stable | cut -d' ' -f1)"
     [ -n "$want" ] || continue
     if [ -n "${LAB_SWEEP_MEMO:-}" ] && [ "$root" = "$SWEEP_REFS_ROOT" ]; then
-      if sweep_patch_ids "$root" "$mb" "$ref" | grep -Fxq "$want"; then BRANCH_IN="$t"; return 0; fi
+      if ids="$(sweep_patch_ids "$root" "$mb" "$ref")" && grep -Fxq -- "$want" <<<"$ids"; then BRANCH_IN="$t"; return 0; fi
       continue
     fi
-    if git -C "$root" log -p --no-merges --max-count="${LAB_SQUASH_SCAN:-200}" "$mb..$ref" 2>/dev/null | git patch-id --stable | cut -d' ' -f1 | grep -Fxq "$want"; then
+    if ids="$(git -C "$root" log -p --no-merges --max-count="${LAB_SQUASH_SCAN:-200}" "$mb..$ref" 2>/dev/null | git patch-id --stable | cut -d' ' -f1)" &&
+      grep -Fxq -- "$want" <<<"$ids"; then
       BRANCH_IN="$t"; return 0
     fi
   done
@@ -200,10 +296,14 @@ merge_regression() {
   local wt="$1" ref="$2" start="$3" ours="$4" tree foreign r file a b last="" hits=""; shift 4
   local -a L=()
   REGRESSION_LIST=""
-  [ -n "$start" ] && git -C "$wt" rev-parse --verify --quiet "$start^{commit}" >/dev/null 2>&1 || return 2
-  tree="$(git -C "$wt" merge-tree --write-tree "$ours" "$ref" 2>/dev/null)" || return 2
+  [ -n "$start" ] || return 2
+  # l'arbre fusionné de l'essai à blanc qui précède (sync_dry, mêmes révisions), sinon calculé ; un début inconnu fait échouer
+  # rev-list comme rev-parse --verify avant (lot 05 de charge-processeur : deux programmes de moins, exec dans les substitutions)
+  if [ -n "${SYNC_TREE:-}" ] && [ "${SYNC_TREE_FOR:-}" = "$wt|$ours|$ref" ]; then tree="$SYNC_TREE"
+  else tree="$(exec git -C "$wt" merge-tree --write-tree "$ours" "$ref" 2>/dev/null)" || return 2; fi
+  SYNC_TREE=""; SYNC_TREE_FOR=""
   tree="${tree%%$'\n'*}"
-  foreign="$(git -C "$wt" rev-list --no-merges "$start..$ref" 2>/dev/null)" || return 2
+  foreign="$(exec git -C "$wt" rev-list --no-merges "$start..$ref" 2>/dev/null)" || return 2
   for r in "$@"; do [ -z "$r" ] || foreign="$(printf '%s\n' "$foreign" | grep -vFx -- "$r" || true)"; done
   [ -n "$foreign" ] || return 0
   while IFS=$'\t' read -r file a b; do   # une passe de blame par fichier, sur ses seules plages retirées
@@ -285,10 +385,15 @@ pr_make_ready() {
 # tant que l'exécution « prête » n'a pas remplacé la sienne, ou l'exécution du brouillon annulée par cancel-in-progress (lot 23).
 # Une ligne « genre<TAB>nom<TAB>workflow<TAB>fichier<TAB>bucket » par reste, classé par pr_skip_kinds ; le job sauté par sa propre condition
 # (own) n'en est pas un (couloir veilleur-saute). Vide : aucun reste (PR jamais brouillon comprise). rc 1 si gh ne répond pas.
-pr_draft_leftovers() {
-  local ready line l name link wf bucket run created pre=""
-  ready="$(with_timeout 20 gh api "repos/$1/issues/$2/timeline" --paginate --jq '.[] | select(.event == "ready_for_review") | .created_at' 2>/dev/null)" || return 1
-  ready="$(printf '%s\n' "$ready" | sed '/^$/d' | tail -1)"; [ -n "$ready" ] || return 0
+pr_draft_leftovers() { pr_draft_leftovers_set "$@" || return; [ -z "$PR_LEFT" ] || printf '%s\n' "$PR_LEFT"; }
+# pr_draft_leftovers_set : la même lecture dans PR_LEFT, sans substitution autour (lot 05 de charge-processeur) — la chronologie lue
+# par gh_read, sa dernière date retenue par le shell (sed et tail avant)
+pr_draft_leftovers_set() {
+  local ready line l name link wf bucket run created pre="" r
+  PR_LEFT=''
+  gh_read 20 api "repos/$1/issues/$2/timeline" --paginate --jq '.[] | select(.event == "ready_for_review") | .created_at' 2>/dev/null || return 1
+  ready=''; while IFS= read -r r; do [ -z "$r" ] || ready="$r"; done <<<"$GH_OUT"
+  [ -n "$ready" ] || return 0
   # tous les contrôles, puis awk : un job annulé d'une exécution remplacée (plus récente, même workflow, même événement, PR #125) n'est
   # pas un reste ; ne restent que skipping et cancel
   line="$(with_timeout 30 gh pr checks -R "$1" "$2" --json name,bucket,link,workflow,event --jq '.[] | [.name, .link, .workflow, .bucket, .event] | @tsv' 2>/dev/null)" || return 1
@@ -304,7 +409,7 @@ pr_draft_leftovers() {
     [[ "$created" < "$ready" ]] && pre="$pre$name"$'\t'"$wf"$'\t'"$bucket"$'\n'
   done <<<"$line"
   [ -n "$pre" ] || return 0
-  printf '%s' "$pre" | pr_skip_kinds "${3:-}" "${4:-}" | awk -F '\t' '$1 != "own"'
+  PR_LEFT="$(printf '%s' "$pre" | pr_skip_kinds "${3:-}" "${4:-}" | awk -F '\t' '$1 != "own"')"
 }
 # pr_skip_kinds <root> <révision> : stdin « nom<TAB>workflow<TAB>bucket » des contrôles d'une exécution d'avant le passage « prête » ;
 # par contrôle « genre<TAB>nom<TAB>workflow<TAB>fichier<TAB>bucket », genre lu dans les workflows de la révision (git show, sans appel gh) :
@@ -373,6 +478,7 @@ pr_skip_kinds() {
 # jamais remplacé (draft), avertissement qui nomme contrôle, workflow et remède, recopié dans LAB_CHECKS_NOTE (issue du veilleur)
 pr_leftovers_read() {
   local deaf
+  [ -n "$2" ] || { LEFT_WAIT=''; LEFT_UNREAD=''; return 1; }   # aucun reste : rien à lire, aucun programme (lot 05 de charge-processeur)
   LEFT_WAIT="$(printf '%s\n' "$2" | awk -F '\t' '$1 == "replaceable" || $1 == "unread" { print $2 }')"
   LEFT_UNREAD="$(printf '%s\n' "$2" | awk -F '\t' '$1 == "unread" && $2 !~ /^\(/ { print $2 }' | paste -sd ',' - | sed 's/,/, /g')"
   deaf="$(printf '%s\n' "$2" | awk -F '\t' '$1 == "draft" { printf "%s%s %s, workflow %s (%s)", (n++ ? "; " : ""), $2, ($5 == "cancel" ? "cancelled" : "skipped"), $3, $4 }')"
@@ -395,6 +501,40 @@ pr_superseded_cancels() {
 # pr_checks_drop <liens> : retire du relevé texte de gh pr checks (stdin) les lignes dont le lien (4e colonne) figure dans <liens>
 pr_checks_drop() {
   LINKS="$1" awk -F '\t' 'BEGIN { n = split(ENVIRON["LINKS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") d[a[i]] = 1 } !($4 in d)'
+}
+# checks_col <relevé> <valeur> [noms exclus, un par ligne] : rc 0 si une ligne du relevé de gh pr checks porte <valeur> en 2e colonne
+# (champs séparés par une tabulation, comme awk -F '\t') sous un nom (1re colonne) hors des noms exclus ; checks_all_pass <relevé> :
+# rc 0 si chaque ligne porte pass ou skipping — le shell seul, ligne par ligne (lot 05 de charge-processeur : awk et grep avant)
+checks_col() {
+  local line name rest b x
+  while IFS= read -r line; do
+    case "$line" in *$'\t'*) name="${line%%$'\t'*}"; rest="${line#*$'\t'}"; b="${rest%%$'\t'*}" ;; *) name="$line"; b='' ;; esac
+    [ "$b" = "$2" ] || continue
+    if [ -n "${3:-}" ]; then
+      while IFS= read -r x; do [ "$x" != "$name" ] || continue 2; done <<<"$3"
+    fi
+    return 0
+  done <<<"$1"
+  return 1
+}
+# checks_all_listed <relevé> : rc 0 si chaque ligne est une ligne de contrôle (nom, tabulation, état) — aucun message de gh mêlé
+checks_all_listed() {
+  local line
+  while IFS= read -r line; do case "$line" in *$'\t'*) ;; *) return 1 ;; esac; done <<<"$1"
+}
+checks_all_pass() {
+  local line rest b
+  while IFS= read -r line; do
+    case "$line" in *$'\t'*) rest="${line#*$'\t'}"; b="${rest%%$'\t'*}" ;; *) b='' ;; esac
+    case "$b" in pass|skipping) ;; *) return 1 ;; esac
+  done <<<"$1"
+}
+# pr_repo_set <root> : PR_REPO, le dépôt GitHub owner/repo du remote de <root> (vide si illisible) — lu une fois par processus et par
+# dossier (lot 05 de charge-processeur : un git remote get-url par lecture de PR avant)
+pr_repo_set() {
+  [ "${PR_REPO_KEY:-}" != "$1|${P_REMOTE:-origin}" ] || return 0
+  repo_slug_set "$1" "${P_REMOTE:-origin}" 2>/dev/null || true; PR_REPO="$REPO_SLUG"
+  PR_REPO_KEY="$1|${P_REMOTE:-origin}"
 }
 # pr_workflows_kind<root> <révision> <branche de tête> <branche cible> → pr | none | unreadable : les workflows de la révision de tête
 # de la PR et ceux de la cible distante (GitHub exécute pull_request depuis leur fusion, pull_request_target depuis la cible) peuvent-ils
@@ -459,8 +599,8 @@ pr_workflows_kind() {
       end
       puts "#{pr ? "pr" : "none"} #{File.basename(path)}"
     end' "$root" "$3" "$4" 2>/dev/null)" || out=""
-  if printf '%s\n' "$out" | grep -q '^pr '; then echo pr; return 0; fi
-  if [ -z "$out" ] || printf '%s\n' "$out" | grep -q '^unreadable '; then
+  if grep -q '^pr ' <<<"$out"; then echo pr; return 0; fi
+  if [ -z "$out" ] || grep -q '^unreadable ' <<<"$out"; then
     warn "workflow unreadable ($(printf '%s\n' "$out" | sed -n 's/^unreadable //p' | paste -sd ',' - | sed 's/,/, /g;s/^$/read failed/')): counted as pull request CI, wait kept"
     echo unreadable; return 0
   fi
@@ -472,110 +612,126 @@ pr_ci_none() { [ "$(pr_workflows_kind "$@")" = none ]; }
 pr_ci_kv() { if pr_ci_none "$@" 2>/dev/null; then kv CI "none (no pull request workflow)"; fi; }
 # pr_checks_wait <root> <numéro> <révision> <tête> <cible> → green | red | pending | none  (attend jusqu'à LAB_CHECKS_TIMEOUT s, défaut
 # 900) ; un contrôle échoué ou annulé → red (lot 23) ; none tout de suite si aucun workflow de demande de fusion (lot 01 de ci-pr)
-pr_checks_wait() {
+pr_checks_wait() { pr_checks_wait_set "$@"; printf '%s\n' "$PR_CHECKS"; }
+# pr_checks_wait_set : la même attente, son résultat dans PR_CHECKS — sans substitution autour, dans le veilleur (lot 05 de
+# charge-processeur)
+pr_checks_wait_set() {
   local -a rargs=(); local s out rc kind=""
-  s="$(repo_slug "$1" "${P_REMOTE:-origin}" 2>/dev/null)" && rargs=(-R "$s")
+  PR_CHECKS=
+  pr_repo_set "$1"; s="$PR_REPO"; [ -z "$s" ] || rargs=(-R "$s")
   # délai de grâce : les checks CI mettent souvent 10 à 60 s à apparaître après l'ouverture de la PR
-  local waited=0 grace="${LAB_CHECKS_GRACE:-90}" poll="${LAB_CHECKS_POLL:-10}"
+  local waited=0 grace="${LAB_CHECKS_GRACE:-90}" poll="${LAB_CHECKS_POLL:-10}" appear
+  # attente de l'apparition des contrôles : au rythme du veilleur (LAB_CHECKS_APPEAR_POLL, posé par lui seul), sinon poll
+  appear="${LAB_CHECKS_APPEAR_POLL:-$poll}"
   while :; do
-    out="$(with_timeout 30 gh pr checks "${rargs[@]+"${rargs[@]}"}" "$2" 2>&1)" && rc=0 || rc=$?
+    gh_read_all 30 pr checks "${rargs[@]+"${rargs[@]}"}" "$2" && rc=0 || rc=$?; out="$GH_OUT"
     case "$out" in
       *"no checks reported"*|"")
         [ -n "$kind" ] || kind="$(pr_workflows_kind "$1" "$3" "$4" "$5")"
-        [ "$kind" != none ] || { echo none; return 0; }
+        [ "$kind" != none ] || { PR_CHECKS=none; return 0; }
         ;;
       *) break ;;
     esac
     # délai écoulé sans contrôle : none seulement sans workflow de demande de fusion — jamais une fusion « sans contrôle » (revue du lot 01 de ci-pr)
-    [ "$waited" -lt "$grace" ] || { if [ "$kind" = none ]; then echo none; else echo pending; fi; return 0; }
-    sleep "$poll"; waited=$((waited + poll))
+    [ "$waited" -lt "$grace" ] || { if [ "$kind" = none ]; then PR_CHECKS=none; else PR_CHECKS=pending; fi; return 0; }
+    lab_pause "$appear"; waited=$((waited + appear))
   done
   # Vert seulement sans reste de brouillon (lot 13) : un job sauté avant le passage « prête » attend l'exécution neuve, jusqu'à
   # l'échéance commune, puis se lit pending — jamais green. Sans slug lisible, rien à comparer : le vert de gh vaut.
   # gh rend 0 sur un job annulé (limite de durée, lot 23) : une lecture simple tranche — échec, ou annulation hors reste de
   # brouillon → red ; vert seulement sur un relevé non vide de contrôles « pass » ou « skipping », sinon attente puis pending.
   # Les jobs annulés d'une exécution remplacée sont retirés du relevé : --fail-fast rend alors la main trop tôt, l'attente se poursuit.
-  local deadline=$((SECONDS + ${LAB_CHECKS_TIMEOUT:-900})) left why sup LEFT_WAIT="" LEFT_UNREAD=""
+  local deadline=$((SECONDS + ${LAB_CHECKS_TIMEOUT:-900})) left why sup LEFT_WAIT="" LEFT_UNREAD="" known=0
+  # contrôles déjà tous finis et passés à la première lecture (rc 0, aucun message de gh mêlé) : --watch rendrait 0 aussitôt et la
+  # relecture le même relevé — dans le veilleur, elle sert de relevé au premier tour (lot 05 de charge-processeur : deux gh de moins)
+  if [ -n "$out" ] && [ "$rc" = 0 ] && gh_piped && checks_all_listed "$out"; then known=1; fi
   while :; do
-    rc=0; with_timeout "$((deadline > SECONDS ? deadline - SECONDS : 1))" gh pr checks "${rargs[@]+"${rargs[@]}"}" "$2" --watch --fail-fast >/dev/null 2>&1 || rc=$?
-    [ "$rc" != 124 ] || { echo pending; return 0; }
-    out="$(with_timeout 30 gh pr checks "${rargs[@]+"${rargs[@]}"}" "$2" 2>/dev/null)" || true
+    if [ "$known" = 1 ]; then known=0; rc=0
+    else
+      rc=0; with_timeout "$((deadline > SECONDS ? deadline - SECONDS : 1))" gh pr checks "${rargs[@]+"${rargs[@]}"}" "$2" --watch --fail-fast >/dev/null 2>&1 || rc=$?
+      [ "$rc" != 124 ] || { PR_CHECKS=pending; return 0; }
+      gh_read 30 pr checks "${rargs[@]+"${rargs[@]}"}" "$2" 2>/dev/null || true; out="$GH_OUT"
+    fi
     sup=""
-    if [ -n "$s" ] && printf '%s\n' "$out" | grep -q $'\tfail'; then
-      sup="$(pr_superseded_cancels "$s" "$2")"; [ -z "$sup" ] || out="$(printf '%s\n' "$out" | pr_checks_drop "$sup")"
+    if [ -n "$s" ]; then case "$out" in *$'\t'fail*)
+      sup="$(pr_superseded_cancels "$s" "$2")"; [ -z "$sup" ] || out="$(printf '%s\n' "$out" | pr_checks_drop "$sup")" ;; esac
     fi
     if [ "$rc" != 0 ]; then
-      [ -n "$sup" ] || { echo red; return 0; }
-      if ! printf '%s\n' "$out" | grep -q $'\tfail' && printf '%s\n' "$out" | grep -q $'\tpending'; then
-        if [ "$SECONDS" -ge "$deadline" ]; then echo pending; return 0; fi
-        sleep "$poll"; continue
-      fi
+      [ -n "$sup" ] || { PR_CHECKS=red; return 0; }
+      case "$out" in *$'\t'fail*) ;; *$'\t'pending*)
+        if [ "$SECONDS" -ge "$deadline" ]; then PR_CHECKS=pending; return 0; fi
+        lab_pause "$poll"; continue ;;
+      esac
     fi
-    if printf '%s\n' "$out" | grep -q $'\tfail'; then echo red; return 0; fi
+    case "$out" in *$'\t'fail*) PR_CHECKS=red; return 0 ;; esac
     # restes classés par les workflows de la révision (couloir veilleur-saute) : brouillon sans exécution possible → red nommé
-    left=""; [ -z "$s" ] || left="$(pr_draft_leftovers "$s" "$2" "$1" "${3:-}")" || left=$'unread\t(checks unreadable by gh)'
-    if pr_leftovers_read "$2" "$left"; then echo red; return 0; fi
-    if printf '%s\n' "$out" | LEFT="$LEFT_WAIT" awk -F '\t' 'BEGIN { n = split(ENVIRON["LEFT"], a, "\n"); for (i = 1; i <= n; i++) l[a[i]] = 1 }
-      $2 == "cancel" && !($1 in l) { f = 1 } END { exit !f }'; then echo red; return 0; fi
+    left=""; [ -z "$s" ] || { pr_draft_leftovers_set "$s" "$2" "$1" "${3:-}" && left="$PR_LEFT"; } || left=$'unread\t(checks unreadable by gh)'
+    if pr_leftovers_read "$2" "$left"; then PR_CHECKS=red; return 0; fi
+    if checks_col "$out" cancel "$LEFT_WAIT"; then PR_CHECKS=red; return 0; fi
     if [ -z "$LEFT_WAIT" ]; then
-      if [ -n "$out" ] && ! printf '%s\n' "$out" | awk -F '\t' '$2 != "pass" && $2 != "skipping" { f = 1 } END { exit !f }'; then
-        echo green; return 0
+      if [ -n "$out" ] && checks_all_pass "$out"; then
+        PR_CHECKS=green; return 0
       fi
       why="check list empty or a check back in progress"
     else
       why="$(printf '%s' "$LEFT_WAIT" | paste -sd ',' -) skipped or cancelled before the PR was marked ready, no new run yet"
       [ -z "$LEFT_UNREAD" ] || why="$why; not linked to a workflow job (workflow or job unread): $LEFT_UNREAD, wait kept"
     fi
-    if [ "$SECONDS" -ge "$deadline" ]; then warn "PR #$2: $why: no pass yet"; echo pending; return 0; fi
-    sleep "$poll"
+    if [ "$SECONDS" -ge "$deadline" ]; then warn "PR #$2: $why: no pass yet"; PR_CHECKS=pending; return 0; fi
+    lab_pause "$poll"
   done
 }
 # pr_view_state <wt> <numéro> → ÉTAT<TAB>révision de tête (OPEN|MERGED|CLOSED) ; rc ≠ 0 si gh ne répond pas (lot 14)
-pr_view_state() {
-  local -a rargs=(); local s
-  s="$(repo_slug "$1" "${P_REMOTE:-origin}" 2>/dev/null)" && rargs=(-R "$s")
-  (cd "$1" && with_timeout 20 gh pr view "${rargs[@]+"${rargs[@]}"}" "$2" --json state,headRefOid --jq '[.state, .headRefOid] | @tsv') 2>/dev/null
+pr_view_state() { pr_view_set "$1" "$2" || return; [ -z "$PR_VIEW" ] || printf '%s\n' "$PR_VIEW"; }
+# pr_view_set <wt> <numéro> : la même lecture dans PR_VIEW, PR_STATE (1re colonne) et PR_HEAD (2e), sans substitution ni découpe — une
+# seule lecture GitHub, et dans le veilleur gh seul (lot 05 de charge-processeur)
+pr_view_set() {
+  local -a rargs=(); local rc=0
+  PR_VIEW='' PR_STATE='' PR_HEAD=''
+  pr_repo_set "$1"; [ -z "$PR_REPO" ] || rargs=(-R "$PR_REPO")
+  gh_read_in "$1" 20 pr view "${rargs[@]+"${rargs[@]}"}" "$2" --json state,headRefOid --jq '[.state, .headRefOid] | @tsv' 2>/dev/null || rc=$?
+  PR_VIEW="$GH_OUT"; PR_STATE="${PR_VIEW%%$'\t'*}"; PR_HEAD="${PR_VIEW#*$'\t'}"; PR_HEAD="${PR_HEAD%%$'\t'*}"
+  return "$rc"
 }
 # pr_merge_exact <wt> <numéro> <sha> [méthode] : fusion par l'API à cette révision exacte — GitHub refuse si la tête a bougé (lot 14) ;
 # la méthode du projet par défaut, « merge » pour une promotion staging → main (lot 16)
 pr_merge_exact() {
-  local -a rargs=(); local s
-  s="$(repo_slug "$1" "${P_REMOTE:-origin}" 2>/dev/null)" && rargs=(-R "$s")
-  (cd "$1" && with_timeout 120 gh pr merge "${rargs[@]+"${rargs[@]}"}" "$2" "--${4:-${P_MERGE_METHOD:-squash}}" --match-head-commit "$3") >/dev/null 2>&1
+  local -a rargs=()
+  pr_repo_set "$1"; [ -z "$PR_REPO" ] || rargs=(-R "$PR_REPO")
+  gh_read_in "$1" 120 pr merge "${rargs[@]+"${rargs[@]}"}" "$2" "--${4:-${P_MERGE_METHOD:-squash}}" --match-head-commit "$3" >/dev/null 2>&1
 }
 # pr_checks_now <wt> <numéro> <révision> <tête> <cible> → green | red | pending | none, en une seule lecture, sans attente : lab merge et
 # lab close rendent la main (lot 14). Juste après un passage « prête » (PR_READY_RESULT=oui), l'exécution neuve n'existe pas encore :
 # pending, jamais green. Aucun contrôle : none seulement si aucun workflow de demande de fusion (lot 01 de ci-pr), sinon pending.
 pr_checks_now() {
   local -a rargs=(); local s out rc=0 left LEFT_WAIT="" LEFT_UNREAD=""
-  s="$(repo_slug "$1" "${P_REMOTE:-origin}" 2>/dev/null)" && rargs=(-R "$s")
-  out="$(with_timeout 30 gh pr checks "${rargs[@]+"${rargs[@]}"}" "$2" 2>&1)" || rc=$?
+  pr_repo_set "$1"; s="$PR_REPO"; [ -z "$s" ] || rargs=(-R "$s")
+  gh_read_all 30 pr checks "${rargs[@]+"${rargs[@]}"}" "$2" || rc=$?; out="$GH_OUT"
   case "$out" in
     *"no checks reported"*|"")
       if pr_ci_none "$1" "$3" "$4" "$5"; then echo none; else echo pending; fi; return 0 ;;
   esac
   # jobs annulés d'une exécution remplacée : hors relevé ; le rc de gh venait de leur « fail », il ne vaut plus que pour un job en cours
-  if [ -n "$s" ] && printf '%s\n' "$out" | grep -q $'\tfail'; then
+  if [ -n "$s" ]; then case "$out" in *$'\t'fail*)
     left="$(pr_superseded_cancels "$s" "$2")"
     if [ -n "$left" ]; then
-      out="$(printf '%s\n' "$out" | pr_checks_drop "$left")"; printf '%s\n' "$out" | grep -q $'\tpending' || rc=0
-    fi
+      out="$(printf '%s\n' "$out" | pr_checks_drop "$left")"; case "$out" in *$'\t'pending*) ;; *) rc=0 ;; esac
+    fi ;; esac
   fi
-  if printf '%s\n' "$out" | grep -q $'\tfail'; then echo red; return 0; fi
+  case "$out" in *$'\t'fail*) echo red; return 0 ;; esac
   # restes de brouillon lus avant la règle cancel, comme pr_checks_wait (lot-03 livrer-sans-friction) : l'exécution du brouillon
   # annulée par cancel-in-progress attend l'exécution neuve → pending ; une annulation hors reste (limite de durée) reste rouge
   # lus seulement s'ils décident : une annulation à juger, ou un vert à confirmer (gh en panne → pending sans attente de plus)
   left=""
-  if printf '%s\n' "$out" | grep -q $'\tcancel'; then
-    [ -z "$s" ] || left="$(pr_draft_leftovers "$s" "$2" "$1" "$3")" || left=$'unread\t(checks unreadable by gh)'
+  case "$out" in *$'\t'cancel*)
+    [ -z "$s" ] || { pr_draft_leftovers_set "$s" "$2" "$1" "$3" && left="$PR_LEFT"; } || left=$'unread\t(checks unreadable by gh)'
     if pr_leftovers_read "$2" "$left"; then echo red; return 0; fi
-    if printf '%s\n' "$out" | LEFT="$LEFT_WAIT" awk -F '\t' 'BEGIN { n = split(ENVIRON["LEFT"], a, "\n"); for (i = 1; i <= n; i++) l[a[i]] = 1 }
-      $2 == "cancel" && !($1 in l) { f = 1 } END { exit !f }'; then echo red; return 0; fi
-    echo pending; return 0
-  fi
+    if checks_col "$out" cancel "$LEFT_WAIT"; then echo red; return 0; fi
+    echo pending; return 0 ;;
+  esac
   if [ "$rc" != 0 ] || [ "${PR_READY_RESULT:-}" = yes ]; then echo pending; return 0; fi
   if [ -n "$s" ]; then
-    left="$(pr_draft_leftovers "$s" "$2" "$1" "$3")" || left=$'unread\t(checks unreadable by gh)'
+    { pr_draft_leftovers_set "$s" "$2" "$1" "$3" && left="$PR_LEFT"; } || left=$'unread\t(checks unreadable by gh)'
     if pr_leftovers_read "$2" "$left"; then echo red; return 0; fi
     [ -z "$LEFT_WAIT" ] || { echo pending; return 0; }
   fi

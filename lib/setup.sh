@@ -314,6 +314,10 @@ _setup_info() {
       case "$note" in treelab-setup-v1:*) LAB_SETUP_INFO="${note#treelab-setup-v1:}" ;; esac
     fi
   done <"$LAB_TXN_MANIFEST"
+  _setup_info_check
+}
+# _setup_info_check : LAB_SETUP_INFO vide, ou l'objet de la première pose, valide
+_setup_info_check() {
   [ -n "$LAB_SETUP_INFO" ] || return 0
   printf '%s' "$LAB_SETUP_INFO" | jq -e '
     type=="object" and (.root|type=="string" and startswith("/")) and

@@ -5,6 +5,7 @@
 # Lecture : le nouvel emplacement d'abord, l'ancien (docs/lots/lot-NN-<slug>.md) à défaut — jamais réécrit.
 # Fiches françaises ou anglaises : chaque lecteur passe par lang_norm (lib/lang.sh), chaque écrivain suit la langue du document.
 . "${BASH_SOURCE[0]%/*}/lang.sh"
+. "${BASH_SOURCE[0]%/*}/facts.sh"
 lots_dir() { if [ -n "${2:-}" ]; then printf '%s/lots/%s\n' "$1" "$2"; else printf '%s/lots\n' "$1"; fi; }
 # next_lot_number <docs> <couloir> [plancher] : max des chiffres de tête de lots/<couloir>/lot-*.md + 1
 # (lot-88.md, lot-60d-g.md, lot-03-x.md → 89). La numérotation repart à 01 dans un couloir neuf : chaque couloir a la sienne.
@@ -20,50 +21,76 @@ next_lot_number() {
 }
 # current_lot_file <docs> <slug> [couloir] → dernier lot-NN-<slug>.md (vide si aucun).
 # Le dossier du couloir gagne ; sans lui, l'ancien emplacement commun est lu (projets d'avant le lot 02).
-# shellcheck disable=SC2012
-current_lot_file() {
-  local f=""
-  [ -n "${3:-}" ] && f="$(ls "$(lots_dir "$1" "$3")"/lot-[0-9]*-"$2".md 2>/dev/null | sort | tail -1)"
-  [ -n "$f" ] || f="$(ls "$(lots_dir "$1")"/lot-[0-9]*-"$2".md 2>/dev/null | sort | tail -1)"
-  printf '%s\n' "$f"
+current_lot_file() { current_lot_set "$@"; printf '%s\n' "$CURRENT_LOT"; }
+# Un dossier nommé comme une fiche : ls listait son contenu, et la réponse en dépendait — elle est rendue par la même commande, seul
+# cas où ces lectures lancent un programme (corpus du lot 02 de charge-processeur)
+current_lot_set() { # les mêmes arguments : CURRENT_LOT, sans processus
+  local f d=0
+  CURRENT_LOT=''
+  if [ -n "${3:-}" ]; then
+    for f in "$1/lots/$3"/lot-[0-9]*-"$2".md; do if [ -e "$f" ] || [ -L "$f" ]; then CURRENT_LOT="$f"; [ ! -d "$f" ] || d=1; fi; done
+    # shellcheck disable=SC2012 # repli voulu : la réponse de ls d'avant le lot, quand un dossier porte le nom d'une fiche
+    [ "$d" = 0 ] || CURRENT_LOT="$(ls "$1/lots/$3"/lot-[0-9]*-"$2".md 2>/dev/null | sort | tail -1)" || true
+  fi
+  [ -z "$CURRENT_LOT" ] || return 0
+  d=0
+  for f in "$1/lots"/lot-[0-9]*-"$2".md; do if [ -e "$f" ] || [ -L "$f" ]; then CURRENT_LOT="$f"; [ ! -d "$f" ] || d=1; fi; done
+  # shellcheck disable=SC2012 # repli voulu : la réponse de ls d'avant le lot, quand un dossier porte le nom d'une fiche
+  [ "$d" = 0 ] || CURRENT_LOT="$(ls "$1/lots"/lot-[0-9]*-"$2".md 2>/dev/null | sort | tail -1)" || true
 }
 lot_number_of() { basename "$1" | sed -n 's/^lot-\([0-9][0-9]*\).*/\1/p'; }
 # lot_slug_of <wt> : slug du lot = celui de la branche <kind>/<slug> (une branche par lot, 2026-09-02), sinon le nom du dossier.
 # Une branche de réouverture chore/<slug>.c<N>[.r<report>] (lot 02 d'autonomie-tours) rend le slug du lot rouvert, suffixe retiré.
-lot_slug_of() {
-  local br; br="$(branch_name "$1")"
+lot_slug_of() { lot_slug_set "$1"; printf '%s\n' "$LOT_SLUG"; }
+lot_slug_set() { # <wt> : LOT_SLUG, sans processus
+  local br d; head_branch_set "$1"; br="$HEAD_BRANCH"
   case "$br" in
-    */*) local bare; br="${br#*/}"   # BASH_REMATCH lu avant reopen_branch_of, qui le réécrit
-         if [[ "$br" =~ ^(.+)\.c[0-9]+(\.r[0-9]+)?$ ]]; then bare="${BASH_REMATCH[1]}"; ! reopen_branch_of "$1" >/dev/null || br="$bare"; fi
-         printf '%s\n' "$br" ;;
-    *) local slug; slug="$(wt_meta "$1" lot)"; if [ -n "$slug" ]; then printf '%s\n' "$slug"; else basename "$1"; fi ;;
+    */*) LOT_SLUG="${br#*/}"
+         if [[ "$LOT_SLUG" =~ ^(.+)\.c[0-9]+(\.r[0-9]+)?$ ]] && reopen_branch_is "$br"; then
+           [[ "$LOT_SLUG" =~ ^(.+)\.c[0-9]+(\.r[0-9]+)?$ ]]; LOT_SLUG="${BASH_REMATCH[1]}"
+         fi ;;
+    *) kv_value "$1/.lab/meta" lot || true; d="${1%/}"; LOT_SLUG="${KV_VALUE:-${d##*/}}" ;;
   esac
 }
 # reopen_branch_of <wt> → « C<N> » si la branche est une réouverture chore/<slug>.c<N>, ou chore/<slug>.c<N>.r<k> après le k-ième
 # report, rc 1 sinon. Un slug de lot qui finit ainsi est refusé à sa création (lot_slug_reserved) : le suffixe n'est jamais ambigu.
 reopen_branch_of() {
-  local br; br="$(branch_name "$1")"
-  [[ "$br" =~ ^chore/.+\.c([0-9]+)(\.r[0-9]+)?$ ]] || return 1
+  head_branch_set "$1"
+  reopen_branch_is "$HEAD_BRANCH" || return 1
   printf 'C%s\n' "${BASH_REMATCH[1]}"
 }
+reopen_branch_is() { [[ "$1" =~ ^chore/.+\.c([0-9]+)(\.r[0-9]+)?$ ]]; }   # <branche> : réouverture ; BASH_REMATCH[1], le numéro du critère
 lot_slug_reserved() { [[ "${1:-}" =~ \.c[0-9]+(\.r[0-9]+)?$ ]]; }
 # wt_own_lot_file <wt> → la fiche nommée par la branche, sans repli sur la fiche de tête (lab batch wait, sur une réouverture)
 wt_own_lot_file() { current_lot_file "$(docs_dir "$1")" "$(lot_slug_of "$1")" "$(wt_lane "$1")"; }
 # lane_head_lot <docs> <couloir> → fiche de plus grand numéro du couloir (vide si aucune)
-# shellcheck disable=SC2012
-lane_head_lot() { ls "$(lots_dir "$1" "$2")"/lot-[0-9]*.md 2>/dev/null | awk '{ n = $0; sub(/.*\/lot-/, "", n); sub(/[^0-9].*/, "", n); print n + 0 "\t" $0 }' | sort -n | tail -1 | cut -f2-; }
+lane_head_lot() { lane_head_set "$@"; [ -z "$HEAD_LOT" ] || printf '%s\n' "$HEAD_LOT"; }
+lane_head_set() { # les mêmes arguments : HEAD_LOT, sans processus hors d'un dossier nommé comme une fiche (current_lot_set)
+  local f n max=-1 d=0
+  HEAD_LOT=''
+  for f in "$1/lots/$2"/lot-[0-9]*.md; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    [ ! -d "$f" ] || d=1
+    n="${f##*/lot-}"; n="${n%%[!0-9]*}"; n=$((10#$n))
+    [ "$n" -lt "$max" ] || { max="$n"; HEAD_LOT="$f"; }
+  done
+  # shellcheck disable=SC2012 # repli voulu : la réponse de ls d'avant le lot, quand un dossier porte le nom d'une fiche
+  [ "$d" = 0 ] || HEAD_LOT="$(ls "$1/lots/$2"/lot-[0-9]*.md 2>/dev/null | awk '{ n = $0; sub(/.*\/lot-/, "", n); sub(/[^0-9].*/, "", n); print n + 0 "\t" $0 }' | sort -n | tail -1 | cut -f2-)" || true
+}
 # wt_lot_file <wt> → fiche du lot courant du couloir : lot-NN-<slug de la branche>.md, sinon lot-NN-<nom du couloir>.md
 # (couloirs d'avant le lot 9 : le worktree 60d-g sur feat/60d-h garde sa fiche lot-97-60d-g). Vide si aucune.
 # Sur une branche de réouverture, la fiche rouverte tant qu'elle est planifiée ou en cours ; close ou de nouveau en attente, le
 # couloir reprend sa fiche de tête (plus grand numéro) : lab next, la recette et lab status repartent d'où le couloir en était.
-wt_lot_file() {
-  local docs lane f h; docs="$(docs_dir "$1")"; lane="$(wt_lane "$1")"
-  f="$(current_lot_file "$docs" "$(lot_slug_of "$1")" "$lane")"
-  [ -n "$f" ] || f="$(current_lot_file "$docs" "$(basename "$1")" "$lane")"
-  if [ -n "$f" ] && reopen_branch_of "$1" >/dev/null; then
-    case "$(lot_state "$f")" in planned*|'in progress'*) ;; *) h="$(lane_head_lot "$docs" "$lane")"; [ -z "$h" ] || f="$h" ;; esac
+wt_lot_file() { wt_lot_set "$1"; printf '%s\n' "$WT_LOT"; }
+wt_lot_set() { # <wt> : WT_LOT ; sans processus hors d'une branche de réouverture
+  local docs lane d="${1%/}"
+  docs_dir_set "$1"; docs="$DOCS_DIR"; wt_lane_set "$1"; lane="$WT_LANE"
+  lot_slug_set "$1"; current_lot_set "$docs" "$LOT_SLUG" "$lane"; WT_LOT="$CURRENT_LOT"
+  [ -n "$WT_LOT" ] || { current_lot_set "$docs" "${d##*/}" "$lane"; WT_LOT="$CURRENT_LOT"; }
+  if [ -n "$WT_LOT" ] && reopen_branch_is "$HEAD_BRANCH"; then
+    lot_state_set "$WT_LOT"
+    case "$LOT_STATE" in planned*|'in progress'*) ;; *) lane_head_set "$docs" "$lane"; [ -z "$HEAD_LOT" ] || WT_LOT="$HEAD_LOT" ;; esac
   fi
-  printf '%s\n' "$f"
 }
 # lot_state_check <fiche> → <verdict><TAB><n° de ligne><TAB><valeur><TAB><ligne brute>, verdict ok | variante | inconnue | absente.
 # Lecture tolérante (lot 12) : une ligne « État » écrite à la main — casse, puce - * +, deux-points dans ou hors du gras, gras absent,
@@ -73,26 +100,18 @@ wt_lot_file() {
 LOT_STATE_EXPECTED='"**State** : planned", "in progress", "waiting" or "closed" (French batch file: "**État** : planifié", "en cours", "en attente" or "clos"), optionally followed by a suffix'
 lot_state_check() {
   [ -f "${1:-}" ] && [ -r "$1" ] || { printf 'absente\t\t\t\n'; return 0; }
-  lang_norm <"$1" | LC_ALL=C awk '
-    { sub(/\r$/, "") }
-    /^[ \t]*(```|~~~)/ { fence = !fence; next }
-    fence { next }
-    /^## +(Objectif|Journal|Reprise)/ { exit }
-    {
-      l = $0; gsub(/\302\240|\342\200\257|\342\200\211|\t/, " ", l)
-      if (!match(l, /^ *([-*+] +)?(\*\*|__)?(\303\211|\303\251|E|e)[Tt][Aa][Tt] *(\*\*|__)? *: *(\*\*|__)? */)) next
-      v = substr(l, RSTART + RLENGTH); sub(/ +$/, "", v)
-      t = v; if (gsub(/\*\*/, "", t) % 2) sub(/ *\*\*$/, "", v)
-      t = v; if (gsub(/__/, "", t) % 2) sub(/ *__$/, "", v)
-      if (v !~ /^(planifi\303\251|en cours|en attente|clos)([^A-Za-z0-9\200-\377]|$)/) verdict = "inconnue"
-      else if ($0 == "**\303\211tat** : " v) verdict = "ok"
-      else verdict = "variante"
-      printf "%s\t%d\t%s\t%s\n", verdict, NR, v, $0; found = 1; exit
-    }
-    END { if (!found) printf "absente\t\t\t\n" }'
+  lang_norm <"$1" | LC_ALL=C awk "$DOC_AWK"'
+    BEGIN { lot_state_reset() }
+    lot_state_scan($0, NR) { exit }
+    END { if (ST_N == "") printf "absente\t\t\t\n"; else printf "%s\t%d\t%s\t%s\n", ST_VERDICT, ST_N, ST_V, ST_RAW }'
 }
 # lot_state <fiche> → état anglais : planned | in progress | closed, suffixe conservé (vide si pas de fiche ; jamais rc≠0 : appelé en `st="$(lot_state …)"` sous set -e, un rc=1 tuait la CLI en silence — review du lot 9)
-lot_state() { lang_code_prefix "$(lot_state_check "${1:-}" | cut -f3)"; }   # toujours anglais, quelle que soit la langue de la fiche
+lot_state() { lot_state_set "${1:-}"; printf '%s\n' "$LOT_STATE"; }   # toujours anglais, quelle que soit la langue de la fiche
+lot_state_set() { # <fiche> : LOT_STATE
+  LOT_STATE=''
+  doc_need "${1:-}" S || return 0
+  doc_fact STATE; lang_code_prefix_set "$DOC_FACT"; LOT_STATE="$LANG_CODE"
+}
 # lot_set_state <fiche> <état anglais> : la ligne d'État de l'en-tête, quelle que soit sa forme, devient « **État** : <état> » ; rien sans ligne.
 # Une ligne anglaise reste anglaise : « **State** : <valeur anglaise> » (la langue est celle de la ligne elle-même).
 lot_set_state() {
@@ -183,7 +202,21 @@ lot_mac_signal() {
     }'
 }
 # lot_title_of <fiche> → titre du lot lu dans son titre de premier niveau « # Lot NN — <titre> » (vide si illisible)
-lot_title_of() { [ -f "${1:-}" ] && [ -r "$1" ] || return 0; lang_norm <"$1" | sed -n 's/^# Lot [0-9][0-9]*[[:space:]]*—[[:space:]]*//p' | head -1; }
+lot_title_of() { lot_title_set "${1:-}"; [ -z "$LOT_TITLE" ] || printf '%s\n' "$LOT_TITLE"; }
+LOT_TITLE_RE='^[[:space:]]*—[[:space:]]*(.*)$'
+lot_title_set() { # <fiche> : LOT_TITLE, la première ligne de titre qui porte un tiret — presque toujours au-dessus de l'État
+  local l kind
+  LOT_TITLE=''
+  for kind in S F; do
+    doc_need "${1:-}" "$kind" || return 0
+    doc_fact TITLE; DOC_FACT="$DOC_FACT"$'\n'
+    while [ -n "$DOC_FACT" ]; do
+      l="${DOC_FACT%%$'\n'*}"; DOC_FACT="${DOC_FACT#*$'\n'}"
+      if [[ "$l" =~ $LOT_TITLE_RE ]]; then LOT_TITLE="${BASH_REMATCH[1]}"; return 0; fi
+    done
+    [ "$DOC_KIND" = S ] || return 0
+  done
+}
 # create_lot <docs> <couloir> <slug> <titre> [projet] [branche] [plancher] → chemin
 # Une fiche semée — même slug, « planifié », numéro au-dessus du plancher — est reprise telle quelle, jamais renumérotée (lot 26).
 # shellcheck disable=SC2012
@@ -314,11 +347,11 @@ ensure_treeplan() {
 # dans un treeplan anglais) si absent.
 # Aucun symbole d'avancement : la ligne dit l'ordre et l'intention, jamais l'état.
 treeplan_add() {
-  local tp name line tmp lots
+  local tp name line tmp lots lotnames
   tp="$(treeplan_file "$1" "$2")"; [ -f "$tp" ] || return 0
   lots="$(lang_word "$(lang_doc_of "$tp")" Lots)"
   name="$(basename "$3" .md)"
-  treeplan_lots "$tp" | cut -f1 | grep -Fxq "$name" && return 0
+  lotnames="$(treeplan_lots "$tp" | cut -f1)" && grep -Fxq "$name" <<<"$lotnames" && return 0
   line="- [$name](../lots/$2/$name.md) — $4"
   tmp="$(mktemp)"
   # insère à la fin de la section « ## Lots » (avant l'en-tête suivant), en gardant une ligne vide autour
@@ -329,23 +362,15 @@ treeplan_add() {
     insec { while (blank > 0) { print ""; blank-- } }
     { print }
     END { if (insec && !done) { if (blank == 0) print ""; print l } }' "$tp" >"$tmp"
-  treeplan_lots "$tmp" | cut -f1 | grep -Fxq "$name" || printf '\n## %s\n\n%s\n' "$lots" "$line" >>"$tmp"
+  lotnames="$(treeplan_lots "$tmp" | cut -f1)" && grep -Fxq "$name" <<<"$lotnames" || printf '\n## %s\n\n%s\n' "$lots" "$line" >>"$tmp"
   mv "$tmp" "$tp"
 }
 # treeplan_lots <treeplan> → « nom du lot<TAB>intention » pour chaque ligne de la section « ## Lots », dans l'ordre du fichier.
-treeplan_lots() {
-  [ -f "${1:-}" ] && [ -r "$1" ] || return 0
-  lang_norm <"$1" | awk '/^## Lots([[:space:]]|$)/ {inside=1; next} inside && /^## / {exit} inside {print}' |
-    sed -n 's/^- \[\(lot-[0-9][0-9]*[^]]*\)\]([^)]*)[[:space:]]*—*[[:space:]]*\(.*\)$/\1	\2/p'
-}
+treeplan_lots() { plan_lots_set "${1:-}"; [ -z "$PLAN_LOTS" ] || printf '%s\n' "$PLAN_LOTS"; }
+plan_lots_set() { PLAN_LOTS=''; doc_need "${1:-}" T || return 0; doc_fact LOTS; PLAN_LOTS="$DOC_FACT"; }   # <treeplan> : PLAN_LOTS, les mêmes lignes
 # treeplan_intent <treeplan> → la ligne « **Intention** : … » (vide si absente ou encore à écrire)
-treeplan_intent() {
-  local i
-  [ -f "${1:-}" ] && [ -r "$1" ] || return 0
-  i="$(lang_norm <"$1" | sed -n 's/^\*\*Intention\*\* *: *//p' | head -1)"
-  case "$i" in '<!--'*) i="" ;; esac
-  printf '%s\n' "$i"
-}
+treeplan_intent() { [ -f "${1:-}" ] && [ -r "$1" ] || return 0; plan_intent_set "$1"; printf '%s\n' "$PLAN_INTENT"; }
+plan_intent_set() { PLAN_INTENT=''; doc_need "${1:-}" T || return 0; doc_fact INTENT; PLAN_INTENT="$DOC_FACT"; }   # <treeplan> : PLAN_INTENT
 ensure_changelog() { [ -f "$1/CHANGELOG.md" ] || cp "$LAB_ROOT/templates/project/CHANGELOG.md" "$1/CHANGELOG.md"; }
 # changelog_add <fichier> <ligne> : insère sous « ## Unreleased ».
 changelog_add() {
@@ -353,21 +378,32 @@ changelog_add() {
   awk -v l="$2" 'BEGIN{done=0} {print} /^## Unreleased/ && !done { print ""; print l; done=1 }' "$1" >"$tmp" && mv "$tmp" "$1"
 }
 # extract_reprise <fiche> → la section « ## Reprise » (« ## Handoff »), marqueurs ramenés à la valeur interne
-extract_reprise() { [ -f "${1:-}" ] && [ -r "$1" ] || return 0; lang_norm <"$1" | awk '/^## Reprise/{p=1} p && /^## / && !/^## Reprise/{exit} p'; }
+extract_reprise() {
+  [ -f "${1:-}" ] && [ -r "$1" ] || return 0
+  lang_norm <"$1" | LC_ALL=C awk "$DOC_AWK"'BEGIN { reprise_reset() } reprise_scan($0) { print } RP_END { exit }'
+}
 # lot_bare_slug <nom> → le slug sans son préfixe « lot-NN- » : « lot-02-foo » et « foo » désignent le même lot
 # (seul point de normalisation : Reprise et treeplan se comparent par lui, la branche créée ne s'appelle jamais feat/lot-02-…).
-lot_bare_slug() { printf '%s\n' "$1" | sed 's/^lot-[0-9][0-9]*-//'; }
+lot_bare_slug() { lot_bare_set "$1"; printf '%s\n' "$LOT_BARE"; }
+lot_bare_set() { LOT_BARE="$1"; if [[ "$1" =~ ^lot-[0-9][0-9]*-(.*)$ ]]; then LOT_BARE="${BASH_REMATCH[1]}"; fi; }   # <nom> : LOT_BARE
+# next_slug_set <valeur de la ligne Prochain lot> : NEXT_SLUG, le slug nu ; « none » pour « aucun » ; vide si ce n'est pas un slug
+next_slug_set() {
+  NEXT_SLUG=''
+  case "$1" in '') return 0 ;; [aA]ucun*|[nN]one*) NEXT_SLUG=none; return 0 ;; esac   # « aucun » : Reprise d'une fiche française
+  NEXT_SLUG="${1%%[[:space:]]*}"; NEXT_SLUG="${NEXT_SLUG%%—*}"; lot_bare_set "${NEXT_SLUG//\`/}"; NEXT_SLUG="$LOT_BARE"
+  valid_slug "$NEXT_SLUG" || NEXT_SLUG=''
+}
+# reprise_next_set <fiche> : NEXT_SLUG, lu dans la Reprise de la fiche (une seule lecture)
+reprise_next_set() { NEXT_SLUG=''; doc_need "${1:-}" F || return 0; doc_fact NEXT; next_slug_set "$DOC_FACT"; }
 # reprise_next_lot <texte de la reprise> → « slug<TAB>titre » depuis la ligne « **Prochain lot** : <slug> — <titre> » ; « aucun » ;
 # vide si absente ou si le slug n'en est pas un (le placeholder « <slug> » du gabarit ne doit jamais passer pour un lot suivant).
 # Le slug est rendu nu : une fiche qui écrit « lot-02-foo » est formellement juste (constat 4 du brief, 2026-09-15).
 reprise_next_lot() {
-  local l slug title; l="$(printf '%s\n' "$1" | lang_norm | sed -n 's/^\*\*Prochain lot\*\* *: *//p' | head -1)"
-  [ -n "$l" ] || return 0
-  case "$l" in [aA]ucun*|[nN]one*) echo none; return 0 ;; esac   # « aucun » : Reprise d'une fiche française
-  slug="$(lot_bare_slug "$(printf '%s' "$l" | sed 's/[[:space:]].*$//; s/—.*$//; s/`//g')")"
-  valid_slug "$slug" || return 0
+  local l title; l="$(printf '%s\n' "$1" | lang_norm | sed -n 's/^\*\*Prochain lot\*\* *: *//p' | head -1)"
+  next_slug_set "$l"; [ -n "$NEXT_SLUG" ] || return 0
+  [ "$NEXT_SLUG" != none ] || { echo none; return 0; }
   title="$(printf '%s' "${l#"${l%%[[:space:]—]*}"}" | sed 's/^[[:space:]]*—*[[:space:]]*//; s/^-[[:space:]]*//; s/[[:space:]]*$//')"
-  printf '%s\t%s\n' "$slug" "$title"
+  printf '%s\t%s\n' "$NEXT_SLUG" "$title"
 }
 # ---------- démarrage d'un couloir (lot 18 de lab-enhancement) ----------
 # lane_brief <docs> <couloir> → le brief le plus récent du couloir (lots/<couloir>/brief-*.md, rangé par lab new --brief), ou rien

@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # onboarding — from the registered repository to the first lane
 
-`lab onboard` opened you in the project's main checkout, `main` tab of cmux. The project's name is in your start message. The user has just read three screens — the words (project, lane, batch), the cycle (`lab new`, `lab next`, `lab close`), the guarantees — and knows nothing else.
+`lab onboard` opened you in the project's main checkout, in the `welcome` tab of cmux. The project's name is in your start message. The user has just read three screens — the words (project, lane, batch), the cycle (`lab new`, `lab next`, `lab close`), the guarantees — and knows nothing else.
 
 Speak in the user's language, in plain words, one thing at a time; they may never have used git. Explain each technical term once, the first time you use it, in a few words — for instance:
 
@@ -40,7 +40,22 @@ A vague answer is normal. Do not frame it here: the lane starts precisely with a
 
 Suggest a short name drawn from the need: lowercase, no accent, words separated by a hyphen, three words at most (`card-payment`). Say in one sentence that this name will designate the lane, its working copy and its tab. Wait for approval, or for the name the user prefers.
 
-## 4. Open the lane
+## 4. Say what comes next, before opening the lane
+
+Opening the lane closes this tab: everything the user must know is said now, in a few lines.
+
+- the lane opens in its own tab; that is where what follows happens, by answering the agent's questions;
+- `lab guide <project> <lane>` shows, in four steps, where the lane stands (questions, plan, work checked by tests, their review of the pull request) and whether GitHub is ready;
+- `lab next <project> <lane>` moves on to the next step; the lane's agent runs it itself, the user can also type it;
+- at the end, the user tries the result, then `lab close <project> <lane>` delivers and removes the lane, after their approval;
+- a later need: they write it in the `tower` tab, the first one, which opens its lane;
+- the working documents (plans, batch files) live outside the repository (`docs=local`); `lab init <project> --docs repo` versions them in the repository;
+- `lab help` recalls the commands, `lab doctor` checks the installation;
+- this tab then closes by itself; this conversation stays resumable.
+
+Leave out the `tower` line when the project has no tower. Without cmux (`lab new` printed no tab), nothing closes: say it instead.
+
+## 5. Open the lane
 
 Write the need, in the user's words, to a temporary file outside the repository, then open the lane — all in a single command, with the agent you are (`claude` or `codex`):
 
@@ -48,18 +63,6 @@ Write the need, in the user's words, to a temporary file outside the repository,
 
 `lab new <project> <lane> --brief <file>` creates the isolated working copy and its branch, files the need with the lane's documents, then opens the lane's tab: an agent starts there and asks its questions. `--guided` makes it a first lane, short and guided by the first-lane skill: GitHub made ready first (a private repository only with the user's agreement), five questions at most, one single batch up to its pull request, the step line shown at each step. Leave `--guided` out only when the user already knows Treelab and asks for a full framing.
 
+- `WELCOME=closing` in the output: this tab closes by itself at the end of your reply. Answer in one line, the lane's tab; ask nothing, run nothing more.
 - Refusal: repeat the cause in simple words, say what to do, and run it again only once the cause is gone.
-- `NEXT_COMMAND=` in the output (cmux absent): give this single command to the user, to run in a terminal.
-
-## 5. Hand over
-
-Say, in a few lines:
-
-- the lane is open in its tab; that is where what follows happens, by answering the agent's questions;
-- `lab guide <project> <lane>` shows, in four steps, where the lane stands (questions, plan, work checked by tests, their review of the pull request) and whether GitHub is ready;
-- `lab next <project> <lane>` moves on to the next step; the lane's agent runs it itself, the user can also type it;
-- at the end, the user tries the result, then `lab close <project> <lane>` delivers and removes the lane, after their approval;
-- the working documents (plans, batch files) live outside the repository (`docs=local`); `lab init <project> --docs repo` versions them in the repository;
-- `lab help` recalls the commands, `lab doctor` checks the installation.
-
-This session has done its job: the user can close it.
+- `NEXT_COMMAND=` in the output (cmux absent): give this single command to the user, to run in a terminal. No tab closes: the user can close this session.

@@ -56,8 +56,11 @@ migrations_match() {
 # migrations_collide <wt> <ref> [<sha>] : collisions des migrations ajoutées par <sha> (sans <sha> : arbre de travail) avec <ref>.
 # Pose MIGRATION_COLLISIONS (lignes de migrations_match) ; rc 0 aucune ou aucune clé, 1 collision, 2 non vérifiable.
 migrations_collide() {
-  local changes rc=0; MIGRATION_COLLISIONS=""
-  [ -n "$(migrations_dirs)" ] || return 0
+  local changes rc=0 d; local -a t=(); MIGRATION_COLLISIONS=""
+  # un dossier déclaré au moins (migrations_dirs, lu par le shell seul : lot 05 de charge-processeur)
+  read -r -a t <<<"${P_MIGRATIONS:-}"; d=''
+  for d in "${t[@]+"${t[@]}"}"; do d="${d%/}"; [ -z "$d" ] || break; done
+  [ -n "$d" ] || return 0
   changes="$(migrations_changes "$@")" || rc=$?
   [ "$rc" = 0 ] || return 2
   [ -n "$changes" ] || return 0
@@ -86,7 +89,7 @@ migrations_hook_line() {
   [ -n "$(migrations_dirs)" ] || return 0
   ref="${P_REMOTE:-origin}/$(pr_base)"
   changes="$(migrations_changes "$wt" "$ref" 2>/dev/null)" || return 0
-  printf '%s\n' "$changes" | grep -q '^A' || return 0
+  grep -q '^A' <<<"$changes" || return 0
   MIGRATION_COLLISIONS="$( {
     printf '%s\n' "$changes"; migrations_base_files "$wt" "$ref"
     while IFS= read -r other; do

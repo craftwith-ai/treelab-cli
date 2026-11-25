@@ -8,7 +8,7 @@
 - Develop: `scripts/dev.sh` (free port, prints the URL)
 - Test: `{{TEST}}`
 - Lint / typecheck: 
-- CI: `.github/workflows/ci.yml` — fill in `FAST_CMD`, `TARGETED_CMD`, `FULL_CMD`, `E2E_CMD` at its top; the full suite runs once per lane (`full-suite` label), and at night.
+- CI: `.github/workflows/ci.yml` — fill in `FAST_CMD`, `TARGETED_CMD`, `FULL_CMD`, `E2E_CMD` at its top; the full suite runs at night, on the staging → main promotion, and on a pull request only when the `full-suite` label is posted by hand.
 
 ## Architecture in three lines
 - 

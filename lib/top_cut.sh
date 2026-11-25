@@ -36,7 +36,7 @@ top_cmux() { CMUX_QUIET=1 with_timeout 30 cmux "$@"; }
 # top_cmux_refusal <sortie> → « code<TAB>message » d'un refus de cmux (« Error: <code>: <message> », forme mesurée sur 0.65.2,
 # message dans la langue du Mac) ; une autre forme est relayée entière, code unknown
 top_cmux_refusal() {
-  local line; line="$(printf '%s\n' "$1" | grep -m1 -E '^Error: ' || printf '%s\n' "$1" | head -1)"
+  local line; line="$(grep -m1 -E '^Error: ' <<<"$1" || head -1 <<<"$1")"
   case "$line" in
     'Error: '*': '*) line="${line#Error: }"; printf '%s\t%s\n' "${line%%: *}" "${line#*: }" ;;
     *) printf 'unknown\t%s\n' "${line:-no output}" ;;
@@ -157,7 +157,7 @@ top_close() {
     fi
     if [ -n "$dirty" ]; then
       n="$(printf '%s\n' "$dirty" | awk 'END { print NR }')"
-      top_refuse "$2" "$3" uncommitted "$n uncommitted file(s) in $p/$lane, first: $(printf '%s\n' "$dirty" | head -1 | cut -c4-)"; return 0
+      top_refuse "$2" "$3" uncommitted "$n uncommitted file(s) in $p/$lane, first: $(head -1 <<<"$dirty" | cut -c4-)"; return 0
     fi
   fi
   st="$(top_status "$(top_field "$4" PID)")"
@@ -281,6 +281,7 @@ top_wake() { # <onglet> : réveil sur place ; l'entrée du registre en sort, gar
 # ---------- --explain ----------
 # top_explain_processes <id> : lignes de ps de la cible et de ses descendants (pid), ou des processus de la famille, 40 au plus
 top_explain_processes() {
+  top_terminals
   { LC_ALL=en_US.UTF-8 ps -axww -o pid=,ppid=,uid=,stat=,rss=,%cpu=,etime=,args= 2>/dev/null || true; } | LC_ALL=C awk -v id="$1" "$TOP_AWK_LIB"'
     ps_parse($0) { n++; O[n] = P_PID; PP[P_PID] = P_PPID; L[P_PID] = "pid " P_PID " · " name_of(P_ARGS) " · rss " int(P_RSS / 1024) "M · " P_CPU "% CPU · up " P_ET " · parent " P_PPID " · uid " P_UID " · " P_ARGS; F[P_PID] = family_of(P_ARGS, agent_of(P_ARGS)) }
     function under(p,   d) { d = 0; while (p != "" && p != "0" && d < 64) { if (p == id) return 1; p = PP[p]; d++ } return 0 }

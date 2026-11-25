@@ -2,33 +2,35 @@
 # Recette du couloir : décisions relues dans les fiches, jamais de fichier d’état.
 # Dépend de git.sh, project.sh, docs.sh et deploy.sh ; charge lui-même waiting.sh (phase « waiting », lot 02 d'autonomie-tours).
 declare -F wait_lane_first >/dev/null || . "${BASH_SOURCE[0]%/*}/waiting.sh"
+declare -F snap_mark >/dev/null || . "${BASH_SOURCE[0]%/*}/snapshot.sh"   # instantané de Treelab.app (lot 03 d'app-treelab)
 
 # recette_filter <body|strip|count> : section exacte sur stdin, hors blocs de code.
 recette_filter() {
-  lang_norm | awk -v mode="$1" '
-    /^[[:space:]]*(```|~~~)/ {
-      fence=!fence
-      if (mode == "strip" && !inside) print
-      next
+  lang_norm | LC_ALL=C awk -v mode="$1" "$DOC_AWK"'
+    BEGIN { recette_reset() }
+    {
+      r = recette_scan($0)
+      if (r == 2) next
+      if (mode == "strip" && !RC_IN) print
+      else if (mode == "body" && RC_IN && r == 0 && !RC_FENCE) print
     }
-    !fence && /^## Recette du couloir[[:space:]]*$/ {inside=1; count++; next}
-    !fence && /^## / {inside=0}
-    mode == "strip" && !inside {print; next}
-    mode == "body" && inside && !fence {print}
-    END {if (mode == "count") print count+0}'
+    END {if (mode == "count") print RC_COUNT+0}'
 }
 # recette_validated_by <fiche> : la ligne Validated by de la recette, fiche française ou anglaise (recette_field lit les noms
 # internes français) ; le nom reste ici, jamais dans le code qui l'appelle (tests/livre_anglais.bats, CI Linux du 2026-11-21)
 recette_validated_by() { local lang=fr; recette_field "$1" "$(lang_word "$lang" 'Validé par')"; }
 recette_field() { # <fiche> <champ> : un seul champ, sinon vide
-  recette_filter body <"$1" | awk -v key="**$2**" '
-    index($0,key)==1 {
-      v=substr($0,length(key)+1)
-      if (v !~ /^[[:space:]]*:/) next
-      sub(/^[[:space:]]*:[[:space:]]*/,"",v); sub(/[[:space:]]*$/,"",v)
-      value=v; n++
-    }
+  recette_filter body <"$1" | LC_ALL=C awk -v key="**$2**" "$DOC_AWK"'
+    recette_field_scan($0, key) { value = RF_V; n++ }
     END {if (n == 1) print value}'
+}
+# recette_fact_set <fiche> <champ> : RECETTE_FACT, le même champ, lu avec les autres faits de la fiche (lib/facts.sh)
+recette_fact_set() {
+  local k
+  RECETTE_FACT=''
+  case "$2" in Décision) k=DECISION ;; Date) k=DATE ;; 'Révision essayée') k=REVISION ;; Preuves) k=PREUVES ;; 'Révision des documents') k=DOCS ;; *) return 1 ;; esac
+  doc_need "$1" F || return 0
+  doc_fact "$k"; RECETTE_FACT="$DOC_FACT"
 }
 
 # Formes tolérées (retour 1 du lot 01, 2026-09-15 : deux commits documentaires pour fermer un couloir validé, parce que le skill écrivait
@@ -52,14 +54,18 @@ recette_revision_of() { # <valeur> → révision hexadécimale complète (40 ou 
 # ou en double). Une seule règle par champ : recette_status et le refus de lab close lisent la même.
 recette_field_check() {
   local value; value="$(recette_field "$1" "$2")"
+  recette_value_ok "$value" "$2" && return 0
+  printf '%s\n' "$value"; return 1
+}
+recette_value_ok() { # <valeur> <champ> : la même règle, sur la valeur déjà lue
+  local value="$1"
   case "$2" in
     Décision) [ "$(lang_code "$value")" = accepted ] ;;
     Date) [ -n "$(recette_date_of "$value")" ] ;;
     'Révision essayée'|'Révision des documents') [ -n "$(recette_revision_of "$value")" ] ;;
     Preuves) case "$value" in ''|'<'*|TODO*|'à compléter'*) false ;; *) true ;; esac ;;
     *) false ;;
-  esac && return 0
-  printf '%s\n' "$value"; return 1
+  esac
 }
 recette_expected() { # <champ> → la forme attendue, dite dans le refus
   case "$1" in
@@ -88,63 +94,85 @@ recette_incomplete_detail() {
 }
 
 # lane_plan_names <wt> : les noms exacts des lots de ce seul couloir.
-lane_plan_names() { treeplan_lots "$(treeplan_file "$(docs_dir "$1")" "$(wt_lane "$1")")" | cut -f1; }
-# Refuser une liste partiellement lisible : une entrée ignorée ne vaut pas absence.
-lane_plan_complete() { # <treeplan>
-  lang_norm <"$1" | awk '
-    /^## Lots([[:space:]]|$)/ {inside=1; sections++; next}
-    inside && /^## / {inside=0}
-    inside && /^[[:space:]]*([-*+][[:space:]]|[0-9]+[.)][[:space:]])/ {
-      if ($0 !~ /^- \[lot-[0-9]+-[a-z0-9][a-z0-9._-]*\]\([^)]*\)/) bad=1
-    }
-    END {exit (sections != 1 || bad)}'
+lane_plan_names() { lane_names_set "$1"; [ -z "$LANE_NAMES" ] || printf '%s\n' "$LANE_NAMES"; }
+lane_names_set() { # <wt> : LANE_NAMES, un nom par ligne, et LANE_NAMES_N, leur nombre
+  local rows
+  docs_dir_set "$1"; wt_lane_set "$1"; plan_lots_set "$DOCS_DIR/treeplans/$WT_LANE.md"; rows="$PLAN_LOTS"
+  LANE_NAMES=''; LANE_NAMES_N=0
+  [ -n "$rows" ] || return 0
+  rows="$rows"$'\n'
+  while [ -n "$rows" ]; do
+    LANE_NAMES="$LANE_NAMES${LANE_NAMES:+$'\n'}${rows%%$'\t'*}"; LANE_NAMES_N=$((LANE_NAMES_N + 1)); rows="${rows#*$'\n'}"
+  done
 }
-lane_last_lot() { # <wt> [fiche] → yes | no | unknown
-  ! lane_permanent "$1" || { printf 'no\n'; return; }   # un couloir permanent n'a jamais de dernier lot, treeplan à jour ou non
-  lane_plan_last "$@"
+# Refuser une liste partiellement lisible : une entrée ignorée ne vaut pas absence.
+lane_plan_complete() { doc_need "$1" T || return 1; doc_fact COMPLETE; [ "$DOC_FACT" = 1 ]; } # <treeplan>
+lane_last_lot() { lane_last_set "$@"; printf '%s\n' "$LANE_LAST"; } # <wt> [fiche] → yes | no | unknown
+lane_last_set() { # les mêmes arguments : LANE_LAST
+  ! lane_permanent "$1" || { LANE_LAST=no; return; }   # un couloir permanent n'a jamais de dernier lot, treeplan à jour ou non
+  plan_last_set "$@"
 }
 # lane_plan_last <wt> [fiche] → yes | no | unknown, lu sur le seul treeplan : lab next y cherche la vraie cause d'un désaccord, même
 # dans un couloir permanent (revue du lot 01 d'autonomie-tours)
-lane_plan_last() {
-  local lot="${2:-}" docs tp names name count
-  [ -n "$lot" ] || lot="$(wt_lot_file "$1")"
-  [ -n "$lot" ] || { printf 'unknown\n'; return; }
-  docs="$(docs_dir "$1")"; tp="$(treeplan_file "$docs" "$(wt_lane "$1")")"
-  if [ ! -d "$(treeplans_dir "$docs")" ]; then
-    case "$(reprise_next_lot "$(extract_reprise "$lot")")" in
-      none) printf 'yes\n' ;; '') printf 'unknown\n' ;; *) printf 'no\n' ;;
-    esac
-    return
+lane_plan_last() { plan_last_set "$@"; printf '%s\n' "$LANE_LAST"; }
+plan_last_set() { # les mêmes arguments : LANE_LAST
+  local lot="${2:-}" docs tp name rest one count=0
+  LANE_LAST=unknown
+  [ -n "$lot" ] || { wt_lot_set "$1"; lot="$WT_LOT"; }
+  [ -n "$lot" ] || return 0
+  docs_dir_set "$1"; docs="$DOCS_DIR"; wt_lane_set "$1"; tp="$docs/treeplans/$WT_LANE.md"
+  if [ ! -d "$docs/treeplans" ]; then
+    reprise_next_set "$lot"
+    case "$NEXT_SLUG" in none) LANE_LAST=yes ;; '') ;; *) LANE_LAST=no ;; esac
+    return 0
   fi
-  if [ ! -r "$tp" ] || ! lane_plan_complete "$tp"; then printf 'unknown\n'; return; fi
-  if lane_unplanned "$1" "$lot"; then printf 'unknown\n'; return; fi
-  names="$(lane_plan_names "$1")"; name="$(basename "$lot" .md)"
-  count="$(printf '%s\n' "$names" | grep -Fxc "$name" || true)"
-  [ "$count" = 1 ] || { printf 'unknown\n'; return; }
-  if [ "$(printf '%s\n' "$names" | tail -1)" = "$name" ]; then printf 'yes\n'; else printf 'no\n'; fi
+  if [ ! -r "$tp" ] || ! lane_plan_complete "$tp"; then return 0; fi
+  if lane_unplanned "$1" "$lot"; then return 0; fi
+  name="${lot##*/}"; name="${name%.md}"
+  lane_names_set "$1"; [ -n "$LANE_NAMES" ] || return 0
+  rest="$LANE_NAMES"$'\n'
+  while [ -n "$rest" ]; do one="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"; [ "$one" != "$name" ] || count=$((count + 1)); done
+  [ "$count" = 1 ] || return 0
+  if [ "$one" = "$name" ]; then LANE_LAST=yes; else LANE_LAST=no; fi
 }
-lane_next_slug() { # <wt> <fiche> : entrée immédiatement suivante du treeplan, slug nu (vide si la fiche est la dernière)
-  lot_bare_slug "$(lane_plan_names "$1" | awk -v name="$(basename "$2" .md)" 'found {print; exit} $0 == name {found=1}')"
+lane_next_slug() { lane_next_set "$1" "$2"; printf '%s\n' "$LANE_NEXT"; } # <wt> <fiche> : entrée immédiatement suivante du treeplan, slug nu (vide si la fiche est la dernière)
+lane_next_set() { # les mêmes arguments : LANE_NEXT
+  local name="${2##*/}" rest one found=0
+  LANE_NEXT=''; name="${name%.md}"
+  lane_names_set "$1"; [ -n "$LANE_NAMES" ] || return 0
+  rest="$LANE_NAMES"$'\n'
+  while [ -n "$rest" ]; do
+    one="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"
+    if [ "$found" = 1 ]; then lot_bare_set "$one"; LANE_NEXT="$LOT_BARE"; return 0; fi
+    [ "$one" != "$name" ] || found=1
+  done
 }
 # lane_next_values <wt> <fiche> : pose LANE_NEXT_REPRISE (slug annoncé par la Reprise, « aucun », ou vide) et LANE_NEXT_TREEPLAN
 # (entrée suivante du treeplan), tous deux nus — lane_phase les compare, lab next les nomme quand ils divergent.
 lane_next_values() {
-  local next; next="$(reprise_next_lot "$(extract_reprise "$2")")"
-  LANE_NEXT_REPRISE="${next%%$'\t'*}"; LANE_NEXT_TREEPLAN="$(lane_next_slug "$1" "$2")"
+  reprise_next_set "$2"; LANE_NEXT_REPRISE="$NEXT_SLUG"
+  lane_next_set "$1" "$2"; LANE_NEXT_TREEPLAN="$LANE_NEXT"
 }
 lane_lots_closed() { # <wt> <fiche courante> : toutes les fiches prévues existent et sont closes
-  local docs lane name file names
-  docs="$(docs_dir "$1")"; lane="$(wt_lane "$1")"
-  [ -d "$(treeplans_dir "$docs")" ] || { case "$(lot_state "$2")" in closed*) return 0 ;; *) return 1 ;; esac; }
-  lane_plan_complete "$(treeplan_file "$docs" "$lane")" || return 1
-  names="$(lane_plan_names "$1")"; [ -n "$names" ] || return 1
-  [ -z "$(printf '%s\n' "$names" | sort | uniq -d)" ] || return 1
-  while IFS= read -r name; do
+  local docs lane name file rest seen=$'\n'
+  docs_dir_set "$1"; docs="$DOCS_DIR"; wt_lane_set "$1"; lane="$WT_LANE"
+  [ -d "$docs/treeplans" ] || { lot_state_set "$2"; case "$LOT_STATE" in closed*) return 0 ;; *) return 1 ;; esac; }
+  lane_plan_complete "$docs/treeplans/$lane.md" || return 1
+  lane_names_set "$1"; [ -n "$LANE_NAMES" ] || return 1
+  rest="$LANE_NAMES"$'\n'
+  while [ -n "$rest" ]; do   # un nom en double ne vaut aucune des deux entrées
+    name="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"
+    case "$seen" in *$'\n'"$name"$'\n'*) return 1 ;; esac
+    seen="$seen$name"$'\n'
+  done
+  rest="$LANE_NAMES"$'\n'
+  while [ -n "$rest" ]; do
+    name="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"
     [[ "$name" =~ ^lot-[0-9]+-[a-z0-9][a-z0-9._-]*$ ]] || return 1
-    file="$(lots_dir "$docs" "$lane")/$name.md"
-    [ -f "$file" ] || file="$(lots_dir "$docs")/$name.md"
-    case "$(lot_state "$file")" in clos*) ;; *) return 1 ;; esac
-  done <<<"$names"
+    file="$docs/lots/$lane/$name.md"
+    [ -f "$file" ] || file="$docs/lots/$name.md"
+    lot_state_set "$file"; case "$LOT_STATE" in clos*) ;; *) return 1 ;; esac
+  done
 }
 
 # recette_lane_changes <wt> <révision essayée> <fichiers changés> → ceux qui appartiennent au couloir (lot 17) : un merge de la base
@@ -171,6 +199,7 @@ lane_touched_files() {
   [ -n "$SLUG" ] || SLUG="$(wt_lane "$wt")"
   { lane_files "$wt"
     cur="$(branch_name "$wt")"
+    declare -F close_lane_branches >/dev/null || . "${BASH_SOURCE[0]%/*}/close.sh"   # démarrage de session : chargée ici seulement
     close_lane_branches 2>/dev/null | while IFS= read -r b; do
       start="$(branch_start "$wt" "$b" "")"
       git -C "$wt" merge-base --is-ancestor "$start" "$b" 2>/dev/null || start=""
@@ -193,20 +222,64 @@ recette_stale_files() {
   recette_lane_changes "$wt" "$revision" "$(git -C "$wt" -c core.quotePath=false diff --name-only "$revision" HEAD 2>/dev/null || true)" \
     | awk -v r="$rel" 'NF && $0 != r' | sync_join
 }
-# recette_status <wt> <fiche> : résultat stable, toujours rc=0, aucun fichier créé.
+# recette_early_set <fiche lisible> : RECETTE_EARLY, la réponse que la fiche seule suffit à donner (absent | incomplete | rejected), vide
+# quand elle est remplie : git dit alors si elle vaut encore. Un awk au plus, aucun si les faits de la fiche sont déjà lus
+recette_early_set() {
+  local field
+  RECETTE_EARLY=absent
+  doc_need "$1" F || return 0
+  doc_fact RECETTES
+  [ "$DOC_FACT" != 0 ] || return 0
+  RECETTE_EARLY=incomplete
+  [ "$DOC_FACT" = 1 ] || return 0
+  recette_fact_set "$1" Décision; lang_code_set "$RECETTE_FACT"
+  [ "$LANG_CODE" != rejected ] || { RECETTE_EARLY=rejected; return 0; }
+  for field in Décision Date 'Révision essayée' Preuves; do
+    recette_fact_set "$1" "$field"; recette_value_ok "$RECETTE_FACT" "$field" || return 0
+  done
+  RECETTE_EARLY=''
+}
+# recette_status <wt> <fiche> : résultat stable, toujours rc=0, aucun fichier créé (hors état gardé ci-dessous).
 # La validation est un document Git lié à une révision du résultat ; un nouveau
 # commit n’est admis que s’il modifie la seule section de recette de cette fiche.
+# RECETTE_CACHE_DIR, posé par le seul écrivain de l'instantané de Treelab.app (lot 03 d'app-treelab) : le résultat est gardé par couloir
+# et repris tant que sa clé tient — réglages du projet, couloir lu (SLUG), branche de HEAD, fiche, références git du couloir (show-ref
+# --head : HEAD, branches, base distante) ; fiches dans leur propre dépôt (docs=local) : le contenu des chemins du couloir à HEAD de ce
+# dépôt (ls-tree), jamais sa révision entière, qu'un commit d'un autre couloir ou projet bougerait —, seulement arbre propre et chemins du
+# couloir propres ; sinon recalculé. Hors clé : le reflog (départ d'une branche, branch_start), qui ne bouge qu'à son expiration, et une
+# réécriture de l'historique du dépôt des fiches. Un crochet d'un couloir en recette coûtait une trentaine de git, 0,9 s de processeur
+# par réécriture (relevé d'une heure, C6).
 recette_status() {
-  local wt="$1" lot="$2" count field revision droot rel changes before after docs_revision
+  [ -n "${RECETTE_CACHE_DIR:-}" ] || { recette_status_fresh "$@"; return; }
+  local wt="$1" lot="$2" f droot refs st p key='' was='' cfg='' doc='' docs=''; local -a paths=()
+  if [ -L "$lot" ] || [ ! -r "$lot" ] || ! is_clean "$wt"; then recette_status_fresh "$@"; return; fi
+  droot="$(repo_root "${lot%/*}")" || droot=''
+  [ -n "$droot" ] || { recette_status_fresh "$@"; return; }
+  refs="$(git -C "$wt" show-ref --head 2>/dev/null)" || { recette_status_fresh "$@"; return; }
+  if ! same_path "$droot" "$wt"; then
+    while IFS= read -r p; do [ -z "$p" ] || paths+=("$p"); done < <(lane_doc_paths "$wt")
+    [ "${#paths[@]}" -gt 0 ] || { recette_status_fresh "$@"; return; }
+    if [ -n "$(git -C "$droot" status --porcelain --untracked-files=all -- "${paths[@]}" 2>/dev/null)" ]; then
+      recette_status_fresh "$@"; return
+    fi
+    docs="$(git -C "$droot" ls-tree -r HEAD -- "${paths[@]}" 2>/dev/null)" || { recette_status_fresh "$@"; return; }
+  fi
+  head_branch_set "$wt"
+  { IFS= read -r -d '' cfg <"$LAB_PROJECTS/$P_NAME/config"; } 2>/dev/null || true
+  { IFS= read -r -d '' doc <"$lot"; } 2>/dev/null || true
+  key="v1"$'\n'"${SLUG:-}"$'\n'"$HEAD_BRANCH"$'\n'"$cfg"$'\n'"$doc"$'\n'"$refs"$'\n'"$docs"
+  f="$RECETTE_CACHE_DIR/$P_NAME/${wt##*/}"
+  { IFS= read -r -d '' was <"$f"; } 2>/dev/null || true
+  if [ -n "$was" ] && [ "${was#*$'\n'}" = "$key" ]; then printf '%s\n' "${was%%$'\n'*}"; return; fi
+  st="$(recette_status_fresh "$wt" "$lot")"
+  { mkdir -p "${f%/*}" && printf '%s\n%s' "$st" "$key" >"$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"; } 2>/dev/null || rm -f "$f.tmp.$$"
+  printf '%s\n' "$st"
+}
+recette_status_fresh() {
+  local wt="$1" lot="$2" field revision droot rel changes before after docs_revision
   [ -r "$lot" ] || { printf 'absent\n'; return; }
-  count="$(recette_filter count <"$lot")"
-  [ "$count" != 0 ] || { printf 'absent\n'; return; }
-  [ "$count" = 1 ] || { printf 'incomplete\n'; return; }
-  [ "$(lang_code "$(recette_field "$lot" Décision)")" != rejected ] || { printf 'rejected\n'; return; }
-  for field in Décision Date 'Révision essayée' Preuves; do
-    recette_field_check "$lot" "$field" >/dev/null || { printf 'incomplete\n'; return; }
-  done
-  revision="$(recette_revision_of "$(recette_field "$lot" 'Révision essayée')")"
+  recette_early_set "$lot"; [ -z "$RECETTE_EARLY" ] || { printf '%s\n' "$RECETTE_EARLY"; return; }
+  recette_fact_set "$lot" 'Révision essayée'; revision="$(recette_revision_of "$RECETTE_FACT")"
   lot="$(real_path "$(dirname "$lot")")/$(basename "$lot")"
   droot="$(repo_root "$(dirname "$lot")" 2>/dev/null || true)"
   [ -n "$droot" ] || { printf 'unversioned\n'; return; }
@@ -221,8 +294,8 @@ recette_status() {
   if ! same_path "$wt" "$droot"; then
     # Deux dépôts, deux révisions essayées, dans la même et seule recette.
     # Un HEAD projet inchangé ne prouve pas que les documents sont inchangés.
-    [ -z "$changes" ] || { printf 'expired\n'; return; }
-    docs_revision="$(recette_revision_of "$(recette_field "$lot" 'Révision des documents')")"
+    [ -z "$changes" ] || recette_kept_by_words "$wt" "$2" "$revision" || { printf 'expired\n'; return; }
+    recette_fact_set "$2" 'Révision des documents'; docs_revision="$(recette_revision_of "$RECETTE_FACT")"
     [ -n "$docs_revision" ] || { printf 'incomplete\n'; return; }
     # Seuls les chemins du couloir comptent : un fichier sale ou un commit d'un autre couloir ou d'un autre projet dans le même
     # dépôt de fiches ne périme rien (lot 03). Sans chemins connus, tout le dépôt est regardé, comme avant.
@@ -235,6 +308,9 @@ recette_status() {
     changes="$(git -C "$wt" -c core.quotePath=false diff --name-only "$revision" HEAD -- "${paths[@]+"${paths[@]}"}")"
   fi
   if [ -z "$changes" ]; then printf 'valid\n'; return; fi
+  # lot 04 d'onglet-tower : le oui de fermer de l'utilisateur survit aux commits qui suivent (synchro, correctif de CI), arbre propre et
+  # révision essayée dans l'historique (vérifiés plus haut) ; la CI verte de la PR décide de la livraison, lab close nomme ces commits
+  if same_path "$wt" "$droot" && recette_kept_by_words "$wt" "$2" "$revision"; then printf 'valid\n'; return; fi
   if [ "$changes" != "$rel" ]; then printf 'expired\n'; return; fi
   # Le document doit déjà exister à la révision essayée ; seule sa section de
   # recette est ajoutée ensuite. Une exemption sur tout docs/ serait trop large.
@@ -244,45 +320,67 @@ recette_status() {
   if [ "$before" = "$after" ]; then printf 'valid\n'; else printf 'expired\n'; fi
 }
 
-lane_phase() { # <wt> [fiche état] → work | in acceptance | acceptance passed | to clarify | permanent | waiting ; expose LANE_NEXT_REPRISE et LANE_NEXT_TREEPLAN
-  local lot state next last docs
-  if [ "$#" -ge 3 ]; then lot="$2"; state="$3"; else lot="$(wt_lot_file "$1")"; state="$(lot_state "$lot")"; fi   # fiche déjà lue (lab sweep)
+# lane_phase <wt> [fiche état] → work | in acceptance | acceptance passed | to clarify | permanent | waiting ; expose
+# LANE_NEXT_REPRISE et LANE_NEXT_TREEPLAN
+lane_phase() { lane_phase_set "$@"; printf '%s\n' "$LANE_PHASE"; }
+lane_phase_set() { # les mêmes arguments : LANE_PHASE. Un awk au plus par couloir au travail, aucun si ses documents sont déjà lus
+  facts_begin; phase_set "$@"; facts_end
+}
+phase_set() {
+  local lot state last docs list=''
+  if [ "$#" -ge 3 ]; then lot="$2"; state="$3"   # fiche déjà lue (lab sweep)
+  else
+    wt_lot_set "$1"; lot="$WT_LOT"; docs_dir_set "$1"; wt_lane_set "$1"
+    # la fiche et le treeplan, seuls documents d'un couloir au travail ou qui enchaîne, en une lecture
+    if [ -f "$lot" ] && [ -r "$lot" ] && ! doc_find "$lot"; then list="F"$'\t'"$lot"; fi
+    docs="$DOCS_DIR/treeplans/$WT_LANE.md"
+    if [ -f "$docs" ] && [ -r "$docs" ] && ! doc_find "$docs" T; then list="$list${list:+$'\n'}T"$'\t'"$docs"; fi
+    facts_load "$list"
+    lot_state_set "$lot"; state="$LOT_STATE"
+  fi
   case "$state" in
-    planned*|'in progress'*) printf 'work\n'; return ;;
+    planned*|'in progress'*) LANE_PHASE=work; return ;;
     closed*|waiting*) ;;   # en attente : livré comme un lot clos (lot 02 d'autonomie-tours)
-    *) printf 'to clarify\n'; return ;;
+    *) LANE_PHASE='to clarify'; return ;;
   esac
-  lane_next_values "$1" "$lot"; next="$LANE_NEXT_REPRISE"; last="$(lane_last_lot "$1" "$lot")"; docs="$(docs_dir "$1")"
-  if [ "$next" != none ]; then
-    if [ -n "$next" ] && { [ ! -d "$(treeplans_dir "$docs")" ] \
-      || { [ "$last" = no ] && [ "$next" = "$LANE_NEXT_TREEPLAN" ]; }; }; then printf 'work\n'
-    else printf 'to clarify\n'; fi
+  lane_next_values "$1" "$lot"; lane_last_set "$1" "$lot"; last="$LANE_LAST"; docs_dir_set "$1"; docs="$DOCS_DIR"
+  if [ "$LANE_NEXT_REPRISE" != none ]; then
+    if [ -n "$LANE_NEXT_REPRISE" ] && { [ ! -d "$docs/treeplans" ] \
+      || { [ "$last" = no ] && [ "$LANE_NEXT_REPRISE" = "$LANE_NEXT_TREEPLAN" ]; }; }; then LANE_PHASE=work
+    else LANE_PHASE='to clarify'; fi
     return
   fi
   # couloir permanent sans lot restant : ni recette ni fermeture, lab next y ouvre la session libre (lot 01 d'autonomie-tours)
-  if lane_permanent "$1"; then printf 'permanent\n'; return; fi
+  if lane_permanent "$1"; then LANE_PHASE=permanent; return; fi
   # dernier lot fini, une mesure du couloir attend sa date : ni recette ni fermeture avant elle (lot 02 d'autonomie-tours)
-  if [ "$last" = yes ] && [ -n "$(wait_lane_first "$1")" ]; then printf 'waiting\n'; return; fi
-  if [ "$last" != yes ] || ! lane_lots_closed "$1" "$lot"; then printf 'to clarify\n'; return; fi
-  if [ "$(recette_status "$1" "$lot")" = valid ]; then printf 'acceptance passed\n'; else printf 'in acceptance\n'; fi
+  if [ "$last" = yes ]; then wait_first_set "$1"; if [ -n "$WAIT_FIRST" ]; then LANE_PHASE=waiting; return; fi; fi
+  if [ "$last" != yes ] || ! lane_lots_closed "$1" "$lot"; then LANE_PHASE='to clarify'; return; fi
+  LANE_PHASE='in acceptance'
+  [ -r "$lot" ] || return 0
+  recette_early_set "$lot"; [ -z "$RECETTE_EARLY" ] || return 0
+  [ "$(recette_status "$1" "$lot")" != valid ] || LANE_PHASE='acceptance passed'
 }
 
 # lane_unplanned <wt> [fiche] : couloir neuf pas encore planifié (lot 18) — treeplan sans intention, un seul lot, aucune Reprise dans
 # la fiche. Ce seul lot n'est pas « le dernier prévu » : personne n'a encore fixé la suite (le grill-me et batch-plan la fixeront).
 lane_unplanned() {
-  local lot="${2:-}" tp
-  [ -n "$lot" ] || lot="$(wt_lot_file "$1")"
-  tp="$(treeplan_file "$(docs_dir "$1")" "$(wt_lane "$1")")"
-  [ -r "$tp" ] && [ -z "$(treeplan_intent "$tp")" ] || return 1
-  [ "$(lane_plan_names "$1" | awk 'NF {n++} END {print n + 0}')" = 1 ] || return 1
-  [ -z "$(extract_reprise "$lot")" ]
+  local lot="${2:-}" tp n=0 rest one
+  [ -n "$lot" ] || { wt_lot_set "$1"; lot="$WT_LOT"; }
+  docs_dir_set "$1"; wt_lane_set "$1"; tp="$DOCS_DIR/treeplans/$WT_LANE.md"
+  [ -r "$tp" ] || return 1
+  plan_intent_set "$tp"; [ -z "$PLAN_INTENT" ] || return 1
+  lane_names_set "$1"; [ "$LANE_NAMES_N" = 1 ] || return 1
+  doc_need "$lot" F || return 0
+  doc_fact REPRISE; [ "$DOC_FACT" = 0 ]
 }
-last_lot_notice() { # <wt> [fiche] : indication dérivée, avant et après planification
-  case "$(lane_last_lot "$1" "${2:-}")" in
-    yes) printf '%s' 'Last planned batch — a check together will follow.' ;;
-    unknown) if lane_unplanned "$1" "${2:-}"; then printf '%s' 'Next batches: unknown — planning will set them.'; fi ;;
+last_lot_notice() { lot_notice_set "$@"; printf '%s' "$LOT_NOTICE"; } # <wt> [fiche] : indication dérivée, avant et après planification
+lot_notice_set() { # les mêmes arguments : LOT_NOTICE
+  LOT_NOTICE=''
+  lane_last_set "$1" "${2:-}"
+  case "$LANE_LAST" in
+    yes) LOT_NOTICE='Last planned batch — a check together will follow.' ;;
+    unknown) if lane_unplanned "$1" "${2:-}"; then LOT_NOTICE='Next batches: unknown — planning will set them.'; fi ;;
   esac
-  return 0
 }
 
 # ---------- lab recette (lot 01 de livrer-sans-friction) : écrire et versionner la recette en un seul geste ----------
@@ -322,7 +420,7 @@ acceptance_interface_touched() {
   spec="$( { [ ! -f "$wt/AGENTS.md" ] || acceptance_interface_spec <"$wt/AGENTS.md"
              [ -z "$ref" ] || git -C "$wt" show "$ref:AGENTS.md" 2>/dev/null | acceptance_interface_spec; } | sed '/^$/d' | sort -u)"
   [ -n "$spec" ] || return 0
-  if printf '%s\n' "$spec" | grep -qx unknown; then echo unknown; return 0; fi
+  if grep -qx unknown <<<"$spec"; then echo unknown; return 0; fi
   files="$(lane_touched_files "$wt" "${2:-}")" || files="$(lane_files "$wt")"
   while IFS= read -r d; do
     if printf '%s\n' "$files" | awk -v d="$d" 'BEGIN {p = d; sub(/\/$/, "", p)} $0 == p || index($0, p "/") == 1 {f = 1} END {exit !f}'; then
@@ -404,16 +502,27 @@ acceptance_waits_why() {
 # vient des mots de l'utilisateur lus par le crochet de lab (lib/words.sh), qui valent aussi l'ordre de fermer. --reject le remplace, lab close l'efface après le retrait ; la garde refuse Write, Edit et
 # apply_patch sous $LAB_STATE (lib/hooks.sh). La ligne Validated by de la fiche n'est plus qu'une trace.
 agreement_file() { printf '%s/%s/agreements/%s\n' "$LAB_STATE" "$P_NAME" "$1"; }   # <couloir>
-agreement_get() { [ -f "$1" ] || return 0; sed -n "s/^$2=//p" "$1" | head -1; }   # <fichier> <champ>
+# agreement_get <fichier> <champ> : la première valeur, sans processus (kv_print) — huit lectures par couloir réécrit dans l'instantané
+# de Treelab.app (lot 03 d'app-treelab)
+agreement_get() { [ -f "$1" ] || return 0; kv_print "$1" "$2" || true; }
 # agreement_write <couloir> <décision> <révision> <révision des documents> <rôle> <lot> [via] [close] [mots] : réécriture atomique
 agreement_write() {
   local f; f="$(agreement_file "$1")"
   ( umask 077; mkdir -p "$(dirname "$f")" && rm -f "$f.tmp.$$" \
     && { printf 'decision=%s\nrev=%s\ndocs_rev=%s\nrole=%s\nbatch=%s\nat=%s\n' "$2" "$3" "$4" "$5" "$6" "$(rdv_now)"
          [ -z "${7:-}" ] || printf 'via=%s\nclose=%s\nsaid=%s\n' "$7" "${8:-no}" "${9:-}"; } >"$f.tmp.$$" \
-    && mv "$f.tmp.$$" "$f" )
+    && mv "$f.tmp.$$" "$f" ) || return
+  snap_mark_lane "$P_NAME" "$1"
 }
-agreement_clear() { rm -f "$(agreement_file "$1")"; }
+agreement_clear() { local f; f="$(agreement_file "$1")"; [ -e "$f" ] || [ -L "$f" ] || return 0; rm -f "$f"; snap_mark_lane "$P_NAME" "$1"; }
+# agreement_hold <couloir> (lot 04 d'onglet-tower, revue) : l'ordre de fermer donné par les mots est retiré (close=no), l'accord du
+# résultat reste — une négation dite après lab acceptance ; rc 1 sans ordre de fermer à retirer. Ses mots, redits, le rendent
+agreement_hold() {
+  local f; f="$(agreement_file "$1")"
+  [ -f "$f" ] && [ ! -L "$f" ] && [ "$(agreement_get "$f" close)" = yes ] || return 1
+  agreement_write "$1" "$(agreement_get "$f" decision)" "$(agreement_get "$f" rev)" "$(agreement_get "$f" docs_rev)" \
+    "$(agreement_get "$f" role)" "$(agreement_get "$f" batch)" "$(agreement_get "$f" via)" no "$(agreement_get "$f" said)"
+}
 # agreement_valid <wt> : rc 0 si l'accord au registre vaut pour la recette de la fiche — accepted, rôle user ou tower, même lot,
 # même révision essayée, même révision des documents ; sinon rc 1 et AG_WHY nomme le manque (lu par la tour et lab close)
 # shellcheck disable=SC2034 # AG_WHY est lu par tower_waits_for (lib/tower.sh) et close_alone_state (lib/close.sh)
@@ -436,6 +545,44 @@ agreement_valid() {
   [ "$v" = "$want" ] || { AG_WHY="agreement recorded for other documents (${v:0:7}), not the tried documents ${want:0:7}"; return 1; }
 }
 
+# recette_kept_by_words <wt> <fiche> <révision essayée> (lot 04 d'onglet-tower) : rc 0 si l'accord gardé par lab pour ce couloir vient
+# des mots de l'utilisateur (decision=accepted, role=user, via=words, close=yes), pour ce lot et cette révision essayée — ce oui survit
+# aux commits qui le suivent ; mêmes documents essayés (docs_rev), comme agreement_valid. Projet non chargé ou nom illisible : rc 1, la
+# recette reste périmée comme avant. Choix d'Alex (2026-11-25) : ces commits sont livrés sans nouvel essai, CI verte de la PR, et
+# nommés par lab close (AFTER_AGREEMENT=) et sa notification
+recette_kept_by_words() {
+  local lane f
+  [ -n "${P_NAME:-}" ] || return 1
+  lane="$(wt_lane "$1" 2>/dev/null)"; valid_slug "$lane" || return 1
+  f="$(agreement_file "$lane")"; [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  [ "$(agreement_get "$f" decision)" = accepted ] && [ "$(agreement_get "$f" role)" = user ] \
+    && [ "$(agreement_get "$f" via)" = words ] && [ "$(agreement_get "$f" close)" = yes ] \
+    && [ "$(agreement_get "$f" batch)" = "$(basename "$2" .md)" ] && [ -n "$3" ] && [ "$(agreement_get "$f" rev)" = "$3" ] \
+    && [ "$(agreement_get "$f" docs_rev)" = "$(recette_revision_of "$(recette_field "$2" 'Révision des documents')")" ]
+}
+# recette_after_agreement <wt> <révision essayée> [fiche] → « <sha7> <sujet>; …; +N sync(s) with the base » : ce qui a changé après le
+# oui (lot 04 d'onglet-tower) — commits propres du couloir hors base, sauf ceux qui ne touchent que la fiche du lot (la recette et
+# l'accord de nuit, écrits par lab), puis les synchros de la première lignée ; vide si rien, ou si la révision essayée n'est plus un
+# ancêtre de la tête (la recette est alors périmée)
+recette_after_agreement() {
+  local wt="$1" rev="$2" lot="${3:-}" ref rel="" sha subj files list="" n; local -a not=()
+  [ -n "$rev" ] && git -C "$wt" cat-file -e "$rev^{commit}" 2>/dev/null && git -C "$wt" merge-base --is-ancestor "$rev" HEAD 2>/dev/null \
+    || return 0
+  if [ -n "$lot" ] && [ -f "$lot" ]; then
+    rel="$(real_path "$(dirname "$lot")")/$(basename "$lot")"; rel="${rel#"$(real_path "$wt")"/}"
+  fi
+  ref="$(sync_ref 2>/dev/null || true)"
+  [ -z "$ref" ] || ! git -C "$wt" rev-parse --verify --quiet "$ref^{commit}" >/dev/null 2>&1 || not=(--not "$ref")
+  while IFS=' ' read -r sha subj; do
+    [ -n "$sha" ] || continue
+    files="$(git -C "$wt" -c core.quotePath=false diff-tree --no-commit-id --name-only -r "$sha" 2>/dev/null)"
+    [ -z "$rel" ] || [ "$files" != "$rel" ] || continue
+    list="${list:+$list; }${sha:0:7} $subj"
+  done < <(git -C "$wt" log --reverse --no-merges --format='%H %s' "$rev..HEAD" "${not[@]+"${not[@]}"}" 2>/dev/null)
+  n="$(git -C "$wt" rev-list --merges --first-parent --count "$rev..HEAD" 2>/dev/null || echo 0)"
+  case "$n" in ''|0|*[!0-9]*) ;; 1) list="${list:+$list; }+1 sync with the base" ;; *) list="${list:+$list; }+$n syncs with the base" ;; esac
+  printf '%s' "$list"
+}
 # agreement_by_words <wt> : rc 0 si l'accord valide vient des mots de l'utilisateur (via=words close=yes, lot 10) — l'agent du couloir
 # ou la tour ferment alors sans --confirm ; pose AG_SAID, les mots
 # shellcheck disable=SC2034 # AG_SAID est lu par lib/close.sh et lib/tower.sh

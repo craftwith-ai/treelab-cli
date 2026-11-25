@@ -16,6 +16,7 @@ guard_read() {
   guard_fields && return 0
   HOOK_CWD="$(payload_get .cwd)"; HOOK_CWD="${HOOK_CWD:-$HOOK_HERE}"
   HF_TOOL="$(payload_get .tool_name)"; HF_PATH="$(payload_get .tool_input.file_path)"; HF_CMD="$(payload_get .tool_input.command)"
+  # shellcheck disable=SC2034 # GUARD_FIELDS est lu par guard_fields (lib/guard_fast.sh)
   GUARD_FIELDS=slow
 }
 json_context() { jq -cn --arg c "$1" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}'; }
@@ -26,33 +27,52 @@ json_deny() {
 is_protected() { local b; for b in $PROTECTED_BRANCHES; do [ "$1" = "$b" ] && return 0; done; return 1; }
 
 # ---------- SessionStart ----------
+# start_fields : PAYLOAD, HOOK_CWD, HS_TRANSCRIPT et HS_KEY, les champs du démarrage, par un seul jq ; une charge qu'il refuse (champ
+# d'un autre type, plusieurs objets, JSON illisible) se lit champ par champ, comme avant lui
+start_fields() {
+  local out
+  PAYLOAD="$(exec cat 2>/dev/null)" || true
+  # shellcheck disable=SC2016 # programme jq littéral
+  out="$(exec jq -rs 'def s: if type == "string" then (if explode | index(0) then error("nul") else . end) elif . == null or . == false then "" else error("type") end;
+    (if length == 1 then .[0] else error("stream") end)
+    | @sh "HS_CWD=\(.cwd | s) HS_TRANSCRIPT=\(.transcript_path | s) HS_KEY=\(.session_id | s)"' <<<"$PAYLOAD" 2>/dev/null)" || out=''
+  case "$out" in
+    HS_CWD=*) eval "$out"; chomp HS_CWD; chomp HS_TRANSCRIPT; chomp HS_KEY ;;
+    *) HS_CWD="$(payload_get .cwd)"; HS_TRANSCRIPT="$(payload_get .transcript_path)"; HS_KEY="$(payload_get .session_id)" ;;
+  esac
+  HOOK_CWD="${HS_CWD:-$PWD}"
+}
 hook_session_start() {
-  read_payload
-  local root agent res ctx p slug br lot st docs notes n pr lotrel lock priority='' notice='' rdv='' life='' flat='' online='' night='' lic=''
-  root="$(repo_root "$HOOK_CWD" 2>/dev/null || true)"; [ -n "$root" ] || exit 0
-  transcript_note "$root" 2>/dev/null || true   # lot 02 de pilotage-voix : la session reprise ou effacée change de transcript
-  agent="$(detect_agent)"
-  if [ "${LAB_DRY:-0}" = 1 ]; then res=DRY; else res="$(claim "$root" "$agent" 2>/dev/null || echo CLAIMED)"; fi
+  start_fields
+  local root agent='' res ctx p slug br lot name docs notes n line lotrel lock phase f priority='' notice='' rdv='' life='' flat='' online='' night='' lic='' pr
+  git_places "$HOOK_CWD" || exit 0   # un seul git : la racine, et le checkout principal du projet
+  root="$GP_TOP"; [ -n "$root" ] || exit 0
+  transcript_note "$root" "$HS_TRANSCRIPT" 2>/dev/null || true   # lot 02 de pilotage-voix : la session reprise ou effacée change de transcript
+  if [ "${LAB_DRY:-0}" = 1 ]; then res=DRY; else agent="$(detect_agent)"; res="$(claim "$root" "$agent" 2>/dev/null || echo CLAIMED)"; fi
   case "$res" in
     UPDATING) json_context 'LAB: update in progress. Start no work; reopen this session once treelab update has finished.'; return 0 ;;
     UPDATE_PENDING) json_context 'LAB: Treelab restore pending. Start no work; finish treelab update --resume outside any session, then reopen this session.'; return 0 ;;
   esac
-  ctx="LAB worktree=$root branch=$(branch_name "$root")"
-  if p="$(project_from_cwd "$root" 2>/dev/null)" && [ -n "$p" ]; then
+  head_branch_set "$root"; br="$HEAD_BRANCH"
+  ctx="LAB worktree=$root branch=$br"; p=''
+  if project_by_root_set "$GP_MAIN"; then p="$FOUND_PROJECT"; fi
+  if [ -n "$p" ]; then
     load_project "$p" 2>/dev/null || true
-    slug="$(wt_lane "$root")"; same_path "$root" "$P_ROOT" && slug="main-checkout"
-    br="$(branch_name "$root")"
-    if [ "$slug" = main-checkout ]; then ctx="LAB project=$p worktree=$root (main-checkout)"; else ctx="LAB project=$p worktree=$root lane=$slug"; fi
-    if [ "$slug" != main-checkout ]; then
-      ctx="$ctx phase=$(lane_phase "$root")"
-      case "$(lane_phase "$root")" in
+    wt_lane_set "$root"; slug="$WT_LANE"; same_path "$root" "$P_ROOT" && slug="main-checkout"
+    facts_begin   # la fiche et le treeplan du couloir, lus une fois pour tout le contexte
+    if [ "$slug" = main-checkout ]; then ctx="LAB project=$p worktree=$root (main-checkout)"
+    else
+      ctx="LAB project=$p worktree=$root lane=$slug"
+      lane_phase_set "$root"; phase="$LANE_PHASE"
+      ctx="$ctx phase=$phase"
+      case "$phase" in
         'in acceptance') ctx="$ctx — Work finished, to try together." ;;
         'acceptance passed') ctx="$ctx — Closing on explicit confirmation." ;;
         permanent) ctx="$ctx — Permanent lane: no batch left, wait for the request." ;;
-        *) [ -z "$(last_lot_notice "$root")" ] || ctx="$ctx — $(last_lot_notice "$root")" ;;
+        *) lot_notice_set "$root"; [ -z "$LOT_NOTICE" ] || ctx="$ctx — $LOT_NOTICE" ;;
       esac
     fi
-    ctx="$ctx branch=${br:-detached-HEAD} base=$P_BASE pr-target=$(pr_base)"
+    ctx="$ctx branch=${br:-detached-HEAD} base=$P_BASE pr-target=${P_STAGING:-$P_BASE}"
     # règle cloud (lot 03 de cmux-pro) : avec cmux seulement, jamais en mode mesure ; aucune question depuis le lot 01 d'aiguillage-cloud,
     # la ligne Execution de chaque fiche choisit Cloud ou Mac
     if [ "${LAB_DRY:-0}" != 1 ] && has_cmux; then
@@ -64,29 +84,29 @@ hook_session_start() {
       local needs; needs="$(cloud_needs_lines "$p" 2>/dev/null | awk -F '\t' '{ l[NR] = $2 "(" $5 ")" } END { s = (NR > 3 ? NR - 2 : 1); for (i = s; i <= NR; i++) printf "%s%s", (i > s ? "," : ""), l[i]; if (NR > 3) printf " +%d more", NR - 3 }')" || needs=""
       [ -z "$needs" ] || ctx="$ctx cloud-needs=$needs"
     fi
-    pr="$(pr_info "$P_ROOT" "$br" 2>/dev/null || true)"
-    [ -n "$pr" ] && ctx="$ctx PR=#$(printf '%s' "$pr" | cut -f1)($(printf '%s' "$pr" | cut -f2))"
+    pr_info_set "$P_ROOT" "$br" 2>/dev/null; pr="$PR_NUM"
+    [ -n "$pr" ] && ctx="$ctx PR=#$pr($PR_STATE)"
     # ce qui est en ligne (lot 02 de mise-en-ligne), jamais en mode mesure : en tête si ce couloir est servi sans être fusionné,
     # sinon avant les chemins longs (LAB_DOCS, file) que le plafond de 800 coupe
     if [ "${LAB_DRY:-0}" != 1 ]; then online="$(en_ligne_line 2>/dev/null || true)"; fi
     if [ -n "$online" ] && [ "$slug" != main-checkout ] && [ -n "$(deploy_serving "$slug" 2>/dev/null)" ]; then
       priority="${online%.} — this lane is live: go live with lab deploy only."
     elif [ -n "$online" ]; then ctx="$ctx $online"; fi
-    docs="$(docs_dir "$root")"
+    docs_dir_set "$root"; docs="$DOCS_DIR"
     [ "$P_DOCS" = local ] && ctx="$ctx LAB_DOCS=$docs (docs outside the repository: masterplan, batches and CHANGELOG live there)"
     if [ "$slug" != main-checkout ]; then
-      lot="$(wt_lot_file "$root")"   # fiche du lot de la branche courante (une branche par lot), sinon celle du couloir
-      if [ -n "$lot" ]; then st="$(lot_state "$lot")"; lotrel="${lot#"$root"/}"; ctx="$ctx batch=$(basename "$lot" .md) state=${st:-?} file=$lotrel"
+      wt_lot_set "$root"; lot="$WT_LOT"   # fiche du lot de la branche courante (une branche par lot), sinon celle du couloir
+      if [ -n "$lot" ]; then lot_state_set "$lot"; lotrel="${lot#"$root"/}"; name="${lot##*/}"; ctx="$ctx batch=${name%.md} state=${LOT_STATE:-?} file=$lotrel"
       else ctx="$ctx batch=none (lab batch new --title …)"; fi
       # issue des veilleurs de livraison (lot 14) : un rouge, un conflit, un échec ou un veilleur mort passe en tête
-      local wline
-      while IFS= read -r wline; do
-        [ -n "$wline" ] || continue
-        case "$wline" in
-          *" red — "*|*" conflict — "*|*" failed — "*|*" changed — "*|*" dead — "*) priority="${priority:+$priority }WATCHER=$wline." ;;
-          *) ctx="$ctx WATCHER=$wline." ;;
+      for f in "$LAB_STATE/watch/$P_NAME/$slug"/*; do
+        [ -f "$f" ] || continue; case "$f" in *.log|*.records|*.body|*.tmp.*) continue ;; esac
+        watch_line_set "$f" 2>/dev/null
+        case "$WATCH_LINE" in
+          *" red — "*|*" conflict — "*|*" failed — "*|*" changed — "*|*" dead — "*) priority="${priority:+$priority }WATCHER=$WATCH_LINE." ;;
+          *) ctx="$ctx WATCHER=$WATCH_LINE." ;;
         esac
-      done < <(SLUG="$slug" watch_summary "$slug" 2>/dev/null || true)
+      done
       # couloirs synchronisés (lot 15) : git local seul — ni fetch, ni commit, ni gh ; lab launch fait le merge, pas le hook. Jamais en
       # mode mesure : ces lignes varient avec les autres couloirs, et le cliquet du doctor les verrait monter
       local behind=0 overlap='' migr=''
@@ -102,14 +122,15 @@ hook_session_start() {
     else
       ctx="$ctx — main checkout: no commit here; \"lab new <lane>\""
     fi
-    notes="$(project_dir "$p")/notes.md"
+    facts_end
+    notes="$LAB_PROJECTS/$p/notes.md"
     # vivre avec son projet (lot 18) : ressources tenues, build servie, fiches à plat voisines d'un couloir neuf — informations
     # seulement, jamais en mode mesure (elles varient avec les autres couloirs et l'horloge)
     if [ "${LAB_DRY:-0}" != 1 ]; then
       life="$(resource_hook_line 2>/dev/null || true)"
       life="$life${life:+ }$(served_hook_line 2>/dev/null || true)"
       if [ "$slug" != main-checkout ] && lane_unplanned "$root" 2>/dev/null; then
-        flat="$(flat_lots_overlap "$(docs_dir "$root")" "$(lane_topic "$root" 2>/dev/null)" 2>/dev/null | sync_join)" || flat=''
+        flat="$(flat_lots_overlap "$docs" "$(lane_topic "$root" 2>/dev/null)" 2>/dev/null | sync_join)" || flat=''
         [ -z "$flat" ] || life="$life${life:+ }FLAT_BATCHES=$flat (old location, close to the topic: read them before planning)."
       fi
       life="${life% }"
@@ -151,7 +172,11 @@ hook_session_start() {
   [ "${LAB_DRY:-0}" = 1 ] || ctx="LAB lang=$(lab_lang_detect) ${ctx#LAB }"
   if [ -n "$priority" ]; then ctx="$priority $ctx"; fi
   if [ -n "${notes:-}" ] && [ -f "$notes" ]; then
-    n="$(grep -v '^# ' "$notes" | grep -v '^[[:space:]]*$' | head -20 | tr '\n' ' ' || true)"
+    n=''; lock=0   # vingt lignes au plus, ni titres ni lignes vides
+    while [ "$lock" -lt 20 ] && { IFS= read -r line || [ -n "$line" ]; }; do
+      case "$line" in '# '*) continue ;; esac
+      [[ "$line" =~ ^[[:space:]]*$ ]] || { n="$n$line "; lock=$((lock + 1)); }
+    done <"$notes"
     [ -n "$n" ] && ctx="$ctx Notes: $n"
   fi
   [ "${#ctx}" -gt 800 ] && ctx="${ctx:0:797}…"
@@ -169,7 +194,8 @@ hook_session_start() {
 
 # hook_session_key : la clé de la session qui démarre — .session_id du JSON reçu, sinon agent_pid ; une reprise garde sa clé
 hook_session_key() {
-  local k; k="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null | tr -d '\t\r\n' || true)"
+  local k="${HS_KEY//$'\t'/}"
+  k="${k//$'\r'/}"; k="${k//$'\n'/}"
   if [ -n "$k" ]; then printf '%s\n' "$k"; else agent_pid; fi
 }
 # rdv_hook_line <projet> <clé> → « neutre<TAB>DUE: … », « rouge<TAB>DUE=RED … » ou rien (ni retard ni 48 h : vert).
@@ -217,7 +243,7 @@ rdv_hook_line() {
   [ -n "$late" ] || [ "$n48" -gt 0 ] || return 0
   if [ -n "$reds" ]; then
     r="$(printf '%s\n' "$reds" | grep -c .)"
-    ids="$(printf '%s\n' "$reds" | head -5 | paste -sd, - | sed 's/,/, /g')"; [ "$r" -le 5 ] || ids="$ids, …"
+    ids="$(head -5 <<<"$reds" | paste -sd, - | sed 's/,/, /g')"; [ "$r" -le 5 ] || ids="$ids, …"
     printf 'rouge\tDUE=RED %s overdue deadline(s) left unsettled since an earlier session (no. %s): report them to the user first; lab due %s settles them.\n' "$r" "$ids" "$p"
   else
     printf 'neutre\tDUE: %s overdue, %s within 48 h — lab due %s\n' "$(printf '%s\n' "$late" | grep -c . || true)" "$n48" "$p"
@@ -544,7 +570,9 @@ path_allowed_for_rm() { # <chemin absolu> : sous le worktree courant (pas lui-m�
 seg_forced() { # <segment> → 0 si LAB_FORCE=1 vaut pour ce segment
   local -a t=(); local i=0
   [ "${LAB_FORCE:-0}" = 1 ] && return 0
-  words_split "${1//[()]/ }"; t=("${WORDS[@]+"${WORDS[@]}"}")
+  words_split "${1//[()]/ }"
+  # shellcheck disable=SC2153 # WORDS est posé par words_split (lib/guard_fast.sh)
+  t=("${WORDS[@]+"${WORDS[@]}"}")
   while [ "$i" -lt "${#t[@]}" ]; do
     case "${t[$i]}" in LAB_FORCE=1) return 0 ;; *=*|sudo|env|nohup|command|exec|time) i=$((i+1)) ;; *) return 1 ;; esac
   done
@@ -656,7 +684,9 @@ guard_rules() {
     case "${t[$i]}" in *=*) i=$((i+1)) ;; sudo|env|nohup|command|exec|time) i=$((i+1)) ;; *) break ;; esac
   done
   [ "$i" -lt "$n" ] || return 0
-  base_set "${t[$i]}"; cmd="$BASE"
+  base_set "${t[$i]}"
+  # shellcheck disable=SC2153 # BASE est posé par base_set (lib/guard_fast.sh)
+  cmd="$BASE"
   case "$cmd" in
     git)
       j=$((i+1)); sub=""; local gitcwd="$HOOK_CWD" gitcwd_unknown="${HOOK_CWD_UNKNOWN:-0}" d
@@ -885,6 +915,68 @@ guard_migrations_segment() {
   DENY_REASON="remote migration refused from \"${br:-detached HEAD}\": \"$words\" applies migrations that are not merged yet to production. Alternative: --local to try; production after the merge, from $base."
   return 1
 }
+# docker_prefix_count <mots…> : PREFIX_N, le nombre de mots avant la commande — VAR=…, sudo, env, nohup, command, exec, time,
+# timeout [options] <durée>, xargs [options], et les mots du shell qui en précèdent une (do, then, else, elif, if, while, until, {, !) ;
+# PREFIX_FORCED=1 si LAB_FORCE=1 en fait partie. Une seule liste pour le pré-filtre ci-dessous et la garde Docker (lib/docker.sh)
+# shellcheck disable=SC2034 # PREFIX_FORCED est lu par docker_segment (lib/docker.sh)
+docker_prefix_count() {
+  local w st=0
+  PREFIX_N=0 PREFIX_FORCED=0
+  for w in "$@"; do
+    case "$st:$w" in
+      1:-k|1:-s|1:--kill-after|1:--signal) st=2 ;;
+      1:-*) ;;
+      1:*) st=0 ;;
+      2:*) st=1 ;;
+      3:-n|3:-I|3:-P|3:-L|3:-s|3:-d|3:-E|3:-a) st=4 ;;   # xargs : options suivies d'une valeur
+      3:-*) ;;
+      3:*) return 0 ;;
+      4:*) st=3 ;;
+      *:LAB_FORCE=1) PREFIX_FORCED=1 ;;
+      *:timeout) st=1 ;;
+      *:xargs) st=3 ;;
+      *:*=*|*:sudo|*:env|*:nohup|*:command|*:exec|*:time|*:do|*:then|*:else|*:elif|*:if|*:while|*:until|*:'{'|*:'!') ;;
+      *) return 0 ;;
+    esac
+    PREFIX_N=$((PREFIX_N + 1))
+  done
+}
+# docker_subst_hint <commande> : rc 0 si une substitution $(…) ou `…` a docker pour commande, préfixes compris. Découpe grossière,
+# ligne à ligne et seulement sur les lignes qui portent docker (guillemets ignorés) : $(, l'accent grave ouvrant, ;, &, | ouvrent une
+# commande ; ce qui suit ) ou l'accent grave fermant reste au mot. echo "$(date)"; cat lib/docker.sh ne charge rien. Jamais de
+# ${…//…} sur la commande entière : bash 3.2 y essaie toutes les fins à chaque occurrence (92 s pour 2 000 $( dans 117 Ko)
+docker_subst_hint() {
+  local LC_ALL=C   # octets : une longue commande UTF-8 n'est pas reconvertie
+  local line x out open n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *docker*) ;; *) continue ;; esac
+    # au-delà de 200 lignes qui portent docker, la garde est chargée sans lire la suite : elle juge avec son propre budget (#264)
+    n=$((n + 1)); [ "$n" -le 200 ] || return 0
+    out='' open=1
+    while :; do
+      case "$line" in *\`*) ;; *) break ;; esac
+      x="${line%%\`*}"; line="${line:${#x}+1}"
+      if [ "$open" = 1 ]; then out="$out$x"$'\n'; open=0; else out="$out$x "; open=1; fi
+    done
+    line="$out$line"; line="${line//\$\(/$'\n'}"; line="${line//[;&|]/$'\n'}"
+    while [ -n "$line" ]; do
+      x="${line%%$'\n'*}"
+      if docker_segment_hint "$x"; then return 0; fi
+      line="${line:${#x}}"; line="${line#$'\n'}"
+    done
+  done <<<"$1"
+  return 1
+}
+# docker_segment_hint <segment> : rc 0 si sa commande est docker ou docker-compose, après les préfixes de docker_prefix_count — le
+# mot docker ailleurs (cat lib/docker.sh, echo docker run) n'est pas jugé et ne charge rien
+docker_segment_hint() {
+  words_split "${1//[()]/ }"
+  docker_prefix_count "${WORDS[@]+"${WORDS[@]}"}"
+  [ "$PREFIX_N" -lt "${#WORDS[@]}" ] || return 1
+  base_set "${WORDS[$PREFIX_N]}"
+  case "$BASE" in docker|docker-compose) return 0 ;; esac
+  return 1
+}
 track_cd() { # <segment> → met à jour HOOK_CWD si c'est un cd ; retourne 0 si c'était un cd
   local target
   words_split "$1"; [ "${WORDS[0]:-}" = cd ] || return 1
@@ -904,11 +996,15 @@ hook_guard_bash_payload() {
   # pré-filtre (lib/guard_fast.sh) : git, rm, une migration distante, ou une commande qui ressemble à un déploiement (connue, ou début
   # d'une deploy.<cible> déclarée) ; pose DEPLOY_SIGS
   ! guard_bash_ordinary "$cmd" || exit 0
-  local cwd0="$HOOK_CWD"
+  local cwd0="$HOOK_CWD" docker=0
+  # docker dans une substitution ($(…), `…`), même entre guillemets : la découpe des segments ne la voit pas
+  case "$cmd" in *\$\(*|*\`*) case "$cmd" in *docker*) if docker_subst_hint "$cmd"; then docker=1; fi ;; esac ;; esac
   segments_set "$cmd"
   while IFS= read -r seg; do
-    # aucun des mots que cd, guard_rules et guard_tower_segment cherchent : rien à juger (une commande longue a des centaines de segments)
-    case "$seg" in *cd*|*git*|*rm*|*gh*|*export*|*unset*|*LAB_AGENT_SCAN*) ;; *) continue ;; esac
+    # aucun des mots que cd, guard_rules, guard_tower_segment et la garde Docker cherchent : rien à juger (une commande longue a des
+    # centaines de segments)
+    case "$seg" in *cd*|*git*|*rm*|*gh*|*export*|*unset*|*LAB_AGENT_SCAN*|*docker*) ;; *) continue ;; esac
+    case "$seg" in *docker*) if docker_segment_hint "$seg"; then docker=1; fi ;; esac
     track_cd "$seg" && continue
     if ! guard_segment "$seg"; then
       if [ "$DENY_KIND" = perte ]; then json_deny "LAB: $DENY_REASON"; else json_deny "LAB: $DENY_REASON If the user explicitly asked for it, run it again with LAB_FORCE=1 before the command."; fi
@@ -916,13 +1012,23 @@ hook_guard_bash_payload() {
     fi
     if ! guard_tower_segment "$seg"; then json_deny "LAB: $DENY_REASON"; exit 0; fi   # lot 06 d'autonomie-tours, jamais forcé
   done <<<"$SEGMENTS"
+  # Docker (lot 02 de docker-menage) : un segment dont la commande est docker ; règles et ligne corrigée dans lib/docker.sh, chargée
+  # à la demande, sur la commande brute et le dossier de la session
+  if [ "$docker" = 1 ]; then
+    HOOK_CWD="$cwd0"; guard_load docker
+    if ! guard_docker "$cmd"; then
+      json_deny "LAB: $DENY_REASON"$'\n'"If the user explicitly asked for it, run it again with LAB_FORCE=1 before the command."
+      exit 0
+    fi
+  fi
   # jugés sur la commande brute, même entre guillemets (bash -c "…", URL citée) : LAB_AGENT_SCAN écrit n'importe où, fusion d'une PR
   # par gh api (REST …/pulls/<n>/merge, GraphQL mergePullRequest) — revue de sécurité
   HOOK_CWD="$cwd0"
   case "$cmd" in *LAB_AGENT_SCAN=*) guard_tower_segment "LAB_AGENT_SCAN=" || { json_deny "LAB: $DENY_REASON"; exit 0; } ;; esac
   case "$cmd" in *"gh api"*/pulls/*/merge*|*"gh api"*mergePullRequest*) guard_tower_segment "gh pr merge" || { json_deny "LAB: $DENY_REASON"; exit 0; } ;; esac
   # lot 10 : l'accord de l'utilisateur est tapé par lui seul — un envoi cmux qui le tape est refusé, jamais forcé (LAB_FORCE sans effet)
-  case "$cmd" in *cmux*|*cmx*) guard_words_send "$cmd" || { json_deny "LAB: $DENY_REASON"; exit 0; } ;; esac
+  # lot 02 d'app-treelab : la commande du fork aussi, quel que soit son nom (guard_words_send les connaît)
+  case "$cmd" in *cmux*|*cmx*|*send*|*paste*|*set-buffer*) guard_words_send "$cmd" || { json_deny "LAB: $DENY_REASON"; exit 0; } ;; esac
   # déploiements et migrations : seulement si un mot que leurs règles exigent est dans la commande (un segment n'en contient aucun autre)
   case "$cmd" in
     *deploy*|*publish*|*vercel*|*rsync*|*migrations*|*supabase*) ;;
@@ -942,7 +1048,7 @@ hook_guard_bash_payload() {
   exit 0
 }
 
-# guard_words_send <commande brute> (lot 10 d'autonomie-tours) : un texte tapé dans un onglet par cmux (send, paste, send-panel,
+# guard_words_send <commande brute> (lot 10 d'autonomie-tours) : un texte tapé dans un onglet par cmux ou le fork (send, paste, send-panel,
 # set-buffer) qui dit l'accord de l'utilisateur (words_match, lib/words.sh, avec les couloirs du projet) ou la formule « confirmed
 # aloud » de Ginkgo est refusé : le crochet de lab lirait ces mots comme les siens. /exit, une touche, tout autre texte passent. Chaque
 # chaîne entre guillemets, chaque ligne de la commande (here-doc compris), puis toutes ses chaînes recollées (morceaux coupés dans la
@@ -950,8 +1056,17 @@ hook_guard_bash_payload() {
 # est aussi jugé seul (revue du lot). Hors de portée, nommé par la fiche : des morceaux
 # envoyés en plusieurs appels, un script qui tape à la place de l'agent — la garde est une défense de plus, pas une preuve.
 guard_words_send() {
-  local cmd="$1" t lanes='' texts
-  printf '%s\n' "$cmd" | LC_ALL=C grep -Eq '(^|[^[:alnum:]_.-])(cmux|cmx)([[:space:]][^|;&]*)?[[:space:]](send|paste|send-panel|set-buffer)([[:space:]]|$)' || return 0
+  local cmd="$1" t lanes='' texts folded names='cmux|cmx' n re c specials='.[]\()*+?{}|^$'
+  # lot 02 d'app-treelab : les commandes des apps de terminal posées (le fork, terminal_found_set), par leur nom ou leur chemin, cité
+  # ou non, quelle que soit la casse (le disque du Mac l'ignore) ; chaque caractère spécial d'un nom est échappé, jamais le nom écarté
+  terminal_found_set
+  while IFS= read -r n; do
+    [ -n "$n" ] && [ "$n" != cmux ] || continue
+    re=''; while [ -n "$n" ]; do c="${n:0:1}"; n="${n:1}"; case "$specials" in *"$c"*) re="$re\\$c" ;; *) re="$re$c" ;; esac; done
+    names="$names|$re"
+  done <<<"$TERMINAL_FOUND_CLIS"
+  # SIGPIPE (lot 02 de fix-nuit-2026-11-24) : la commande lue par grep sur un here-string, jamais par un tuyau
+  LC_ALL=C grep -Eiq "(^|[^[:alnum:]_.-])($names)[\"']?([[:space:]][^|;&]*)?[[:space:]](send|paste|send-panel|set-buffer)([[:space:]]|\$)" <<<"$cmd" || return 0
   # un texte sans aucun des mots que les deux règles exigent (replié comme words_fold) n'est pas jugé : un envoi ordinaire coûtait six
   # processus par texte et par ligne. Un perl en échec n'en trie aucun : il faut aussi à words_match, qui ne jugerait rien non plus
   texts="$(printf '%s\n' "$cmd" | perl -MEncode -MUnicode::Normalize -e '
@@ -970,7 +1085,8 @@ guard_words_send() {
   while IFS= read -r t; do
     [ -n "${t// /}" ] || continue
     # shellcheck disable=SC2086 # noms de couloir : des mots (valid_slug)
-    if WORDS_BARE=1 words_match "$t" $lanes >/dev/null || printf '%s' "$t" | words_fold | LC_ALL=C grep -Eq 'confirm[a-z]*[^a-z]*(aloud|out[^a-z]*loud)|voix haute'; then
+    if WORDS_BARE=1 words_match "$t" $lanes >/dev/null \
+      || { folded="$(printf '%s' "$t" | words_fold)" && LC_ALL=C grep -Eq 'confirm[a-z]*[^a-z]*(aloud|out[^a-z]*loud)|voix haute' <<<"$folded"; }; then
       DENY_REASON="the user's agreement is typed by them only: cmux typing \"$(printf '%s' "$t" | words_clean 80)\" refused — they write it in the tab themselves, or answer a question asked with AskUserQuestion."
       return 1
     fi

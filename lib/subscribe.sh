@@ -15,6 +15,7 @@ _subscribe_say() { log_wrap "$*"; }
 # _subscribe_call <POST|GET> <route> <sortie> : un appel du contrat, LAB_PRIVATE_STATUS = statut ; rc 1 sur coupure, redirection
 # ou en-têtes hors contrat (le corps n'est alors jamais lu)
 _subscribe_call() {
+  # shellcheck disable=SC2034 # LAB_PRIVATE_DEADLINE est lu par lib/update_private.sh
   LAB_PRIVATE_DEADLINE=$((SECONDS + 16))
   _update_private_config "$1" "$2" "$temp/request.conf" 2>/dev/null &&
     _update_private_fetch "$temp/request.conf" "$3" 16384 15 2>/dev/null || return 1

@@ -355,8 +355,12 @@ install_legacy_paths() {
 # install_legacy_known <chemin> : le manifeste attribue ce chemin à un lien posé par treelab (revue du lot 02 : un lien personnel
 # sous un ancien nom, jamais posé par treelab, n'est ni retiré, ni annoncé, ni signalé)
 install_legacy_known() {
-  local line
+  local line rc=0
   [ -f "${LAB_TXN_MANIFEST:-}" ] && _txn_target "$1" 2>/dev/null || return 1
+  # aucune ligne « symlink » vers ce chemin dans le texte : rien à parcourir (lot 03 de charge-processeur : le doctor relisait le
+  # manifeste entier par ancien lien présent) ; trouvée, ou texte illisible, la lecture ligne à ligne décide
+  perl -e "$TXN_FACTS_PL" has "$LAB_TXN_MANIFEST" $'\t@symlink\t@'"$LAB_TXN_TARGET"$'\t' 2>/dev/null || rc=$?
+  [ "$rc" != 1 ] || return 1
   while IFS= read -r line; do
     [ "$line" != $'treelab-install\t1' ] || continue
     _txn_parse "$line" || return 1

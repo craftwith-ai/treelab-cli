@@ -45,6 +45,22 @@ _txn_exists() { [ -e "$1" ] || [ -L "$1" ]; }
 _txn_plain_path() { # Refus de lien dans TOUS les composants techniques.
   local p="$1"
   case "$p" in /*) ;; *) return 1 ;; esac
+  # validation groupée : le dossier des sauvegardes, vérifié en tête, et les deux derniers chemins vérifiés ne sont pas reparcourus, ni
+  # aucun de leurs dossiers — chacun de leurs composants l'a été. Deux : chaque ligne vérifie son dossier de sauvegarde puis le parent de
+  # sa cible, deux arbres en alternance (lot 03 de charge-processeur : 40 % des commandes de la validation)
+  if [ -n "${LAB_TXN_PLAIN_OK:-}" ]; then
+    [ "$p" != "${LAB_TXN_PLAIN_LAST:-}" ] || return 0
+    if [ "$p" != "${LAB_TXN_PLAIN_PREV:-}" ]; then
+      while [ "$p" != / ]; do
+        [ "$p" != "$LAB_TXN_PLAIN_OK" ] || break
+        case "${LAB_TXN_PLAIN_LAST:-}/" in "$p"/*) break ;; esac
+        case "${LAB_TXN_PLAIN_PREV:-}/" in "$p"/*) break ;; esac
+        [ ! -L "$p" ] || return 1
+        p="${p%/*}"; p="${p:-/}"
+      done
+    fi
+    LAB_TXN_PLAIN_PREV="${LAB_TXN_PLAIN_LAST:-}"; LAB_TXN_PLAIN_LAST="$1"; return 0
+  fi
   while [ "$p" != / ]; do
     [ ! -L "$p" ] || return 1
     p="${p%/*}"; p="${p:-/}"
@@ -75,44 +91,137 @@ _txn_row() {
   printf '\n'
 }
 _txn_parse() { # Tableau local à l'appelant, valeurs @ non vides avant découpage.
-  local line="$1" field
+  # Chaque champ commence par @ : aucun champ vide, le découpage par tabulation est exact (lot 03 de charge-processeur : une
+  # expansion au lieu d'une boucle par champ, quatre passes sur l'historique par doctor).
+  local line="$1" IFS=$'\t' glob=''
   LAB_TXN_FIELDS=()
-  while :; do
-    field="${line%%$'\t'*}"
-    case "$field" in @*) LAB_TXN_FIELDS+=("${field#@}") ;; *) return 1 ;; esac
-    case "$line" in *$'\t'*) line="${line#*$'\t'}" ;; *) break ;; esac
-  done
+  case "$line" in @*) ;; *) return 1 ;; esac
+  case "$line" in *$'\t'|*$'\t'[!@]*) return 1 ;; esac
+  case "$-" in *f*) ;; *) glob=1; set -f ;; esac
+  # shellcheck disable=SC2206 # découpage voulu, sur la seule tabulation, sans motif
+  LAB_TXN_FIELDS=($line)
+  [ -z "$glob" ] || set +f
+  # IFS par défaut avant "${t[@]#@}" : sous bash 3.2, un IFS sans espace y recolle les éléments en un seul mot
+  IFS=$' \t\n'
+  LAB_TXN_FIELDS=("${LAB_TXN_FIELDS[@]#@}")
   [ "${#LAB_TXN_FIELDS[@]}" -ge 8 ]
 }
-_txn_tree_data() { # Parcours sans lien suivi ; toute erreur de lecture remonte.
-  local p="$1" root="${2:-$1}" mode link child
-  _txn_field "$p" || return 1
-  mode="$(stat -f '%Lp' "$p")" || return
-  printf '%s\t%s\t' "${p#"$root"}" "$mode" || return
-  if [ -L "$p" ]; then
-    _txn_readlink "$p" || return
-    link="$LAB_TXN_LINK"
-    printf 'L\t%s\n' "$link"
-  elif [ -f "$p" ]; then
-    local modified; modified="$(stat -f '%m' "$p")" || return
-    printf 'F\t%s\t' "$modified" && shasum -a 256 <"$p"
-  elif [ -d "$p" ]; then
-    [ -r "$p" ] && [ -x "$p" ] || return 1
-    printf 'D\n' || return
-    for child in "$p"/.[!.]* "$p"/..?* "$p"/*; do
-      _txn_exists "$child" || continue
-      _txn_tree_data "$child" "$root" || return
-    done
-  else return 1
-  fi
+# TXN_FACTS_PL (lot 03 de charge-processeur) : les faits de l'historique lus par un seul perl — un programme par empreinte, mode ou
+# fichier coûtait six programmes par ligne du manifeste. Les règles restent en bash ; ce programme ne fait que lire.
+#   fp <chemin> : l'empreinte d'une arborescence, sans lien suivi — SHA-256 des lignes triées en octets « chemin relatif, mode %Lp
+#     de stat (mode & 0777), L cible | F date shasum-de-son-contenu | D », « absent », ou « ! » (nom ou cible à tabulation ou fin de
+#     ligne, type spécial, illisible) ; à l'octet celle de l'ancien parcours stat, shasum et sort (preuves du lot 03)
+#   rows <manifeste> <sauvegardes> <0|1> : « mode<TAB>dernier octet » du manifeste (- s'il est vide), puis une ligne par ligne du
+#     manifeste — « - », ou « d<TAB>mode row<TAB>after<TAB>done<TAB>types<TAB>empreinte before<TAB>mode retirement<TAB>state<TAB>
+#     empreinte retirement/before<TAB>retirement/after » (- : non demandé ; ! : illisible), empreintes avec 1 seulement ; types :
+#     row, after, done en trois lettres d'après lstat — a absent ou illisible, l lien, f fichier, o autre
+#   committed <manifeste> <id…> : chaque id dont « @id<TAB> » paraît dans le manifeste, un par ligne (grep -F de _txn_committed)
+# shellcheck disable=SC2016 # programme perl littéral
+TXN_FACTS_PL='
+use strict; use Digest::SHA; use filetest "access";
+my $cmd = shift @ARGV;
+sub plain { $_[0] !~ /[\t\r\n]/ }
+sub tree {
+  my ($p, $root, $out) = @_;
+  return 0 unless plain($p);
+  my @st = lstat($p) or return 0;
+  my $line = substr($p, length($root)) . "\t" . sprintf("%o", $st[2] & 0777) . "\t";
+  if (-l _) { my $l = readlink($p); return 0 unless defined $l && plain($l); push @$out, $line . "L\t$l"; }
+  elsif (-f _) {
+    open(my $fh, "<:raw", $p) or return 0; my $sha = Digest::SHA->new(256); eval { $sha->addfile($fh); 1 } or return 0; close $fh;
+    push @$out, $line . "F\t$st[9]\t" . $sha->hexdigest . "  -";
+  } elsif (-d _) {
+    return 0 unless -r $p && -x $p;
+    push @$out, $line . "D";
+    opendir(my $dh, $p) or return 0; my @k = grep { $_ ne "." && $_ ne ".." } readdir($dh); closedir $dh;
+    for my $c (@k) { tree("$p/$c", $root, $out) or return 0; }
+  } else { return 0 }
+  return 1;
 }
-_txn_fingerprint() (
-  set -o pipefail
-  if ! _txn_exists "$1"; then printf 'absent\n'; return; fi
-  local data
-  data="$(_txn_tree_data "$1")" || return
-  printf '%s\n' "$data" | LC_ALL=C sort | shasum -a 256 | cut -d ' ' -f 1
-)
+sub fp { my $p = shift; return "absent" unless -e $p || -l $p; my @l; tree($p, $p, \@l) or return "!"; Digest::SHA::sha256_hex(join("\n", sort @l) . "\n") }
+sub lp { my @s = lstat($_[0]); @s ? sprintf("%o", $s[2] & 0777) : "!" }
+sub ty { join "", map { my @s = lstat("$_[0]/$_"); !@s ? "a" : -l _ ? "l" : -f _ ? "f" : "o" } qw(row after done) }
+sub ex { -e $_[0] || -l $_[0] }
+# contenu comme bash le lit (read -d "" : jusqu au premier NUL), fins de ligne finales retirées
+sub slurp { open(my $fh, "<:raw", $_[0]) or return ""; local $/; my $c = <$fh>; close $fh; $c = "" unless defined $c; $c =~ tr/\0//d; $c =~ s/\n+\z//; $c }
+# métadonnées d une ligne validée, celles du doctor : ok, removal (retrait en cours) ou fail
+sub meta_row {
+  my ($line, $f, $d, $bk) = @_;
+  return "removal" if ex("$d/done") || ex("$d/retirement") || ex("$bk/" . substr($f->[0], 1) . "/remove-started");
+  return "fail" unless -r "$d/row" && -r "$d/after" && defined $f->[5] && slurp("$d/after") eq substr($f->[5], 1) && lp($d) eq "700";
+  my $exp = $line;
+  if (substr($f->[2], 1) ne "skip") { my @g = @$f; $g[5] = "\@pending"; $exp = join("\t", @g) }
+  return slurp("$d/row") eq $exp ? "ok" : "fail";
+}
+if ($cmd eq "fp") { print fp($ARGV[0]), "\n"; exit 0 }
+# has <manifeste> <texte> : 0 si le texte (octets NUL retirés, comme bash les lit) contient la chaîne, 1 sinon, 2 illisible
+if ($cmd eq "has") {
+  my ($man, $s) = @ARGV; open(my $fh, "<:raw", $man) or exit 2; local $/; my $c = <$fh>; close $fh; $c = "" unless defined $c;
+  $c =~ tr/\0//d; exit(index($c, $s) >= 0 ? 0 : 1);
+}
+if ($cmd eq "committed") {
+  my $man = shift @ARGV; open(my $fh, "<:raw", $man) or exit 0; local $/; my $c = <$fh>; close $fh; $c = "" unless defined $c;
+  for my $id (@ARGV) { print "$id\n" if index($c, "\@$id\t") >= 0 }
+  exit 0;
+}
+if ($cmd eq "rows" || $cmd eq "meta") {
+  my ($man, $bk, $with) = @ARGV; my $last = "!"; my $meta = "ok"; my $rows = $cmd eq "rows";
+  if (open(my $fh, "<:raw", $man)) { if (-s $fh) { seek($fh, -1, 2); read($fh, my $c, 1); $last = ord($c) } else { $last = "-" } close $fh }
+  print lp($man), "\t$last\n" if $rows;
+  open(my $in, "<:raw", $man) or exit 0;
+  while (my $line = <$in>) {
+    chomp $line; $line =~ tr/\0//d;
+    my @f = split /\t/, $line, -1;
+    if (@f < 3 || $f[0] !~ /^\@txn\.[a-zA-Z0-9]+$/ || $f[1] !~ /^\@[1-9][0-9]*$/) { print "-\n" if $rows; next }
+    my $d = "$bk/" . substr($f[0], 1) . "/" . substr($f[1], 1);
+    $meta = meta_row($line, \@f, $d, $bk) if $meta eq "ok";
+    next unless $rows;
+    my @o = ($d, lp("$d/row"), lp("$d/after"), lp("$d/done"), ty($d), ($with && defined $f[4] && $f[4] =~ /^\@[0-9a-f]{64}$/) ? fp("$d/before") : "-");
+    if (-e "$d/retirement" || -l "$d/retirement") {
+      push @o, lp("$d/retirement"), lp("$d/retirement/state"), $with ? (fp("$d/retirement/before"), fp("$d/retirement/after")) : ("-", "-");
+    } else { push @o, "-", "-", "-", "-" }
+    print join("\t", @o), "\n";
+  }
+  # après la dernière ligne : le verdict des métadonnées de toutes les lignes (la première ligne fausse décide)
+  print "meta\t$meta\n";
+}'
+_txn_fingerprint() {
+  local fp
+  fp="$(perl -e "$TXN_FACTS_PL" fp "$1" 2>/dev/null)" && [ -n "$fp" ] && [ "$fp" != '!' ] || return 1
+  printf '%s\n' "$fp"
+}
+# _txn_slurp <fichier> : LAB_TXN_SLURP, son contenu comme $(cat fichier) le donnait (octets NUL ôtés, fins de ligne finales
+# retirées), sans programme
+_txn_slurp() {
+  local _c=''
+  LAB_TXN_SLURP=''
+  { while IFS= read -r -d '' _c; do LAB_TXN_SLURP="$LAB_TXN_SLURP$_c"; done; LAB_TXN_SLURP="$LAB_TXN_SLURP$_c"; } 2>/dev/null <"$1" || true
+  while [ "${LAB_TXN_SLURP%$'\n'}" != "$LAB_TXN_SLURP" ]; do LAB_TXN_SLURP="${LAB_TXN_SLURP%$'\n'}"; done
+}
+# _txn_mode_is <chemin> <mode> : le mode « %Lp » de stat vaut <mode>. Validation groupée : lu dans les faits de la ligne courante
+# (LAB_TXN_B, réponse rows de TXN_FACTS_PL) ; tout autre chemin, ou un fait non lu, par stat
+_txn_mode_is() {
+  local v='-' b="${LAB_TXN_B[0]:--}"
+  if [ "$b" != - ]; then
+    case "$1" in
+      "$b/row") v="${LAB_TXN_B[1]:--}" ;; "$b/after") v="${LAB_TXN_B[2]:--}" ;; "$b/done") v="${LAB_TXN_B[3]:--}" ;;
+      "$b/retirement") v="${LAB_TXN_B[6]:--}" ;; "$b/retirement/state") v="${LAB_TXN_B[7]:--}" ;;
+    esac
+  fi
+  [ "$v" != - ] || v="$(stat -f '%Lp' "$1")"
+  [ "$v" = "$2" ]
+}
+# _txn_fp_is <chemin> <empreinte> : même lecture pour une empreinte (before, retirement/before, retirement/after)
+_txn_fp_is() {
+  local v='-' b="${LAB_TXN_B[0]:--}"
+  if [ "$b" != - ]; then
+    case "$1" in
+      "$b/before") v="${LAB_TXN_B[5]:--}" ;; "$b/retirement/before") v="${LAB_TXN_B[8]:--}" ;; "$b/retirement/after") v="${LAB_TXN_B[9]:--}" ;;
+    esac
+  fi
+  if [ "$v" = - ]; then v="$(_txn_fingerprint "$1")" || v=''; fi
+  [ "$v" = "$2" ]
+}
 _txn_allowed() {
   local pair
   [[ "$1" =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]] && [[ "$2" =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]] || return 1
@@ -170,67 +279,122 @@ _txn_validate_row() {
   else [ -z "$forward$inverse" ] || return 1; fi
   d="$LAB_TXN_BACKUPS/${LAB_TXN_FIELDS[0]}/${LAB_TXN_FIELDS[1]}"
   _txn_plain_path "$d" && [ -d "$d" ] || return 1
-  local f
-  for f in row after 'done'; do
-    _txn_plain_path "$d/$f" || return 1
-    if [ -e "$d/$f" ]; then
-      [ -f "$d/$f" ] && [ "$(stat -f '%Lp' "$d/$f")" = 600 ] || return 1
-    fi
-  done
-  if [ -f "$d/done" ]; then [ "$(cat "$d/done")" = 'done' ] || return 1; fi
+  local f t="${LAB_TXN_B[4]:-}"
+  # row, after, done : lien refusé, absent admis, sinon fichier 0600. Types et modes lus par le programme perl pour ce dossier
+  # (lot 03 de charge-processeur : trois stat et un appel par fichier et par ligne) ; sans ces faits, chaque fichier relu ici.
+  if [ "${#t}" -eq 3 ] && [ "${LAB_TXN_B[0]:-}" = "$d" ]; then
+    case "$t" in *[!af]*) return 1 ;; esac
+    [ "${t:0:1}" = a ] || [ "${LAB_TXN_B[1]:-}" = 600 ] || return 1
+    [ "${t:1:1}" = a ] || [ "${LAB_TXN_B[2]:-}" = 600 ] || return 1
+    [ "${t:2:1}" = a ] || [ "${LAB_TXN_B[3]:-}" = 600 ] || return 1
+  else
+    for f in row after 'done'; do
+      [ ! -L "$d/$f" ] || return 1   # $d vérifié juste au-dessus : seul le dernier composant reste
+      if [ -e "$d/$f" ]; then
+        [ -f "$d/$f" ] && _txn_mode_is "$d/$f" 600 || return 1
+      fi
+    done
+  fi
+  if [ -f "$d/done" ]; then _txn_slurp "$d/done"; [ "$LAB_TXN_SLURP" = 'done' ] || return 1; fi
   # Une migration annulée rétablit le lien du dossier parent après ses enfants.
   # Les opérations déjà acquittées n'accèdent plus à cette cible désormais liée.
-  [ -f "$d/done" ] || _txn_plain_path "$(dirname "$target")" || return 1
+  # Parent d'une cible absolue normalisée (vérifiée plus haut) : celui de dirname, sans programme.
+  f="${target%/*}"; [ -n "$f" ] || f=/
+  [ -f "$d/done" ] || _txn_plain_path "$f" || return 1
   _txn_retirement_validate "$d" "$target" || return 1
   if [ "$before" != absent ] && [ "$before" != none ]; then
     # before peut lui-même être le lien sauvegardé ; son contenu doit correspondre.
-    [ "$(_txn_fingerprint "$d/before")" = "$before" ] || return 1
+    _txn_fp_is "$d/before" "$before" || return 1
   fi
 }
 _txn_sealed_count() {
   local file="$LAB_TXN_BACKUPS/$1/sealed-count"
-  _txn_plain_path "$file" && [ -f "$file" ] && [ "$(cat "$file")" = "$2" ] || return 1
+  _txn_plain_path "$file" && [ -f "$file" ] && _txn_slurp "$file" && [ "$LAB_TXN_SLURP" = "$2" ] || return 1
   file="$LAB_TXN_BACKUPS/$1/remove-started"
   if [ -e "$file" ] || [ -L "$file" ]; then
     _txn_plain_path "$file" && [ -f "$file" ] && [ "$(stat -f %Lp "$file")" = 600 ] &&
-      [ "$(cat "$file")" = treelab-removal-v1 ] || return 1
+      _txn_slurp "$file" && [ "$LAB_TXN_SLURP" = treelab-removal-v1 ] || return 1
   fi
 }
+# Validation groupée (lot 03 de charge-processeur) : les mêmes règles, ligne par ligne, avec les faits de tout l'historique lus en
+# une passe par TXN_FACTS_PL (descripteur 4, une réponse par ligne du manifeste lu sur 3) ; sans réponse, chaque fait est relu seul.
 _txn_validate_manifest() {
+  LAB_TXN_META=''; LAB_TXN_SETUP_FOR=''; LAB_TXN_SETUP_NOTE=''
   [ ! -e "$LAB_TXN_MANIFEST" ] || {
-    [ -f "$LAB_TXN_MANIFEST" ] && [ "$(stat -f '%Lp' "$LAB_TXN_MANIFEST")" = 600 ] || return 1
-    local line n=0 prev='' seq=0 seen='|' id order
-    while IFS= read -r line || [ -n "$line" ]; do
-      n=$((n + 1))
-      if [ "$n" -eq 1 ]; then [ "$line" = $'treelab-install\t1' ] || return 1; continue; fi
-      _txn_validate_row "$line" yes || return 1
-      id="${LAB_TXN_FIELDS[0]}"; order="${LAB_TXN_FIELDS[1]}"
-      if [ "$id" != "$prev" ]; then
-        [ -z "$prev" ] || _txn_sealed_count "$prev" "$seq" || return 1
-        case "$seen" in *"|$id|"*) return 1 ;; esac
-        seen="$seen$id|"; prev="$id"; seq=0
-      fi
-      seq=$((seq + 1)); [ "$order" = "$seq" ] || return 1
-    done <"$LAB_TXN_MANIFEST"
-    [ "$n" -ge 1 ] || return 1
-    [ -z "$prev" ] || _txn_sealed_count "$prev" "$seq" || return 1
-    # Une dernière ligne sans terminateur est tronquée.
-    [ "$(tail -c 1 "$LAB_TXN_MANIFEST" | od -An -tu1 | tr -d ' ')" = 10 ] || return 1
+    [ -f "$LAB_TXN_MANIFEST" ] || return 1
+    # illisible : le mode décide seul, sans ouvrir le fichier, comme avant
+    [ -r "$LAB_TXN_MANIFEST" ] || [ "$(stat -f '%Lp' "$LAB_TXN_MANIFEST")" = 600 ] || return 1
+    # shellcheck disable=SC2094 # le manifeste est lu deux fois, jamais écrit
+    _txn_validate_rows 3<"$LAB_TXN_MANIFEST" 4< <(exec perl -e "$TXN_FACTS_PL" rows "$LAB_TXN_MANIFEST" "$LAB_TXN_BACKUPS" 1 2>/dev/null)
   }
 }
+_txn_validate_rows() {
+  local line n=0 prev='' seq=0 seen='|' id order mode='' last='' setup=yes LAB_TXN_PLAIN_OK='' LAB_TXN_PLAIN_LAST='' LAB_TXN_PLAIN_PREV=''
+  local -a LAB_TXN_B=()
+  ! _txn_plain_path "$LAB_TXN_BACKUPS" || LAB_TXN_PLAIN_OK="$LAB_TXN_BACKUPS"
+  IFS=$'\t' read -r mode last <&4 || true
+  [ -n "$mode" ] && [ "$mode" != '!' ] || mode="$(stat -f '%Lp' "$LAB_TXN_MANIFEST")"
+  [ "$mode" = 600 ] || return 1
+  while IFS= read -r line <&3 || [ -n "$line" ]; do
+    n=$((n + 1)); LAB_TXN_B=()
+    IFS=$'\t' read -r -a LAB_TXN_B <&4 || true
+    if [ "$n" -eq 1 ]; then [ "$line" = $'treelab-install\t1' ] || return 1; continue; fi
+    _txn_validate_row "$line" yes || return 1
+    # note de pose de la dernière ligne skip qui en porte une, comme _setup_info la relirait ; skip sans note : _setup_info la jugera
+    # shellcheck disable=SC2034 # LAB_TXN_SETUP_NOTE : lu par doctor_setup_info (lib/doctor_product.sh)
+    if [ "${LAB_TXN_FIELDS[2]}" = skip ]; then
+      if [ "${#LAB_TXN_FIELDS[@]}" -lt 9 ]; then setup=no
+      else case "${LAB_TXN_FIELDS[8]}" in treelab-setup-v1:*) LAB_TXN_SETUP_NOTE="${LAB_TXN_FIELDS[8]#treelab-setup-v1:}" ;; esac; fi
+    fi
+    id="${LAB_TXN_FIELDS[0]}"; order="${LAB_TXN_FIELDS[1]}"
+    if [ "$id" != "$prev" ]; then
+      [ -z "$prev" ] || _txn_sealed_count "$prev" "$seq" || return 1
+      case "$seen" in *"|$id|"*) return 1 ;; esac
+      seen="$seen$id|"; prev="$id"; seq=0
+    fi
+    seq=$((seq + 1)); [ "$order" = "$seq" ] || return 1
+  done
+  # LAB_TXN_META : le verdict des métadonnées (ok, removal, fail), lu après la dernière ligne — celui du doctor, sans second passage
+  IFS=$'\t' read -r -a LAB_TXN_B <&4 || true
+  # shellcheck disable=SC2034 # lu par doctor_manifest_metadata (lib/doctor_product.sh)
+  [ "${LAB_TXN_B[0]:-}" != meta ] || LAB_TXN_META="${LAB_TXN_B[1]:-}"
+  LAB_TXN_B=()
+  [ "$n" -ge 1 ] || return 1
+  [ -z "$prev" ] || _txn_sealed_count "$prev" "$seq" || return 1
+  # Une dernière ligne sans terminateur est tronquée.
+  case "$last" in ''|'!') last="$(tail -c 1 "$LAB_TXN_MANIFEST" | od -An -tu1 | tr -d ' ')" ;; -) last='' ;; esac
+  [ "$last" = 10 ] || return 1
+  # LAB_TXN_SETUP_FOR (lot 03 de charge-processeur) : manifeste validé dont LAB_TXN_SETUP_NOTE est la note de pose — lu par le doctor
+  # seul, qui n'écrit pas entre les deux (doctor_setup_info) ; setup et update relisent par _setup_info
+  # shellcheck disable=SC2034 # lu par doctor_setup_info (lib/doctor_product.sh)
+  [ "$setup" = no ] || LAB_TXN_SETUP_FOR="$LAB_TXN_MANIFEST"
+}
 _txn_committed() { [ -f "$LAB_TXN_MANIFEST" ] && grep -Fq "@$1"$'\t' "$LAB_TXN_MANIFEST"; }
+# _txn_committed_in <id> <ids lus> <ids validés> : réponse de la lecture groupée de _txn_pending, sinon _txn_committed
+_txn_committed_in() {
+  case "$2" in *$'\n'"$1"$'\n'*) case "$3" in *$'\n'"$1"$'\n'*) return 0 ;; *) return 1 ;; esac ;; esac
+  _txn_committed "$1"
+}
 _txn_pending() {
-  local d
+  local d asked=$'\n' set=$'\n'; local -a ids=()
   LAB_TXN_PENDING=''
+  # les transactions validées lues en un seul programme ; un nom à fin de ligne, ou absent de cette lecture, par _txn_committed
+  for d in "$LAB_TXN_BACKUPS"/txn.*; do
+    _txn_exists "$d" || continue
+    case "${d##*/}" in *$'\n'*) ;; *) ids+=("${d##*/}"); asked="$asked${d##*/}"$'\n' ;; esac
+  done
+  if [ "${#ids[@]}" -gt 0 ] && [ -f "$LAB_TXN_MANIFEST" ]; then
+    set="$set$(perl -e "$TXN_FACTS_PL" committed "$LAB_TXN_MANIFEST" "${ids[@]}" 2>/dev/null)"$'\n' || asked=$'\n'
+  fi
   for d in "$LAB_TXN_BACKUPS"/txn.*; do
     _txn_exists "$d" || continue
     _txn_plain_path "$d" && [ -d "$d" ] || return 1
     if [ -e "$d/retired" ] || [ -L "$d/retired" ]; then
       _txn_plain_path "$d/retired" && [ -f "$d/retired" ] &&
-        [ "$(stat -f %Lp "$d/retired")" = 600 ] && [ "$(cat "$d/retired")" = treelab-retired-v1 ] || return 1
+        [ "$(stat -f %Lp "$d/retired")" = 600 ] && _txn_slurp "$d/retired" && [ "$LAB_TXN_SLURP" = treelab-retired-v1 ] || return 1
       continue
     fi
-    if [ -e "$d/rollback" ] || ! _txn_committed "${d##*/}"; then
+    if [ -e "$d/rollback" ] || ! _txn_committed_in "${d##*/}" "$asked" "$set"; then
       [ -z "$LAB_TXN_PENDING" ] || return 1
       LAB_TXN_PENDING="$d"
     fi
@@ -434,15 +598,15 @@ _txn_undo_row() {
 _txn_retirement_validate() {
   local d="$1/retirement" target="$2" f
   [ ! -e "$d" ] && [ ! -L "$d" ] && return 0
-  _txn_plain_path "$d" && [ -d "$d" ] && [ "$(stat -f %Lp "$d")" = 700 ] || return 1
+  _txn_plain_path "$d" && [ -d "$d" ] && _txn_mode_is "$d" 700 || return 1
   for f in state before after; do
     _txn_plain_path "$d/$f" && [ -f "$d/$f" ] || return 1
   done
-  [ "$(stat -f %Lp "$d/state")" = 600 ] || return 1
+  _txn_mode_is "$d/state" 600 || return 1
   local lines=() line
   while IFS= read -r line; do lines+=("$line"); done <"$d/state"
   [ "${#lines[@]}" -eq 4 ] && [ "${lines[0]}" = treelab-retirement-v1 ] && [ "${lines[1]}" = "$target" ] || return 1
-  [ "$(_txn_fingerprint "$d/before")" = "${lines[2]}" ] && [ "$(_txn_fingerprint "$d/after")" = "${lines[3]}" ]
+  _txn_fp_is "$d/before" "${lines[2]}" && _txn_fp_is "$d/after" "${lines[3]}"
 }
 _txn_retirement_ack() {
   local stop="$1" target="$2" line d

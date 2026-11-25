@@ -4,8 +4,8 @@
 # step with a notice, and the full suite never runs on an ordinary pull request push.
 #   1. fast: every pull request push, drafts included — secrets (gitleaks), then FAST_CMD (lint, types). Seconds, Linux.
 #   2. targeted: a ready pull request without the full-suite label — TARGETED_CMD receives the changed files as arguments.
-#   3. full: once per lane — the pull request carries the full-suite label (set by lab close before acceptance), or it is the
-#      staging → main promotion; FULL_CMD runs the whole suite.
+#   3. full: the pull request carries the full-suite label (posted by hand only, its reason written in the batch file), or it
+#      is the staging → main promotion; FULL_CMD runs the whole suite.
 #   4. night: every night on main, skipped when main has not moved since the last green night — FULL_CMD as a safety net.
 #   5. e2e: at night after the night job, or on a pull request carrying the e2e label — E2E_CMD.
 # push only on main (a branch push without a pull request costs nothing); a new revision cancels the previous run of its pull
