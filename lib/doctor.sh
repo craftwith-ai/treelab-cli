@@ -425,6 +425,51 @@ doctor_services() {
   [ "$k" -lt 2 ] || names="$names; all of them: lab services $1 stop --orphans"
   check "$1.lanes.services" "$k" 0 warn "Services of closed lanes, still listed by $SERVICES_HOOK_REL list$names" sans-cliquet
 }
+# doctor_docker <projet> (lot 03 de docker-menage) : la machine Docker vue du projet — jaune si la place est courte (ROOM=short) ou s'il
+# traîne des restes à l'étiquette du projet (conteneurs arrêtés, images de plus de 7 jours, tout ce que laissent les couloirs fermés),
+# avec les nombres et lab docker clean <projet> ; vert sinon, le compte sans étiquette en note ; jamais rouge, hors baseline (flag).
+# Docker absent : ni ligne ni processus (lib/docker.sh n'est même pas chargé) ; muet : jaune « not read ». Lecture directe bornée :
+# sonde 2 s, listes 10 s, ni constructeur ni cache. LAB_DOCTOR_NO_DOCKER=1 (garde de livraison) : sauté.
+# La place est celle de toute la machine Docker : lue une fois par bilan (DOC_DOCKER_*), jamais une sonde par projet ; Docker muet
+# pour un projet l'est pour les suivants, sans nouvelle attente (revue du lot 03).
+DOC_DOCKER_STATE='' DOC_DOCKER_FREE='' DOC_DOCKER_USED='' DOC_DOCKER_ROOM='' DOC_DOCKER_WHY=''
+doctor_docker() {
+  local p="$1" n value space note
+  [ "${LAB_DOCTOR_NO_DOCKER:-}" != 1 ] || return 0
+  command -v "${LAB_DOCKER:-docker}" >/dev/null 2>&1 || return 0
+  declare -F docker_room_set >/dev/null || . "$LAB_ROOT/lib/docker.sh"
+  case "${LAB_DOCKER_IMAGE_DAYS:-7}" in
+    ''|*[!0-9]*) flag "$p.docker" warn "not read" "LAB_DOCKER_IMAGE_DAYS must be a whole number of days: Docker leftovers of $p not read"; return 0 ;;
+  esac
+  if [ -n "$DOC_DOCKER_STATE" ]; then
+    DOCKER_STATE="$DOC_DOCKER_STATE" FREE_GB="$DOC_DOCKER_FREE" USED_PCT="$DOC_DOCKER_USED" ROOM="$DOC_DOCKER_ROOM" DOCKER_WHY="$DOC_DOCKER_WHY"
+  else
+    docker_room_set "$p"
+    DOC_DOCKER_STATE="$DOCKER_STATE" DOC_DOCKER_FREE="$FREE_GB" DOC_DOCKER_USED="$USED_PCT" DOC_DOCKER_ROOM="$ROOM" DOC_DOCKER_WHY="$DOCKER_WHY"
+  fi
+  case "$DOCKER_STATE" in
+    missing) return 0 ;;
+    down) flag "$p.docker" warn "not read" "Docker does not answer ($DOCKER_WHY): room and leftovers of $p not read; lab docker $p once it answers"; return 0 ;;
+  esac
+  docker_leftovers_set "$p" '' nocache || {
+    DOC_DOCKER_STATE=down DOC_DOCKER_WHY="stopped answering while listing"
+    flag "$p.docker" warn "not read" "Docker stopped answering while listing: leftovers of $p not read; lab docker $p once it answers"; return 0; }
+  n=$((DL_NC + DL_NI + DL_NCC + DL_NCI))
+  case "$ROOM" in
+    ok) space="room ok, $FREE_GB GB free, $USED_PCT% used" ;;
+    short) space="room short, $FREE_GB GB free, $USED_PCT% used (needs at least $DOCKER_MIN_FREE_GB GB free and under $DOCKER_MAX_USED_PCT% used)" ;;
+    *) if [ "$DOCKER_WHY" = probe-missing ]; then space="free space not read (image $DOCKER_PROBE_IMAGE missing: lab docker prepare $p fetches it)"
+       else space="free space not read ($DOCKER_WHY)"; fi ;;
+  esac
+  note="Docker of $p: $space; leftovers: stopped containers: $DL_NC, images older than $DOCKER_DAYS days: $DL_NI"
+  [ "$((DL_NCC + DL_NCI))" -eq 0 ] || note="$note, closed lanes ($DL_CLOSED_LANES): $(docker_closed_text "$DL_NCC" "$DL_NCR" "$DL_NCI")"
+  note="$note; $DL_UNLABELED without a Treelab label: counted, never touched"
+  value="$n leftover"; [ "$n" = 1 ] || value="${value}s"
+  if [ "$n" -gt 0 ] || [ "$ROOM" = short ]; then
+    [ "$ROOM" != short ] || value="$value, room short"
+    flag "$p.docker" warn "$value" "$note — lab docker clean $p removes the leftovers of $p"
+  else flag "$p.docker" ok "$value" "$note"; fi
+}
 doctor_project() {
   local p="$1" root f n b ctx ctx_wt others o dead=0 legacy=0 prunable=0 flags path others_warn="" line event cmdline broken
   load_project "$p"; root="${2:-$P_ROOT}"
@@ -471,6 +516,7 @@ doctor_project() {
   doctor_leftovers "$p"
   doctor_unlocked "$p"
   doctor_services "$p"
+  doctor_docker "$p"
   doctor_permanent "$p"
   doctor_tower "$p"
   doctor_permissions "$p" "$root"

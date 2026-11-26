@@ -18,6 +18,12 @@ DOCKER_LIST_WAIT=10
 DOCKER_REMOVE_WAIT="${LAB_DOCKER_REMOVE_WAIT:-60}"
 DOCKER_MIN_FREE_GB=10
 DOCKER_MAX_USED_PCT=85
+DOCKER_STOP_WAIT=10   # docker stop --time 10 : un conteneur en marche a 10 s pour s'arrêter, Docker le tue ensuite (lot 03)
+# conteneurs : identifiant, état, étiquettes projet et couloir en JSON (une valeur à saut de ligne reste un seul champ), date de création
+DOCKER_PS_FORMAT="{{.ID}}\t{{.State}}\t{{.Label \"$DOCKER_LABEL_PROJECT\" | json}}\t{{.Label \"$DOCKER_LABEL_LANE\" | json}}\t{{.CreatedAt}}"
+# un conteneur créé (jamais démarré) depuis moins d'une heure n'est pas un reste : docker create, docker cp puis docker start
+# (scripts/ci-docker.sh, charge.sh linux) — le lab docker clean d'un autre passage le retirerait sinon entre les deux (revue du lot 03)
+DOCKER_CREATED_GRACE=3600
 
 docker_bin_set() { DK="${LAB_DOCKER:-docker}"; }   # LAB_DOCKER : le faux docker des tests, jamais le vrai dans bats
 # docker_labels <projet> [couloir] : les options d'étiquette, sur une ligne
@@ -95,29 +101,75 @@ function created(s,   base, rest, e, off) {
   }
   return -1
 }
+# ps_created(s) : date de création de docker ps (CreatedAt, « 2026-11-25 12:50:00 +0100 CET ») → secondes ; -1 si illisible
+function ps_created(s) {
+  if (s !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [+-][0-9][0-9][0-9][0-9]/) return -1
+  return created(substr(s, 1, 10) "T" substr(s, 12, 8) substr(s, 21, 3) ":" substr(s, 24, 2))
+}
 '
 
-# docker_leftovers_set <projet> [couloir] : DL_CONTAINERS et DL_IMAGES (identifiants à retirer, un par ligne), DL_NC, DL_NI,
-# DL_UNREADABLE (images du projet à date illisible, gardées), DL_UNLABELED, DL_BUILDER, DL_BUILDER_STATE (running|stopped|
+# docker_open_lanes_set : DOCKER_OPEN, les couloirs ouverts du projet chargé, entre espaces (« a b ») — dossiers .worktrees/<couloir>
+# et chaque worktree git du projet, son nom lu comme partout (wt_lane_set : .lab/meta, sinon le dossier) : un couloir hérité hors de
+# .worktrees/ n'est jamais tenu pour fermé. Vide sans projet chargé (P_ROOT) : aucun couloir n'est alors tenu pour fermé.
+docker_open_lanes_set() {
+  local d
+  DOCKER_OPEN=''
+  [ -n "${P_ROOT:-}" ] || return 0
+  DOCKER_OPEN=' '
+  for d in "$P_ROOT"/.worktrees/*/; do [ -d "$d" ] || continue; d="${d%/}"; DOCKER_OPEN="$DOCKER_OPEN${d##*/} "; done
+  if declare -F worktree_list >/dev/null && declare -F wt_lane_set >/dev/null; then
+    while IFS=$'\t' read -r d _; do
+      [ -n "$d" ] && [ -d "$d" ] || continue
+      wt_lane_set "$d"; DOCKER_OPEN="$DOCKER_OPEN$WT_LANE "
+    done < <(worktree_list "$P_ROOT" 2>/dev/null)
+  fi
+}
+
+# docker_leftovers_set <projet> [couloir] [nocache] : DL_CONTAINERS et DL_IMAGES (identifiants à retirer, un par ligne), DL_NC,
+# DL_NI, DL_UNREADABLE (images du projet à date illisible, gardées), DL_UNLABELED, DL_BUILDER, DL_BUILDER_STATE (running|stopped|
 # inactive|absent), DL_CACHE (taille lue par buildx du, 0B sans cache, none sans constructeur, unknown s'il n'est pas lu).
+# Couloirs fermés (lot 03) : sans couloir donné, un projet chargé (P_ROOT) et une étiquette de couloir valide sans dossier
+# .worktrees/<couloir> — DL_CLOSED_RUN (en marche, en pause ou qui redémarrent : arrêtés d'abord), DL_CLOSED_CONTAINERS (tous leurs
+# conteneurs), DL_CLOSED_IMAGES (toutes leurs images, tout âge), DL_NCC, DL_NCR, DL_NCI, DL_CLOSED_LANES (noms, triés, entre
+# virgules) ; ils ne comptent pas dans DL_CONTAINERS ni DL_IMAGES. nocache : constructeur et cache non lus (doctor).
 # rc 1 si Docker ne répond plus pour lister conteneurs ou images ; un cache illisible n'est jamais un Docker muet.
 # Étiquettes des conteneurs lues en JSON (| json) et comparées à la forme JSON du projet : une valeur qui porte un saut de ligne
 # ou une tabulation reste un seul champ et ne forge jamais une ligne (revue du lot 01) ; les images passent par jq @tsv.
 docker_leftovers_set() {
-  local p="$1" lane="${2:-}" days now ps all labeled ids json rows out pq lq
+  local p="$1" lane="${2:-}" days now ps all labeled ids json rows out pq lq cl=0 open=''
   DL_CONTAINERS='' DL_IMAGES='' DL_NC=0 DL_NI=0 DL_UNREADABLE='' DL_UNLABELED=0 DL_CACHE=none DL_BUILDER_STATE=absent
+  DL_CLOSED_RUN='' DL_CLOSED_CONTAINERS='' DL_CLOSED_IMAGES='' DL_NCC=0 DL_NCR=0 DL_NCI=0 DL_CLOSED_LANES=''
   DL_BUILDER="$(docker_builder "$p")"
   docker_days_set; days="$DOCKER_DAYS"
+  if [ -z "$lane" ] && [ -n "${P_ROOT:-}" ]; then docker_open_lanes_set; open="$DOCKER_OPEN"; cl=1; fi
   pq="$(jq -cn --arg v "$p" '$v')"; lq="$(jq -cn --arg v "$lane" '$v')"
   docker_bin_set
-  ps="$(with_timeout "$DOCKER_LIST_WAIT" "$DK" ps -a --no-trunc \
-    --format "{{.ID}}\t{{.State}}\t{{.Label \"$DOCKER_LABEL_PROJECT\" | json}}\t{{.Label \"$DOCKER_LABEL_LANE\" | json}}" 2>/dev/null)" || return 1
+  ps="$(with_timeout "$DOCKER_LIST_WAIT" "$DK" ps -a --no-trunc --format "$DOCKER_PS_FORMAT" 2>/dev/null)" || return 1
+  now="$(rdv_now)" || die "$(rdv_now_refusal)"
   all="$(with_timeout "$DOCKER_LIST_WAIT" "$DK" images --no-trunc --format '{{.ID}}' 2>/dev/null)" || return 1
   labeled="$(with_timeout "$DOCKER_LIST_WAIT" "$DK" images --no-trunc --filter "label=$DOCKER_LABEL_PROJECT" --format '{{.ID}}' 2>/dev/null)" || return 1
-  DL_CONTAINERS="$(printf '%s\n' "$ps" | LC_ALL=C awk -F '\t' -v pq="$pq" -v l="$lane" -v lq="$lq" '
-    NF == 4 && $3 "" == pq "" && (l == "" || $4 "" == lq "") && ($2 == "exited" || $2 == "created" || $2 == "dead") { print $1 }')"
+  # S : arrêté du projet (ou du couloir donné ; créé : depuis plus de DOCKER_CREATED_GRACE s, date illisible comprise) ; couloir
+  # fermé : L son nom, R en marche, C chacun de ses conteneurs
+  out="$(printf '%s\n' "$ps" | LC_ALL=C awk -F '\t' -v pq="$pq" -v l="$lane" -v lq="$lq" -v cl="$cl" -v open="$open" -v now="$now" \
+    -v grace="$DOCKER_CREATED_GRACE" "$RDV_AWK$DOCKER_AWK"'
+    BEGIN { n = epoch(now) }
+    NF == 5 && $3 "" == pq "" {
+      if (cl && $4 ~ /^"[a-z0-9][a-z0-9._-]*"$/ && index(open, " " substr($4, 2, length($4) - 2) " ") == 0) {
+        print "L\t" substr($4, 2, length($4) - 2)
+        if ($2 == "running" || $2 == "paused" || $2 == "restarting") print "R\t" $1
+        if ($2 != "removing") print "C\t" $1
+        next
+      }
+      if (l != "" && $4 "" != lq "") next
+      if ($2 == "exited" || $2 == "dead") print "S\t" $1
+      else if ($2 == "created") { e = ps_created($5); if (e < 0 || n - e >= grace) print "S\t" $1 }
+    }')"
+  DL_CONTAINERS="$(printf '%s\n' "$out" | awk -F '\t' '$1 == "S" { print $2 }')"
+  DL_CLOSED_RUN="$(printf '%s\n' "$out" | awk -F '\t' '$1 == "R" { print $2 }')"
+  DL_CLOSED_CONTAINERS="$(printf '%s\n' "$out" | awk -F '\t' '$1 == "C" { print $2 }')"
+  DL_CLOSED_LANES="$(printf '%s\n' "$out" | awk -F '\t' '$1 == "L" { print $2 }')"
   # sans étiquette : conteneurs, puis images (une ligne par nom d'image chez Docker : identifiants dédoublonnés)
-  DL_UNLABELED="$( { printf '%s\n' "$ps" | awk -F '\t' 'NF == 4 && $3 == "\"\"" { print "C\t" $1 }'
+  DL_UNLABELED="$( { printf '%s\n' "$ps" | awk -F '\t' 'NF == 5 && $3 == "\"\"" { print "C\t" $1 }'
       printf '%s\n' "$all" | awk 'NF { print "A\t" $1 }'; printf '%s\n' "$labeled" | awk 'NF { print "L\t" $1 }'; } \
     | LC_ALL=C awk -F '\t' '$1 == "C" { n++; next } $1 == "A" { a[$2] = 1; next } { l[$2] = 1 }
         END { for (i in a) if (!(i in l)) n++; print n + 0 }')"
@@ -127,19 +179,29 @@ docker_leftovers_set() {
     json="$(with_timeout "$DOCKER_LIST_WAIT" "$DK" image inspect $ids 2>/dev/null)" || [ "$?" -ne 124 ] || return 1
     rows="$(printf '%s' "$json" | jq -r --arg kp "$DOCKER_LABEL_PROJECT" --arg kl "$DOCKER_LABEL_LANE" '.[] | ((.Config.Labels // {}) as $l
       | [.Id, (.Created // ""), ($l[$kp] // ""), ($l[$kl] // "")]) | @tsv' 2>/dev/null)" || return 1
-    now="$(rdv_now)" || die "$(rdv_now_refusal)"
-    out="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' -v p="$p" -v l="$lane" -v now="$now" -v days="$days" "$RDV_AWK$DOCKER_AWK"'
+    # K : image d'un couloir fermé, tout âge ; I : trop vieille ; U : date illisible (gardée)
+    out="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' -v p="$p" -v l="$lane" -v now="$now" -v days="$days" -v cl="$cl" -v open="$open" \
+      "$RDV_AWK$DOCKER_AWK"'
       BEGIN { n = epoch(now) }
-      NF >= 3 && $3 "" == p "" && (l == "" || $4 "" == l "") {
+      NF >= 3 && $3 "" == p "" {
+        if (cl && $4 ~ /^[a-z0-9][a-z0-9._-]*$/ && index(open, " " $4 " ") == 0) { print "L\t" $4; print "K\t" $1; next }
+        if (l != "" && $4 "" != l "") next
         e = created($2)
         if (e < 0) print "U\t" $1
         else if (n - e > days * 86400) print "I\t" $1
       }')"
     DL_IMAGES="$(printf '%s\n' "$out" | awk -F '\t' '$1 == "I" { print $2 }')"
     DL_UNREADABLE="$(printf '%s\n' "$out" | awk -F '\t' '$1 == "U" { print $2 }')"
+    DL_CLOSED_IMAGES="$(printf '%s\n' "$out" | awk -F '\t' '$1 == "K" { print $2 }')"
+    DL_CLOSED_LANES="$DL_CLOSED_LANES"$'\n'"$(printf '%s\n' "$out" | awk -F '\t' '$1 == "L" { print $2 }')"
   fi
   DL_NC="$(printf '%s\n' "$DL_CONTAINERS" | grep -c . || true)"
   DL_NI="$(printf '%s\n' "$DL_IMAGES" | grep -c . || true)"
+  DL_NCC="$(printf '%s\n' "$DL_CLOSED_CONTAINERS" | grep -c . || true)"
+  DL_NCR="$(printf '%s\n' "$DL_CLOSED_RUN" | grep -c . || true)"
+  DL_NCI="$(printf '%s\n' "$DL_CLOSED_IMAGES" | grep -c . || true)"
+  DL_CLOSED_LANES="$(printf '%s\n' "$DL_CLOSED_LANES" | LC_ALL=C sort -u | awk 'NF { printf "%s%s", (n++ ? ", " : ""), $0 }')"
+  [ "${3:-}" != nocache ] || return 0
   docker_builder_state_set "$DL_BUILDER"
   case "$DL_BUILDER_STATE" in
     absent) ;;
@@ -194,6 +256,8 @@ docker_show() {
   docker_leftovers_set "$p" || { docker_failed_listing; return 0; }
   kv DOCKER ok; docker_room_kv
   kv CONTAINERS "$DL_NC"; kv IMAGES "$DL_NI"; kv CACHE "$DL_CACHE"; kv UNLABELED "$DL_UNLABELED"; kv BUILDER "$DL_BUILDER"
+  kv CLOSED_CONTAINERS "$DL_NCC"; kv CLOSED_RUNNING "$DL_NCR"; kv CLOSED_IMAGES "$DL_NCI"
+  [ -z "$DL_CLOSED_LANES" ] || kv CLOSED_LANES "$DL_CLOSED_LANES"
   docker_room_say "$p" "Docker machine"
   case "$DL_BUILDER_STATE:$DL_CACHE" in
     absent:*) cache="build cache: no builder $DL_BUILDER yet (lab docker prepare $p creates it)" ;;
@@ -202,43 +266,107 @@ docker_show() {
     *) cache="build cache: $DL_CACHE (builder $DL_BUILDER)" ;;
   esac
   onboard_say "Leftovers of $p: stopped containers: $DL_NC · images older than $days days: $DL_NI · $cache."
+  [ "$((DL_NCC + DL_NCI))" -eq 0 ] \
+    || onboard_say "Closed lanes of $p ($DL_CLOSED_LANES): $(docker_closed_text "$DL_NCC" "$DL_NCR" "$DL_NCI"), whatever their age."
   if [ -n "$DL_UNREADABLE" ]; then
     while IFS= read -r a; do [ -z "$a" ] || short="$short $(docker_short "$a")"; done <<<"$DL_UNREADABLE"
     onboard_say "Images of $p with an unreadable build date, kept:$short"
   fi
   unlabeled="$DL_UNLABELED containers and images without a Treelab label: counted, never touched."
   onboard_say "$unlabeled"
-  [ "$((DL_NC + DL_NI))" -eq 0 ] || onboard_say "To remove the leftovers of $p: lab docker clean $p"
+  [ "$((DL_NC + DL_NI + DL_NCC + DL_NCI))" -eq 0 ] || onboard_say "To remove the leftovers of $p: lab docker clean $p"
+}
+# docker_closed_text <conteneurs> <en marche> <images> : « 2 containers (1 running, stopped first), 1 image »
+docker_closed_text() {
+  local t="$1 container"; [ "$1" = 1 ] || t="${t}s"
+  [ "$2" = 0 ] || t="$t ($2 running, stopped first)"
+  t="$t, $3 image"; [ "$3" = 1 ] || t="${t}s"
+  printf '%s' "$t"
 }
 
-# docker_clean <projet> [couloir] : lab docker clean — conteneurs arrêtés, images trop vieilles, vieux cache du constructeur dédié.
+# docker_remove_set <en marche> <conteneurs> <images> (identifiants, un par ligne) : arrête les premiers (docker stop, DOCKER_STOP_WAIT s
+# puis Docker les tue), retire tous les conteneurs d'un seul docker rm puis chaque image, par identifiant, sans --force (lot 03). Pose
+# DR_STOPPED, DR_CONTAINERS (retirés, ou partis seuls à leur arrêt : --rm, « No such container », « already in progress »), DR_CKEPT,
+# DR_IMAGES (une image à plusieurs noms part nom par nom : docker_untag), DR_IKEPT,
+# DR_STALLED (1 : Docker resté sans réponse, rien de plus n'est tenté) ; chaque refus est nommé (warn_wrap), rien n'arrête l'appelant.
+docker_remove_set() {
+  local err out id rc
+  local -a ids=()
+  DR_STOPPED=0 DR_CONTAINERS=0 DR_CKEPT=0 DR_IMAGES=0 DR_IKEPT=0 DR_STALLED=0
+  err="$(mktemp)"
+  if [ -n "$1" ]; then
+    while IFS= read -r id; do [ -z "$id" ] || ids+=("$id"); done <<<"$1"
+    rc=0; out="$(with_timeout "$((DOCKER_STOP_WAIT + 20))" "$DK" stop --time "$DOCKER_STOP_WAIT" "${ids[@]}" 2>"$err")" || rc=$?
+    if [ "$rc" -eq 124 ]; then DR_STALLED=1
+    else
+      DR_STOPPED="$(printf '%s\n' "$out" | LC_ALL=C awk 'NR == FNR { want[$1] = 1; next } ($1 in want) { n++ } END { print n + 0 }' <(printf '%s\n' "${ids[@]}") -)"
+      [ "$rc" -eq 0 ] || warn_wrap "docker stop: $(docker_first_error "$err")"
+    fi
+  fi
+  if [ "$DR_STALLED" = 0 ] && [ -n "$2" ]; then
+    ids=(); while IFS= read -r id; do [ -z "$id" ] || ids+=("$id"); done <<<"$2"
+    rc=0; out="$(with_timeout "$DOCKER_REMOVE_WAIT" "$DK" rm "${ids[@]}" 2>"$err")" || rc=$?
+    if [ "$rc" -eq 124 ]; then DR_STALLED=1
+    else
+      DR_CONTAINERS="$( { printf '%s\n' "$out"; sed -n -e 's/.*No such container: *//p' -e 's/.*removal of container \([^ ]*\) is already in progress.*/\1/p' "$err"; } \
+        | LC_ALL=C awk 'NR == FNR { want[$1] = 1; next } ($1 in want) && !seen[$1]++ { n++ } END { print n + 0 }' <(printf '%s\n' "${ids[@]}") -)"
+      DR_CKEPT=$((${#ids[@]} - DR_CONTAINERS))
+      if [ "$DR_CKEPT" -gt 0 ]; then
+        grep -v -e 'No such container' -e 'is already in progress' "$err" >"$err.k" 2>/dev/null || true
+        warn_wrap "$DR_CKEPT container(s) kept: $(docker_first_error "$err.k")"; rm -f "$err.k"
+      fi
+    fi
+  fi
+  while [ "$DR_STALLED" = 0 ] && IFS= read -r id; do
+    [ -n "$id" ] || continue
+    rc=0; with_timeout "$DOCKER_REMOVE_WAIT" "$DK" rmi "$id" >/dev/null 2>"$err" || rc=$?
+    case "$rc" in
+      0) DR_IMAGES=$((DR_IMAGES + 1)) ;;
+      124) DR_STALLED=1 ;;
+      *) if grep -q 'referenced in multiple repositories' "$err" && docker_untag "$id"; then DR_IMAGES=$((DR_IMAGES + 1))
+         else DR_IKEPT=$((DR_IKEPT + 1)); warn_wrap "image $(docker_short "$id") kept: $(docker_first_error "$err" "$id")"; fi ;;
+    esac
+  done <<<"$3"
+  rm -f "$err"
+}
+# docker_untag <ID> : une image à plusieurs noms, que docker rmi <ID> refuse sans --force (revue du lot 03), part nom par nom — ses
+# noms lus, chacun relu juste avant pour pointer encore sur cet ID (sinon rien n'est retiré par nom), puis un docker rmi de ces noms ;
+# l'image part avec le dernier. rc 0 si elle n'existe plus ; jamais --force.
+docker_untag() {
+  local id="$1" out t i=0
+  local -a names=() mine=()
+  out="$(with_timeout "$DOCKER_LIST_WAIT" "$DK" image inspect --format '{{range .RepoTags}}{{println .}}{{end}}' "$id" 2>/dev/null)" || return 1
+  while IFS= read -r t; do [ -z "$t" ] || names+=("$t"); done <<<"$out"
+  [ "${#names[@]}" -gt 0 ] || return 1
+  out="$(with_timeout "$DOCKER_LIST_WAIT" "$DK" image inspect --format '{{.Id}}' "${names[@]}" 2>/dev/null)" || return 1
+  while IFS= read -r t; do [ "$t" != "$id" ] || mine+=("${names[$i]}"); i=$((i + 1)); done <<<"$out"
+  [ "${#mine[@]}" -eq "${#names[@]}" ] || return 1
+  with_timeout "$DOCKER_REMOVE_WAIT" "$DK" rmi "${mine[@]}" >/dev/null 2>&1 || return 1
+  ! with_timeout "$DOCKER_LIST_WAIT" "$DK" image inspect "$id" >/dev/null 2>&1
+}
+
+# docker_clean <projet> [couloir] : lab docker clean — conteneurs et images des couloirs fermés (tout âge, en marche arrêtés d'abord,
+# lot 03), conteneurs arrêtés, images trop vieilles, vieux cache du constructeur dédié.
 # Au premier appel de retrait resté sans réponse (rc 124), plus rien n'est tenté : DOCKER=down, le reste attend le prochain passage.
 # Un constructeur trouvé arrêté est démarré le temps du vidage (0,4 s mesurée, image buildkit déjà là), puis arrêté de nouveau,
 # que le vidage réussisse ou non — laissé comme trouvé.
 docker_clean() {
-  local p="$1" lane="${2:-}" days err out id containers=0 removed=0 kept=0 freed=none stalled=0 started=0 rc
-  local -a ids=()
+  local p="$1" lane="${2:-}" days err out containers=0 removed=0 kept=0 ckept=0 freed=none stalled=0 started=0 rc
+  local closed_c=0 closed_i=0 closed_s=0 closed=""
   docker_days_set; days="$DOCKER_DAYS"
   docker_room_set "$p"
   ! docker_unanswered || return 0
   docker_leftovers_set "$p" "$lane" || { docker_failed_listing; return 0; }
-  err="$(mktemp)"
-  if [ -n "$DL_CONTAINERS" ]; then
-    while IFS= read -r id; do [ -z "$id" ] || ids+=("$id"); done <<<"$DL_CONTAINERS"
-    rc=0; out="$(with_timeout "$DOCKER_REMOVE_WAIT" "$DK" rm "${ids[@]}" 2>"$err")" || rc=$?
-    if [ "$rc" -eq 124 ]; then stalled=1
-    elif [ "$rc" -ne 0 ]; then warn_wrap "docker rm: $(docker_first_error "$err")"; fi
-    containers="$(printf '%s\n' "$out" | LC_ALL=C awk 'NR == FNR { want[$1] = 1; next } ($1 in want) { n++ } END { print n + 0 }' <(printf '%s\n' "${ids[@]}") -)"
+  if [ "$((DL_NCC + DL_NCI))" -gt 0 ]; then
+    docker_remove_set "$DL_CLOSED_RUN" "$DL_CLOSED_CONTAINERS" "$DL_CLOSED_IMAGES"
+    closed_c="$DR_CONTAINERS" closed_i="$DR_IMAGES" closed_s="$DR_STOPPED" stalled="$DR_STALLED" kept="$DR_IKEPT" ckept="$DR_CKEPT"
+    closed="$DL_CLOSED_LANES"
   fi
-  while [ "$stalled" = 0 ] && IFS= read -r id; do
-    [ -n "$id" ] || continue
-    rc=0; with_timeout "$DOCKER_REMOVE_WAIT" "$DK" rmi "$id" >/dev/null 2>"$err" || rc=$?
-    case "$rc" in
-      0) removed=$((removed + 1)) ;;
-      124) stalled=1 ;;
-      *) kept=$((kept + 1)); warn_wrap "image $(docker_short "$id") kept: $(docker_first_error "$err" "$id")" ;;
-    esac
-  done <<<"$DL_IMAGES"
+  if [ "$stalled" = 0 ]; then
+    docker_remove_set '' "$DL_CONTAINERS" "$DL_IMAGES"
+    containers="$DR_CONTAINERS" removed="$DR_IMAGES" stalled="$DR_STALLED" kept=$((kept + DR_IKEPT)) ckept=$((ckept + DR_CKEPT))
+  fi
+  err="$(mktemp)"
   case "$stalled:$DL_BUILDER_STATE" in
     0:running|0:stopped)
       rc=0
@@ -262,7 +390,10 @@ docker_clean() {
   esac
   rm -f "$err"
   if [ "$stalled" = 1 ]; then kv DOCKER down; else kv DOCKER ok; fi
-  kv CONTAINERS_REMOVED "$containers"; kv IMAGES_REMOVED "$removed"; kv IMAGES_KEPT "$kept"; kv CACHE_FREED "$freed"
+  kv CONTAINERS_REMOVED "$containers"; kv IMAGES_REMOVED "$removed"; kv IMAGES_KEPT "$kept"; kv CONTAINERS_KEPT "$ckept"; kv CACHE_FREED "$freed"
+  kv CLOSED_CONTAINERS_REMOVED "$closed_c"; kv CLOSED_STOPPED "$closed_s"; kv CLOSED_IMAGES_REMOVED "$closed_i"
+  [ -z "$closed" ] || kv CLOSED_LANES "$closed"
+  [ -z "$closed" ] || onboard_say "Removed for the closed lanes of $p ($closed): $(docker_closed_text "$closed_c" "$closed_s" "$closed_i" | sed 's/ running, stopped first/ stopped first/')."
   onboard_say "Removed for $p: stopped containers: $containers · images older than $days days: $removed · build cache freed: $freed. Nothing of another project nor without a label was touched."
   if [ "$stalled" = 1 ]; then
     onboard_say "Docker stopped answering during the cleaning (no answer within $DOCKER_REMOVE_WAIT s): the rest waits for the next lab docker clean $p."
@@ -272,6 +403,93 @@ docker_clean() {
   # la garde lit cette place et l'heure de ce nettoyage : encore court juste après, le reste n'est pas au projet (lot 02)
   docker_now_set; docker_room_save "$p"
   if [ "$DOCKER_STATE" = ok ]; then docker_room_kv; docker_room_say "$p" "Docker machine now"; fi
+}
+
+# ---------- fermeture d'un couloir (lot 03 de docker-menage) ----------
+# docker_lane_set <projet> <couloir> : ce que porte le couloir — DLN_RUN (en marche, en pause ou qui redémarrent : arrêtés d'abord),
+# DLN_CONTAINERS (tous ses conteneurs, ceux-là compris, sauf ceux que Docker retire déjà), DLN_IMAGES (toutes ses images, tout âge),
+# DLN_NR, DLN_NC, DLN_NI ; DOCKER_STATE (missing|down|ok) et DOCKER_WHY. Docker absent : aucun processus. La première lecture
+# (conteneurs) attend DOCKER_PROBE_WAIT secondes : un Docker muet coûte 2 s ; les suivantes, DOCKER_LIST_WAIT. Étiquettes
+# comparées chaîne pour chaîne (JSON pour les conteneurs, jq @tsv pour les images), comme docker_leftovers_set.
+docker_lane_set() {
+  local p="$1" lane="$2" err ps labeled ids json rows pq lq rc=0
+  DLN_RUN='' DLN_CONTAINERS='' DLN_IMAGES='' DLN_NR=0 DLN_NC=0 DLN_NI=0 DOCKER_STATE=missing DOCKER_WHY=''
+  docker_bin_set
+  command -v "$DK" >/dev/null 2>&1 || return 0
+  err="$(mktemp)"
+  ps="$(with_timeout "$DOCKER_PROBE_WAIT" "$DK" ps -a --no-trunc --format "$DOCKER_PS_FORMAT" 2>"$err")" || rc=$?
+  [ "$rc" -ne 0 ] || { labeled="$(with_timeout "$DOCKER_LIST_WAIT" "$DK" images --no-trunc --filter "label=$DOCKER_LABEL_PROJECT" --format '{{.ID}}' 2>"$err")" || rc=$?; }
+  ids="$(printf '%s\n' "${labeled:-}" | LC_ALL=C awk 'NF && !seen[$1]++')"
+  if [ "$rc" -eq 0 ] && [ -n "$ids" ]; then
+    # shellcheck disable=SC2086 # identifiants d'image, sans espace : un argument chacun
+    json="$(with_timeout "$DOCKER_LIST_WAIT" "$DK" image inspect $ids 2>"$err")" || rc=$?
+    [ "$rc" -eq 124 ] || rc=0   # une image retirée entre les deux lectures : les autres restent lisibles
+    [ "$rc" -ne 0 ] || rows="$(printf '%s' "$json" | jq -r --arg kp "$DOCKER_LABEL_PROJECT" --arg kl "$DOCKER_LABEL_LANE" '.[] | ((.Config.Labels // {}) as $l
+      | [.Id, ($l[$kp] // ""), ($l[$kl] // "")]) | @tsv' 2>/dev/null)" || { rc=1; printf 'image labels unreadable\n' >"$err"; }
+  fi
+  case "$rc" in
+    0) DOCKER_STATE=ok ;;
+    124) DOCKER_STATE=down DOCKER_WHY="no answer within ${DOCKER_PROBE_WAIT} s" ;;
+    *) DOCKER_STATE=down DOCKER_WHY="$(docker_first_error "$err")"; [ -n "$DOCKER_WHY" ] || DOCKER_WHY="code $rc" ;;
+  esac
+  rm -f "$err"
+  [ "$DOCKER_STATE" = ok ] || return 0
+  pq="$(jq -cn --arg v "$p" '$v')"; lq="$(jq -cn --arg v "$lane" '$v')"
+  DLN_RUN="$(printf '%s\n' "$ps" | LC_ALL=C awk -F '\t' -v pq="$pq" -v lq="$lq" '
+    NF == 5 && $3 "" == pq "" && $4 "" == lq "" && ($2 == "running" || $2 == "paused" || $2 == "restarting") { print $1 }')"
+  DLN_CONTAINERS="$(printf '%s\n' "$ps" | LC_ALL=C awk -F '\t' -v pq="$pq" -v lq="$lq" '
+    NF == 5 && $3 "" == pq "" && $4 "" == lq "" && $2 != "removing" { print $1 }')"
+  DLN_IMAGES="$(printf '%s\n' "${rows:-}" | LC_ALL=C awk -F '\t' -v p="$p" -v l="$lane" 'NF >= 3 && $2 "" == p "" && $3 "" == l "" { print $1 }')"
+  DLN_NR="$(printf '%s\n' "$DLN_RUN" | grep -c . || true)"
+  DLN_NC="$(printf '%s\n' "$DLN_CONTAINERS" | grep -c . || true)"
+  DLN_NI="$(printf '%s\n' "$DLN_IMAGES" | grep -c . || true)"
+}
+# docker_lane_show <projet> <couloir> [kv] : l'annonce avant l'accord de lab close (et --abandon, --dry-run), sur stderr ; kv : aussi
+# DOCKER=, DOCKER_CONTAINERS=, DOCKER_RUNNING=, DOCKER_IMAGES= (--dry-run). Docker absent : ni ligne ni processus. Rien n'est retiré.
+docker_lane_show() {
+  local p="$1" lane="$2"
+  docker_lane_set "$p" "$lane"
+  case "$DOCKER_STATE" in
+    missing) return 0 ;;
+    down)
+      [ -z "${3:-}" ] || kv DOCKER down
+      docker_close_say "Docker: not read ($DOCKER_WHY); what lane $lane leaves stays until lab docker clean $p" ;;
+    *)
+      [ -z "${3:-}" ] || { kv DOCKER ok; kv DOCKER_CONTAINERS "$DLN_NC"; kv DOCKER_RUNNING "$DLN_NR"; kv DOCKER_IMAGES "$DLN_NI"; }
+      if [ "$((DLN_NC + DLN_NI))" -eq 0 ]; then docker_close_say "Docker: nothing labeled for lane $lane"
+      else
+        docker_close_say "Docker: lane $lane has $(docker_closed_text "$DLN_NC" "$DLN_NR" "$DLN_NI" | sed 's/, \([0-9]* image\)/ and \1/')"
+        docker_close_say "  removed by ID after delivery; nothing of another lane or project; a failure does not block"
+      fi ;;
+  esac
+}
+# docker_close_say <ligne> : une ligne de l'annonce, repliée au mot dans un terminal ou sous COLUMNS (comme les branches de lab close)
+docker_close_say() {
+  if { [ -t 2 ] || [ -n "${COLUMNS:-}" ]; } && declare -F onboard_wrap >/dev/null; then printf '%s\n' "$1" | onboard_wrap "$(onboard_cols)" >&2
+  else printf '%s\n' "$1" >&2; fi
+}
+# docker_close_lane <projet> <couloir> : le retrait à la fermeture (lab close sur place, veilleur, --abandon), après la livraison et
+# avant le retrait du dossier ; jamais bloquant : Docker absent → rien (ni ligne ni processus) ; muet, ou retrait refusé →
+# avertissement qui renvoie vers lab docker clean <projet> (le couloir fermé, ses restes y partent), rc 0 toujours.
+docker_close_lane() {
+  local p="$1" lane="$2"
+  docker_lane_set "$p" "$lane"
+  case "$DOCKER_STATE" in
+    missing) return 0 ;;
+    down) kv DOCKER down
+      warn_wrap "Docker did not answer ($DOCKER_WHY): what lane $lane left in Docker stays; lab docker clean $p removes it once Docker answers"
+      return 0 ;;
+  esac
+  if [ "$((DLN_NC + DLN_NI))" -eq 0 ]; then kv DOCKER ok; kv DOCKER_CONTAINERS_REMOVED 0; kv DOCKER_IMAGES_REMOVED 0; return 0; fi
+  docker_remove_set "$DLN_RUN" "$DLN_CONTAINERS" "$DLN_IMAGES"
+  if [ "$DR_STALLED" = 1 ]; then kv DOCKER down; else kv DOCKER ok; fi
+  kv DOCKER_CONTAINERS_REMOVED "$DR_CONTAINERS"; kv DOCKER_CONTAINERS_KEPT "$DR_CKEPT"; kv DOCKER_IMAGES_REMOVED "$DR_IMAGES"; kv DOCKER_IMAGES_KEPT "$DR_IKEPT"
+  log_wrap "Docker: lane $lane — $(docker_closed_text "$DR_CONTAINERS" "$DR_STOPPED" "$DR_IMAGES" | sed 's/ running, stopped first/ stopped first/') removed."
+  if [ "$DR_STALLED" = 1 ]; then
+    warn_wrap "Docker stopped answering while removing what lane $lane left (no answer within $DOCKER_REMOVE_WAIT s): lab docker clean $p removes the rest once Docker answers"
+  elif [ "$((DR_CKEPT + DR_IKEPT))" -gt 0 ]; then
+    warn_wrap "what Docker refused to remove for lane $lane stays (named above): lab docker clean $p tries again"
+  fi
 }
 
 # docker_prepare <projet> : lab docker prepare — constructeur lab-<projet> créé une fois, image de mesure présente
@@ -510,8 +728,8 @@ docker_label() {
   case "$key" in *['$`']*) ok=key ;; esac
   case "$key" in
     "$DOCKER_LABEL_PROJECT") if [ "$ok" = 1 ] && [ "$val" = "$DG_P" ]; then S_OKP=1; return 0; fi ;;
+    # couloir : sa valeur ; au checkout principal, vide (revue du lot 03 : jamais celle d'un couloir, héritée sinon de l'image)
     "$DOCKER_LABEL_LANE")
-      [ -n "$DG_LANE" ] || return 0
       if [ "$ok" = 1 ] && [ "$val" = "$DG_LANE" ]; then S_OKL=1; return 0; fi ;;
     *) [ "$ok" = key ] || return 0 ;;
   esac
@@ -519,7 +737,8 @@ docker_label() {
   if [ "$ok" = 1 ]; then
     case "$key" in
       "$DOCKER_LABEL_PROJECT") docker_why "label $v is not $DG_P's" ;;
-      *) docker_why "label $v is not lane $DG_LANE's" ;;
+      *) if [ -n "$DG_LANE" ]; then docker_why "label $v is not lane $DG_LANE's"
+         else docker_why "label $v is not the main checkout's: its lane stays empty"; fi ;;
     esac
   else
     docker_shown "${DT_TEXT[${SW[$2]}]}"; docker_why "label $DS cannot be read here (variable or command): written in clear"
@@ -538,9 +757,15 @@ docker_labels_needed() {
     [ -z "$add" ] || what=labels
     add="${add:+$add }--label $DOCKER_LABEL_LANE=$DG_LANE"; miss="${miss:+$miss and }$DOCKER_LABEL_LANE=$DG_LANE"
   fi
+  [ -z "$miss" ] || docker_why "without the $what $miss, lab docker clean $DG_P cannot find it"
+  # checkout principal (revue du lot 03) : étiquette de couloir explicite et vide — sans elle, Docker donne au conteneur, ou à l'image
+  # bâtie dessus, l'étiquette de couloir de son image (mesuré sur Docker 29), et la fermeture de ce couloir le retirerait
+  if [ -z "$DG_LANE" ] && [ "$S_OKL" = 0 ]; then
+    add="${add:+$add }--label $DOCKER_LABEL_LANE="
+    docker_why "without an empty $DOCKER_LABEL_LANE=, it takes the lane label of its image and goes when that lane closes"
+  fi
   [ -n "$add" ] || return 0
   S_ADD="${S_ADD:+$S_ADD }$add"
-  docker_why "without the $what $miss, lab docker clean $DG_P cannot find it"
 }
 
 # docker_segment <premier mot> <dernier mot> : juge le segment dont DG_W porte les morceaux de mots (indices dans DT_TEXT)

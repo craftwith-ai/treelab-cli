@@ -93,18 +93,15 @@ cloud_fin_need() {
     exit
   }' | { IFS= read -r l || true; [ -z "$l" ] || printf '%s\t%s\n' "$(cut -f1 <<<"$l")" "$(cut -f2 <<<"$l" | cut -c1-160)"; }
 }
-# cloud_need_keeps_mac <fiche> : rc 1 si un besoin retenu garde le Mac — celui de ce lot, sinon le plus récent du projet pour une fiche
-# sans ligne Execution (batch-plan écrit la ligne des autres) ; CLOUD_WHY le nomme
+# cloud_need_keeps_mac <fiche> : rc 1 si le besoin retenu de ce lot garde le Mac, CLOUD_WHY le nomme. Les besoins des autres lots ne
+# décident plus rien ici : une fiche sans ligne Execution reste sur le Mac par défaut (lot 01 de session-unique), batch-plan les lit
+# avant d'écrire une ligne cloud.
 cloud_need_keeps_mac() {
   local r d
   r="$(cloud_need_of_lot "$SLUG" "$(basename "${1:-}" .md)")"
-  if [ -n "$r" ]; then
-    d="$(cut -f3 <<<"$r")"
-    CLOUD_WHY="$(cloud_need_name "$(cut -f2 <<<"$r")") found on the VM ($(cut -f1 <<<"$r" | cut -c1-10))${d:+: $d}"; return 1
-  fi
-  [ "$(lot_execution "${1:-}" | cut -f1)" = absent ] || return 0
-  r="$(cloud_needs_lines | tail -1)"; [ -n "$r" ] || return 0
-  CLOUD_WHY="remembered $(cloud_need_name "$(cut -f2 <<<"$r")") ($(cut -f5 <<<"$r"), $(cut -f1 <<<"$r" | cut -c1-10)), no Execution line"; return 1
+  [ -n "$r" ] || return 0
+  d="$(cut -f3 <<<"$r")"
+  CLOUD_WHY="$(cloud_need_name "$(cut -f2 <<<"$r")") found on the VM ($(cut -f1 <<<"$r" | cut -c1-10))${d:+: $d}"; return 1
 }
 # ---------- journal des sessions VM du projet (lot 02 d'aiguillage-cloud) ----------
 # $LAB_STATE/cloud/sessions/<p> : une ligne TSV par fin — couloir, lot, machine, départ, fin, durée en s, pushs, issue (done, need,
@@ -731,8 +728,9 @@ cloud_decide() {
   cloud_decide_ "$@"
   if [ "$CLOUD_MODE" = local ]; then EXECUTION=mac; EXECUTION_WHY="$CLOUD_WHY"; else EXECUTION=cloud; fi
 }
-# cloud_execution_line <fiche> : rc 1 si la fiche garde le Mac — besoin écrit, signal dur des étapes, puis valeur illisible (Mac par
-# sécurité) —, CLOUD_WHY le nomme ; rc 0 sinon, EXECUTION_WHY dit pourquoi le Cloud (ligne écrite, ou par défaut).
+# cloud_execution_line <fiche> : rc 1 si la fiche garde le Mac — besoin écrit, signal dur des étapes, valeur illisible (Mac par
+# sécurité), puis ligne absente (Mac par défaut depuis le lot 01 de session-unique) —, CLOUD_WHY le nomme ; rc 0 pour une ligne
+# « cloud » écrite, EXECUTION_WHY le dit.
 cloud_execution_line() {
   local x mode need detail n raw sig said needs
   x="$(lot_execution "${1:-}" | cloud_plain)"   # texte écrit dans la fiche, par une session VM peut-être : aucun octet de contrôle au terminal
@@ -752,7 +750,8 @@ cloud_execution_line() {
     CLOUD_WHY="$(cut -f1 <<<"$sig"): $(cut -f2 <<<"$sig") in Steps, $said"; return 1
   fi
   [ "$mode" != unreadable ] || { CLOUD_WHY="line $n of $(basename "$1") unreadable (\"$raw\"): Mac for safety"; return 1; }
-  if [ "$mode" = cloud ]; then EXECUTION_WHY="written in the batch file${detail:+: $detail}"; else EXECUTION_WHY="by default, no Execution line"; fi
+  [ "$mode" = cloud ] || { CLOUD_WHY="by default, no Execution line"; return 1; }
+  EXECUTION_WHY="written in the batch file${detail:+: $detail}"
 }
 # cloud_execution_say <session> : lab next annonce où tourne l'exécution du lot, une ligne repliée à la largeur du terminal ; les
 # autres sessions sont toujours locales, sans annonce

@@ -5,7 +5,7 @@ description: Guides a new user's first lane, short and in plain words — GitHub
 
 # first-lane — the first lane, short and guided
 
-The person in front of you may never have used git, GitHub or an agent. They want one thing to work; they do not want to learn a method. This lane goes from their need to a first pull request, in one single batch, then their trial.
+The person in front of you may never have used git, GitHub or an agent. They want one thing to work; they do not want to learn a method. This lane goes from their need to a first pull request, in one single batch and one session, then their trial.
 
 ## How you speak
 
@@ -23,8 +23,8 @@ Before any question, run `lab guide <project> <lane>` and read `GITHUB=`. The wo
 
 - `ready`: say it, move on.
 - `no-remote`: the project is not on GitHub yet. Propose to create a private repository, visible to them only — never public — and ask for their explicit agreement with the multiple-choice question tool (`AskUserQuestion` in Claude, a numbered question elsewhere). Only after a yes, from the project's main checkout, run the command of `GITHUB_FIX=`: `gh repo create <name> --private --source <root> --remote origin --push`. It sends the main branch as it is today and writes nothing on it. If that sending is refused over SSH (`Permission denied (publickey)`: gh uses SSH and this Mac has no SSH key for GitHub), the repository already exists — never create it a second time: point the project at its HTTPS address, `git remote set-url origin https://github.com/<owner>/<name>.git`, let git use the gh sign-in with `gh auth setup-git`, then `git push -u origin <main branch>`. If gh answers that the name already exists on their account, create nothing: ask them for another name, or whether that existing repository is theirs to use. Then `lab guide <project> <lane>` again: it must say `ready`. A no is respected: the batch can still be planned and coded, but no pull request can be opened; say so, and the work stays on its branch.
-- `gh-logged-out`: gh, GitHub's command-line tool, is not signed in. Ask the user to sign in themselves: `! gh auth login` typed in this session (Claude Code), or `gh auth login` in another terminal; it opens their browser. Never type a password or a token for them. Then `lab guide` again.
-- `gh-missing`: gh is not installed. Ask them to install it (`brew install gh`, then `gh auth login`), or for their agreement to run `brew install gh` yourself; then the sign-in as above.
+- `gh-logged-out`: gh, GitHub's command-line tool, is not signed in. Ask the user, with the multiple-choice question tool, to sign in themselves: `gh auth login` in another terminal, or `! gh auth login` typed in this session (Claude Code) while no question is open; it opens their browser, and their answer says when it is done. Never type a password or a token for them. Then `lab guide` again.
+- `gh-missing`: gh is not installed. Ask them, with the same tool, to install it (`brew install gh`, then `gh auth login`), or for their agreement to run `brew install gh` yourself; then the sign-in as above.
 - `other-host`: the project lives elsewhere (GitLab, Bitbucket, a folder of this Mac). Explain in one sentence that Treelab opens pull requests on GitHub only and that the work would stay ready on its branch, then stop: no questions, no plan, until the user decides. Resuming later is `lab next <project> <lane>`.
 - `unknown`: gh did not answer in time (network). Run `lab guide` again a little later; if it lasts, say so and go on with the questions.
 
@@ -37,7 +37,7 @@ Before any question, run `lab guide <project> <lane>` and read `GITHUB=`. The wo
 
 - The roadmap holds one single batch, the last one: one batch line in the lane's treeplan. Detail its batch file with the batch-plan and use-goal skills: a Goal in one sentence the user understands, criteria `C1`, `C2`…, steps with their tests.
 - Keep it small: what fits in one session and one pull request. A larger wish is noted for a next lane.
-- Show the plan in plain words — what will change, how it will be checked — and ask for confirmation. Then run `lab next <project> <lane>` yourself.
+- Show the plan in plain words — what will change, how it will be checked — without waiting for a click: their answers to the questions are the agreement. Then apply batch-run in this same session: the work, its tests and the pull request follow without a new session.
 
 ## 4. A first test if there is none
 

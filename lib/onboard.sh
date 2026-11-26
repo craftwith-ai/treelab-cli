@@ -69,9 +69,9 @@ Treelab — 2/3 · The cycle
 
 Three commands move a need forward, from start to finish. Your agent runs them for you; you can type them too.
 
-  lab new <lane>: opens a lane. The agent asks you a few questions, five at most for your first lane, then writes the plan.
+  lab new <lane>: opens a lane. The agent asks you a few questions, five at most for your first lane, then plans the work, does it and checks it with tests, in the same session.
 
-  lab next <project> <lane>: moves to the next step. The command reads where the lane stands and starts what is needed: the work, then your final trial.
+  lab next <project> <lane>: moves to the next step. The command reads where the lane stands and starts what is needed: the next batch, then your final trial.
 
   lab close <project> <lane>: after your trial and your agreement, delivers the work into your main branch, then removes the lane.
 
@@ -307,7 +307,7 @@ lab new — open a lane for a new need
 
   lab new [project] <lane> [--brief <file>] [--agent claude|codex] [--kind feat|fix|chore] [--batch <slug>] [--title <text>] [--base <branch>] [--no-open] [--no-install] [--permanent] [--guided]
 
-Creates the lane's isolated working copy and its first branch, installs the dependencies, prepares the first batch file, then opens the lane's tab with an agent. The agent starts with a few questions to frame the need.
+Creates the lane's isolated working copy and its first branch, installs the dependencies, prepares the first batch file, then opens the lane's tab with an agent. The agent asks a few questions to frame the need, then plans, codes and closes the first batch in that same session.
 
 --brief stores the text of your need with the lane's documents: the agent starts from it. --permanent creates the lane already permanent (see lab help permanent). --guided makes it a first lane, short and guided: GitHub made ready first, five questions at most, one single batch up to its pull request, and the steps shown by lab guide; lab onboard and the installer use it. The main repository must have no pending change.
 
@@ -362,9 +362,9 @@ If the last nightly CI of the main branch is red, it says so (NIGHT=red) and sug
 
 Started from the lane's session, it replaces that session with a fresh one in the same tab. The second form imposes the next batch, for example a fix after your trial.
 
-Each batch chooses by itself, without a question: its Execution line, written at planning (cloud, or mac — <need>: <detail> with secret, deploy, mac-tool, human, resource or live), a lab deploy or lab lock command in its Steps, or an unreadable line keeps it on the Mac; without a line, it goes to the Cloud. lab next announces the choice in one line (EXECUTION=, EXECUTION_WHY=).
+Each batch chooses by itself, without a question: only its Execution line written cloud at planning sends it to the Cloud. Without a line it stays on the Mac, as with mac — <need>: <detail> (secret, deploy, mac-tool, human, resource or live), a lab deploy or lab lock command in its Steps, or an unreadable line. lab next announces the choice in one line (EXECUTION=, EXECUTION_WHY=).
 
-With cmux, the Cloud rule at yes, gh signed in and a ready image (see lab help cloud), a batch's run goes to a Cloud machine sized by your plan (CLOUD_RUN=, CLOUD_SIZE=) and shows in the lane's workspace; lanes of a project share a machine that has room (one session per 4 vCPU, LAB_CLOUD_LANES_PER_VM), awake first, without taking a slot of the plan (CLOUD_SHARED=<machine> <lanes> <n/max>, also in lab status); at its end, the Mac takes it back alone for the closing. If your plan is full, the lane takes its place in a queue (CLOUD_RUN=file (position n/m)) and leaves alone as soon as a slot frees up, in order of arrival; after 30 minutes of waiting, it runs on the Mac. Otherwise, or with --local (which also removes it from the queue), it stays on the Mac and CLOUD_RUN= says why. Planning, fixing and the final trial always stay on the Mac.
+With cmux, the Cloud rule at yes, gh signed in and a ready image (see lab help cloud), the run of a batch whose line says cloud goes to a Cloud machine sized by your plan (CLOUD_RUN=, CLOUD_SIZE=) and shows in the lane's workspace; lanes of a project share a machine that has room (one session per 4 vCPU, LAB_CLOUD_LANES_PER_VM), awake first, without taking a slot of the plan (CLOUD_SHARED=<machine> <lanes> <n/max>, also in lab status); at its end, the Mac takes it back alone for the closing. If your plan is full, the lane takes its place in a queue (CLOUD_RUN=file (position n/m)) and leaves alone as soon as a slot frees up, in order of arrival; after 30 minutes of waiting, it runs on the Mac. Otherwise, or with --local (which also removes it from the queue), it stays on the Mac and CLOUD_RUN= says why. Planning, fixing and the final trial always stay on the Mac.
 
 A Cloud session blocked on a need of the Mac (it writes "blocked: need <need>: <detail>") comes back alone: the run reopens on the Mac, a notification says so, and the need is remembered for the project (see lab help cloud). Without a push for an hour, a notification tells you; nothing is stopped.
 
@@ -495,7 +495,7 @@ Without an option, a read-only snapshot: memory pressure, compressed memory, swa
 
 Last comes the list of what to cut, each with its reason, what the cut implies and the command of its click: a session idle for 24 hours or more (hibernate; set top_idle_hours= in LAB_HOME/config), a session whose lane is finished or removed (close), an agent holding three zombie processes or more (sleep then wake it), a tool server or test browser left orphan for an hour, a heavy family, a Lima virtual machine or a forgotten tool (stop). cmux, cmux-cua, the calling session and its parents, the parents of any session (a tab's shell, tmux), root processes, other accounts and the names in top_keep= (comma list in LAB_HOME/config) are never proposed; a tab shared by two sessions is only explained. Sessions put to sleep by lab appear with their wake command.
 
-One gesture at a time, without confirmation: lab takes a fresh snapshot, checks the reason again and refuses otherwise, naming the refusal. --cut <pid> or --cut <family> acts on one line: an idle session sleeps in its tab and keeps its conversation; the tab of a finished lane closes only with a filled Handoff, no uncommitted file, an idle session and the tab off screen; a session running a background command is left alone; a process outside agents gets a stop signal, then a forced stop after 10 seconds (a family by its root, a Lima VM by limactl stop, node never as a whole). An agent is never killed. --cut idle and --cut lane-done act on every line of that reason. --wake <tab> resumes a sleeping session in place. --explain opens a cmux tab where claude, in plan mode, reads what lab knows and explains before anything is cut.
+One gesture at a time, without confirmation: lab takes a fresh snapshot, checks the reason again and refuses otherwise, naming the refusal. --cut <pid> or --cut <family> acts on one line: an idle session sleeps in its tab and keeps its conversation; the tab of a finished lane closes only with a filled Handoff, no uncommitted file, an idle session and the tab off screen; a session running a background command is left alone; a process outside agents gets a stop signal, then a forced stop after 10 seconds (a family by its root, a Lima VM by limactl stop, node never as a whole). An agent is never killed. --cut idle and --cut lane-done act on every line of that reason. --wake <tab> resumes a sleeping session in place. --explain opens a cmux tab where claude reads what lab knows and explains; nothing is cut before you agree.
 
 --fast, for frequent refreshes, reads resident memory instead of the footprint (marked approximate) and does not reread the acceptance of lanes: a lane finished by lab close is still proposed, an accepted lane only by the full pass. KEY=value blocks on stdout (--json available), the readable view on stderr.
 
@@ -613,6 +613,8 @@ Right before the merge, the main branch is read again up to date: if the merge w
 If the last nightly CI of the main branch is red, lab close refuses and suggests a fix lane, unless the lane proves its fix: a green manual run of the same workflow, on a revision that contains the first red commit and comes before the lane head; for such a lane, the count of red nights in lab doctor (ci.night_red_days) does not stop the delivery either. To close anyway, give your reason with --night-red-ok "<reason>": in both cases a dated agreement line (citing the green run for a proof) is committed in the acceptance section of the batch file, before the confirmation, and stays there if the closing stops.
 
 --abandon removes a lane that has nothing to deliver, after the same confirmation.
+
+Docker: the containers and images that carry the labels of the project and of this lane are counted before your agreement, then removed after the delivery, running containers stopped first (10 seconds at most); another lane's, another project's or an unlabelled resource stays. Without Docker nothing is read; when Docker does not answer or refuses a removal, the closing still goes to its end and lab docker clean removes what stays.
 
 You never have to type it. Write in the lane's tab, or in the tower's, that the acceptance is validated and the lane can be closed (for example "acceptance validated, close the lane"), or click the button the agent shows you: lab reads your words and the agent closes without --confirm, delivered then removed; from the lane's own tab, that tab closes with its session at the very end. Your words are enough once: they also cover a red night (lab writes the reason) and the commits that come after them, such as a sync with the main branch or a fix the CI asks for, as long as the tree is clean and the PR's CI is green; lab close names those commits (AFTER_AGREEMENT=). A question without a negation never takes your words back. Without your words, on a red night the agent asks you with one button, "Close <lane> despite the red night": your click is the agreement, its reason written by lab.
 
@@ -779,11 +781,11 @@ lab cloud — a project's Cloud rule
   lab cloud <project> suite [<lane>]
   lab cloud <project> clean [--dry-run]
 
-Says whether this project's batch sessions may run on cmux Cloud machines, and where the answer comes from: lane, project, global setting (cloud= in ~/.lab/config, read only) or default (yes). yes or no records it for the project, or for the named lane only; reset removes that level. Run without a project in a lane's folder, it targets that lane. With cmux, lab status, lab next and the session context show it. no keeps every batch on the Mac, whatever its Execution line; with yes, each batch file chooses (see lab help next), never a question.
+Says whether this project's batch sessions may run on cmux Cloud machines, and where the answer comes from: lane, project, global setting (cloud= in ~/.lab/config, read only) or default (yes). yes or no records it for the project, or for the named lane only; reset removes that level. Run without a project in a lane's folder, it targets that lane. With cmux, lab status, lab next and the session context show it. no keeps every batch on the Mac, whatever its Execution line; with yes, each batch file chooses (see lab help next), never a question: only a batch whose Execution line says cloud goes to a Cloud machine, a batch without a line stays on the Mac.
 
 image prepares the project's machine once (test tools, lab's method) from the main branch, or the one of --ref, freezes it as a snapshot then pauses it: each batch starts from it.
 
-needs lists what Cloud sessions could not do without the Mac: when a session writes "blocked: need <need>: <detail>", lab takes it back on the Mac and remembers the need here, outside the repository. That batch then stays on the Mac, and so does a batch file without an Execution line; planning reads them. needs reset forgets them all. Without a value, lab cloud also shows them (NEED=) with the 5 last Cloud sessions (SESSION=: duration, pushes, outcome).
+needs lists what Cloud sessions could not do without the Mac: when a session writes "blocked: need <need>: <detail>", lab takes it back on the Mac and remembers the need here, outside the repository. That batch then stays on the Mac, and planning reads them before writing a cloud line. needs reset forgets them all. Without a value, lab cloud also shows them (NEED=) with the 5 last Cloud sessions (SESSION=: duration, pushes, outcome).
 
 suite runs the project's bats suite of the current commit on a disposable Cloud machine restored from the image and sized to the largest tier the plan allows and has free (at least 4 vCPU, one bats job per vCPU), through the project's launcher scripts/cloud-suite.sh, then deletes the machine, even on failure or interruption. An image older than its tooling (scripts/cloud-image.sh and the files it reads, on the base) is rebuilt first, once, under a lock; a transient HTTP 502 is retried twice; a test stuck past 600 s is stopped and red, and at the global deadline the partial report is pulled before the machine is deleted. The committed tree is sent without lab's batch documents and without any token; each red is replayed alone. The answer is the exit code: SUITE=green (0), red (1, RED= names each test that stayed red alone) or unavailable (3, REASON=: uncommitted changes, cloud=no, no image, cmux or launcher missing) — RUN=cloud. A plan still full after the cleanup (no tier left, or HTTP 402 with the counted machines) runs the same suite on the Mac at once, never silently: RUN=mac, PLAN_FULL= (why), PLAN_ALERT= and a notification say that a larger plan would keep the suite on the Cloud; one job, macos tests included, in a frozen copy of the commit, same verdict and exit code. DURATION_S= counts everything; REPORT= keeps TAP, JUnit and replays.
 
@@ -924,9 +926,9 @@ lab docker — free space of the Docker machine, and the project's leftovers
   lab docker clean [project]
   lab docker prepare [project]
 
-Without a verb: reads the free space of the Docker machine with one throwaway container (2 s at most) and counts the project's leftovers: stopped containers and images older than 7 days that carry the label sh.treelab.project=<project>, and the build cache of its own builder lab-<project>. ROOM=short below 10 GB free or from 85% used. Resources without that label are counted, never touched.
+Without a verb: reads the free space of the Docker machine with one throwaway container (2 s at most) and counts the project's leftovers: stopped containers (created and never started: after one hour) and images older than 7 days that carry the label sh.treelab.project=<project>, everything that carries the label of a closed lane (sh.treelab.lane=<lane> without its folder nor a git worktree of that name), and the build cache of its own builder lab-<project>. ROOM=short below 10 GB free or from 85% used. Resources without that label are counted, never touched.
 
-clean removes those leftovers one identifier at a time, then the build cache older than 7 days of the builder lab-<project> only: a running container, another project's resource and an unlabelled one stay. LAB_DOCKER_IMAGE_DAYS changes the 7 days. prepare creates that builder once and fetches the small image that reads the free space. Without Docker, or when it does not answer, nothing is removed and the command ends without error.
+clean removes those leftovers one identifier at a time, a closed lane's running containers stopped first, then the build cache older than 7 days of the builder lab-<project> only: a running container of an open lane, another project's resource and an unlabelled one stay. LAB_DOCKER_IMAGE_DAYS changes the 7 days. prepare creates that builder once and fetches the small image that reads the free space. Without Docker, or when it does not answer, nothing is removed and the command ends without error.
 
 Example:
   lab docker clean
@@ -954,6 +956,8 @@ lab doctor — check the installation
 Checks the machine's installation and, with a project, its working frame. Each point is green, a warning or red; a red comes with what to do. Read only, except --freeze, which resets the reference of the project's measurements.
 
 --report produces an anonymized report that you can pass on: nothing is sent.
+
+With a project and Docker on this machine, a line <project>.docker warns when Docker is short of room or when leftovers of the project remain (stopped containers, images older than 7 days, what closed lanes left), with the figures and lab docker clean <project>; never red. Without Docker, no line.
 
 Example:
   lab doctor

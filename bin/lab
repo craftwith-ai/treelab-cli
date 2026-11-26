@@ -157,7 +157,7 @@ usage: lab <command> [options]
          cmux VM if cloud=yes and the project image (CLOUD_RUN=<machine>, CLOUD_SIZE=), otherwise CLOUD_RUN=local (reason)
          ; full plan: CLOUD_RUN=file (position n/m), started as soon as a slot frees up, local after LAB_CLOUD_QUEUE_MAX (1800 s)
          ; the Execution line of the batch file (cloud | mac — <need>: <detail>), lab deploy or lab lock in its Steps, or an
-         unreadable line keeps it on the Mac; no line: Cloud by default; announced as EXECUTION=cloud|mac, EXECUTION_WHY=
+         unreadable line keeps it on the Mac; no line: Mac by default; announced as EXECUTION=cloud|mac, EXECUTION_WHY=
          ; the VM agent asks its questions in its terminal (answer typed there); no answer after LAB_CLOUD_IDLE_MAX (7200 s):
          VM paused, lab next wakes it (CLOUD_RUN=<machine> (woken)), --local closes it and goes on on the Mac
          ; a VM session blocked on "blocked: need <need>: <detail>" comes back alone: run reopened on the Mac, need remembered
@@ -205,8 +205,8 @@ usage: lab <command> [options]
   top    [--fast] [--cut|--wake|--explain <target>]  snapshot of the machine, then the cut chosen with one click:
          sessions tied to project, lane and cmux tab (BLOCK=SESSION), memory state (BLOCK=MACHINE), families outside
          Treelab (BLOCK=FAMILY), what to cut, why and what it implies (BLOCK=CUT), sessions asleep (BLOCK=HIBERNATED);
-         --cut <pid|family|idle|lane-done> acts (BLOCK=RESULT), --wake <tab> resumes, --explain opens claude in plan
-         mode; --fast: resident memory, acceptance of lanes not reread; idle threshold top_idle_hours= (24)
+         --cut <pid|family|idle|lane-done> acts (BLOCK=RESULT), --wake <tab> resumes, --explain asks claude
+         why; --fast: resident memory, acceptance of lanes not reread; idle threshold top_idle_hours= (24)
   sysmon   one collection pass for the menu-bar modules: six KEY=value blocks (BLOCK=CPU|MEM|DISK|NET|BATTERY|TEMP)
          from macmon (usage P/E, GPU, power, temps, fans) and native tools; top 5 consumers tied to project and lane;
          no macmon: TEMP and power absent, other modules intact. Read-only, readable view on stderr
@@ -247,10 +247,13 @@ usage: lab <command> [options]
   services [project] stop --orphans           stop once per closed lane that list names; goes on after a failure. STOPPED=, FAILED=
   docker [project]           reads the free space of the Docker machine (DOCKER=ok|missing|down, FREE_GB=, USED_PCT=,
          ROOM=ok|short: 10 GB free and under 85% used) and counts the leftovers labelled sh.treelab.project=<project>
-         (CONTAINERS=, IMAGES=, CACHE=, UNLABELED=); Docker missing or silent: rc 0, nothing read
+         (CONTAINERS=, IMAGES=, CACHE=, UNLABELED=) and what closed lanes left (CLOSED_CONTAINERS=, CLOSED_RUNNING=,
+         CLOSED_IMAGES=, CLOSED_LANES=); Docker missing or silent: rc 0, nothing read
   docker clean [project]     removes the stopped containers and the images older than LAB_DOCKER_IMAGE_DAYS (7) of the project,
-         one identifier at a time, and the old cache of its builder lab-<project>; never a resource of another project nor
-         without label. CONTAINERS_REMOVED=, IMAGES_REMOVED=, IMAGES_KEPT=, CACHE_FREED=
+         one identifier at a time, everything a closed lane left (any age, running containers stopped first) and the old
+         cache of its builder lab-<project>; never a resource of another project nor without label. CONTAINERS_REMOVED=,
+         IMAGES_REMOVED=, IMAGES_KEPT=, CONTAINERS_KEPT=, CACHE_FREED=, CLOSED_CONTAINERS_REMOVED=, CLOSED_STOPPED=,
+         CLOSED_IMAGES_REMOVED=
   docker prepare [project]   creates the builder lab-<project> once and fetches the small image that reads the free space
          (BUILDER=, BUILDER_STATE=created|inactive|running|stopped, PROBE=present|pulled|failed)
   deploy [project] <target> [--with <lane>…] [--retire <lane>…] [--record] [--dry-run]   deploys a declared target
@@ -274,9 +277,13 @@ usage: lab <command> [options]
          (agreement via=words) the lane agent or the tower closes without --confirm (CLOSED_BY=words); the tower without --confirm
          closes alone if the agreement recorded by lab acceptance, verified served revision and prod check are green
          (CLOSED_BY=tower), else refused
+         Docker: the containers and images of the lane (labels sh.treelab.project and sh.treelab.lane) are announced before the
+         agreement, then stopped and removed after delivery; Docker missing, silent or refusing never blocks the closing
+         (DOCKER_CONTAINERS_REMOVED=, DOCKER_IMAGES_REMOVED=, DOCKER_IMAGES_KEPT=; lab docker clean removes what stays)
   close  [project] <lane> --abandon [--confirm <lane>]   removes a lane without commit or PR, nothing is delivered
   close  [project] <lane> --dry-run [--abandon]   lists every closing obstacle without modifying anything:
-         OBSTACLE=<key>: <message and remedy> per obstacle, then RESULT=ok|blocked (rc 0|1)
+         OBSTACLE=<key>: <message and remedy> per obstacle, then RESULT=ok|blocked (rc 0|1); DOCKER=, DOCKER_CONTAINERS=,
+         DOCKER_RUNNING=, DOCKER_IMAGES= (read, nothing removed)
   acceptance [project] <lane> --accept|--reject [--evidence <text>]… [--feedback <text>]   after the trial: notes the tried
          revision, writes the only acceptance section, commits the only batch file; ACCEPTANCE=valid|rejected, REVISION=, COMMIT=
          typed evidence: check: (runs acceptance_check= of the config), screens:<batch> (lab proof); writes Validated by;
@@ -951,11 +958,11 @@ lot_framed() {
 # lane_first_lot <fiche> : première fiche du dossier de son couloir (la numérotation repart à 01 dans chaque couloir)
 # shellcheck disable=SC2012
 lane_first_lot() { [ "$(ls "$(dirname "$1")"/lot-[0-9]*.md 2>/dev/null | sort | head -1)" = "$1" ]; }
-# launch_prompt <session> <lot> [complément] → le prompt exact que l'agent recevra
+# launch_prompt <session> <lot> [complément] [agent] → le prompt exact que l'agent recevra (grill et plan dépendent de l'agent)
 launch_prompt() {
   case "$1" in
-    grill) planning_prompt "$2" 1 "${3:-}" ;;
-    plan)  planning_prompt "$2" 0 "${3:-}" ;;
+    grill) planning_prompt "$2" 1 "${3:-}" "${4:-}" ;;
+    plan)  planning_prompt "$2" 0 "${3:-}" "${4:-}" ;;
     run)   execution_goal_prompt "$2" "${3:-}" ;;
     end)   cloud_end_prompt "$2" ;;
     acceptance) recette_prompt "$2" ;;
@@ -992,7 +999,7 @@ exec_agent() {
 launch_from_lot() {
   local agent="$1" lot="$2" session="$3" extra="${4:-}" prompt bytes
   launch_sync "$session" "$lot"; session="$LAUNCH_SESSION"
-  prompt="$(launch_prompt "$session" "$lot" "$extra")"
+  prompt="$(launch_prompt "$session" "$lot" "$extra" "$agent")"
   bytes="$(byte_len "$prompt")"
   [ "$bytes" -le "$LAB_PROMPT_MAX" ] || die "prompt of $bytes bytes rebuilt from $(prompt_path "$lot"): beyond $LAB_PROMPT_MAX bytes, /goal would truncate it — shorten the first line of its Goal section"
   kv SESSION "$session"; kv PROMPT_BYTES "$bytes"; kv LAST_BATCH "$(lane_last_lot "$WT" "$lot")"
@@ -1111,7 +1118,7 @@ open_fresh_session() {
   cmd="$(launch_line "$extra" "${REPLACE_AGENT:-}" "$corr")"; bytes="$(byte_len "$cmd")"
   [ "$bytes" -le "$LAB_LINE_MAX" ] || die "launch line of $bytes bytes (maximum $LAB_LINE_MAX): the --goal addition is too long to be typed — write it in $(prompt_path "$lot")"
   if [ "${LAB_REPLACE:-0}" = 1 ]; then   # la session remplacée ne verra jamais le refus de lab launch : le prompt est mesuré ici
-    prompt="$(launch_prompt "$session" "$lot" "$extra")" || exit 1   # son refus est nommé, jamais tu (lot 17)
+    prompt="$(launch_prompt "$session" "$lot" "$extra" "$agent")" || exit 1   # son refus est nommé, jamais tu (lot 17)
     [ "$(byte_len "$prompt")" -le "$LAB_PROMPT_MAX" ] || die "prompt of $(byte_len "$prompt") bytes rebuilt from $(prompt_path "$lot"): beyond $LAB_PROMPT_MAX bytes, /goal would truncate it — shorten the first line of its Goal section; no session replaced"
   fi
   case "$session" in acceptance|correction|free) ;; *) meta_set "$WT" session "$session" ;; esac
@@ -1181,23 +1188,35 @@ prompt_path() { # <chemin> : relatif au worktree si possible, sinon absolu (docs
 }
 # lot_docs <lot> : dossier docs de la fiche (docs/lots/<couloir>/lot-NN.md, ou l'ancien docs/lots/lot-NN.md)
 lot_docs() { local d; d="$(dirname "$(dirname "$1")")"; case "$d" in */lots) d="$(dirname "$d")" ;; esac; printf '%s\n' "$d"; }
-planning_prompt() { # <lot> [premier=0|1] [complément]
-  local lot="$1" first="${2:-0}" extra="${3:-}" rel docs master tp
+# planning_prompt <lot> [premier=0|1] [complément] [agent] : une seule session planifie, exécute et clôt le lot (lot 01 de
+# session-unique). Claude démarre sous /goal, ses questions passent par AskUserQuestion, outil bloquant : une question en texte
+# finirait le tour et l'évaluateur du Goal relancerait. Codex démarre sans /goal (questions en texte numéroté) et crée son Goal
+# après les réponses (create_goal). Les réponses valent accord : aucun clic de validation, aucune relance.
+planning_prompt() {
+  local lot="$1" first="${2:-0}" extra="${3:-}" agent="${4:-claude}" rel docs master tp ask goal=""
   rel="$(prompt_path "$lot")"; docs="$(lot_docs "$lot")"
   master="$(prompt_path "$docs/masterplan.md")"; tp="$(prompt_path "$(treeplan_file "$docs" "$SLUG")")"
+  if [ "$agent" = codex ]; then
+    ask="asked as numbered text"
+    goal=" After the answers, or at once when there is no question, create this session's Goal with create_goal (use-goal skill): plan, run and close this batch, or stop with the exact blocker."
+  else
+    printf '/goal '; ask="asked only with AskUserQuestion, like any gesture asked of the user outside this session (the gh sign-in)"
+  fi
   [ -z "$(last_lot_notice "$WT" "$lot")" ] || printf '%s ' "$(last_lot_notice "$WT" "$lot")"
   if [ "$first" = 1 ] && lane_guided "$WT"; then
     # lot 07 de refonte-onboarding : premier couloir guidé — le skill first-lane au lieu du grill-me 10 + 5, un seul lot
     local brief; brief="$(lane_brief "$docs" "$SLUG")"
     [ -z "$brief" ] || printf 'Brief of the need: %s — read it first, the questions start from it. ' "$(prompt_path "$brief")"
-    printf '%s' "First lane, guided: apply the first-lane skill, in plain words, each technical term explained once, and show the step line of lab guide $P_NAME $SLUG at each step. Before any code, GitHub: read GITHUB= of lab guide and follow the skill, a private repository is created only with the user's agreement. Then one single round of five questions at most, and no second grill-me. Read the overall goal in $master and complete it only during the project's initial framing. After confirmation, write in $tp a roadmap of one single batch, the last one, up to its pull request, then detail $rel with the batch-plan and use-goal skills. Write in no other lane. Finish by running lab next $P_NAME $SLUG yourself from this session, without asking the user to type it.${extra:+ $extra}"
+    printf '%s' "First lane, guided, one session from questions to pull request: apply the first-lane skill, in plain words, each technical term explained once, and show the step line of lab guide $P_NAME $SLUG at each step. Before any code, GitHub: read GITHUB= of lab guide and follow the skill, a private repository is created only with the user's agreement. Then one single round of five questions at most, $ask, and no second grill-me; the answers are the agreement. Read the overall goal in $master and complete it only during the project's initial framing. Write in $tp a roadmap of one single batch, the last one, up to its pull request, detail $rel with the batch-plan and use-goal skills, show the plan in plain words, then apply batch-run and batch-end in this same session (a batch file that says cloud: lab next instead of batch-run, the run goes to a Cloud machine). Write in no other lane. Finish by running lab next $P_NAME $SLUG yourself from this session, without asking the user to type it, once batch-end has opened the pull request; otherwise stop with the exact blocker and the attempts already made.$goal${extra:+ $extra}"
   elif [ "$first" = 1 ]; then
     local brief; brief="$(lane_brief "$docs" "$SLUG")"   # rangé par lab new --brief : le grill-me part de ce texte (lot 18)
     [ -z "$brief" ] || printf 'Brief of the need: %s — read it first, the grill-me starts from it. ' "$(prompt_path "$brief")"
-    printf '%s' "New need in this lane; before any code, apply the grill-me skill: ten questions at most, then five only if an important decision remains open. Read the overall goal in $master and complete it only during the project's initial framing. After confirmation, write this lane's roadmap in $tp, then detail $rel with the batch-plan and use-goal skills. Write in no other lane. If a batch changes the project's declared interface, better is available for its planning and its closing. Finish by running lab next $P_NAME $SLUG yourself from this session, without asking the user to type it.${extra:+ $extra}"
+    printf '%s' "New need in this lane, one session from questions to closing; before any code, apply the grill-me skill to the decisions still open: ten questions at most, then five only if an important decision remains open, $ask; the answers are the agreement: show the summary and go on without waiting. Read the overall goal in $master and complete it only during the project's initial framing. Write this lane's roadmap in $tp, detail $rel with the batch-plan and use-goal skills, then apply batch-run and batch-end in this same session (a batch file that says cloud: lab next instead of batch-run, the run goes to a Cloud machine). Write in no other lane. If a batch changes the project's declared interface, better is available for its planning and its closing. Finish by running lab next $P_NAME $SLUG yourself from this session, without asking the user to type it, once batch-end has closed the batch; otherwise stop with the exact blocker and the attempts already made.$goal${extra:+ $extra}"
   else
-    ! lane_guided "$WT" || extra="$(guide_prompt_note)${extra:+ $extra}"   # revue du lot 07 : un couloir guidé repris en plan garde first-lane
-    printf '%s' "New batch in this lane. Read $tp, the previous batch's Handoff and $rel. Complete this batch with the batch-plan and use-goal skills, without coding before its goal and its evidence are clear. Write only in this lane's documents. If this batch changes the project's declared interface, better is available during planning and before closing. Finish by running lab next $P_NAME $SLUG yourself from this session, without asking the user to type it.${extra:+ $extra}"
+    local q="Apply the grill-me skill only to this batch's decisions still open (none: no question), $ask; the answers are the agreement: show the summary and go on without waiting."
+    # revue du lot 07 : un couloir guidé repris en plan garde first-lane, sans second grill-me ; ce qui reste à demander suit la même voie
+    ! lane_guided "$WT" || { q="No second grill-me (first-lane skill): what remains open takes the simplest option, written as a decision; anything still needed from the user is $ask."; extra="$(guide_prompt_note)${extra:+ $extra}"; }
+    printf '%s' "New batch in this lane, one session from questions to closing. Read $tp, the previous batch's Handoff and $rel. $q Complete this batch with the batch-plan and use-goal skills, its goal and evidence clear before any code, then apply batch-run and batch-end in this same session (a batch file that says cloud: lab next instead of batch-run, the run goes to a Cloud machine). Write only in this lane's documents. If this batch changes the project's declared interface, better is available during planning and before closing. Finish by running lab next $P_NAME $SLUG yourself from this session, without asking the user to type it, once batch-end has closed the batch; otherwise stop with the exact blocker and the attempts already made.$goal${extra:+ $extra}"
   fi
 }
 execution_goal_prompt() { # <lot> [complément]
@@ -1424,7 +1443,10 @@ cmd_next() {
   if [ "$NEXT_LOCAL" != 1 ] && [ "$(lang_code "$(cloud_get state)")" = failed ]; then   # 40 colonnes
     log "Previous Cloud session failed:"
     local l; while IFS= read -r l; do log "$l"; done < <(cloud_get detail | cut -c1-160 | fold -s -w 34)
-    log "Default: again on the lane VM;"; log "on the Mac: --local. The VM goes"; log "with lab close or Cloud cleanup."   # lot 01 de restes-cloud
+    # session-unique (revue du lot 01) : seule une fiche « cloud » repart sur la VM ; sans cette ligne, le Mac par défaut
+    if [ "$(lot_execution "$(wt_lot_file "$WT")" | cut -f1)" = cloud ]; then log "Default: again on the lane VM;"; log "on the Mac: --local. The VM goes"
+    else log "Next run: on the Mac, the batch"; log "file has no cloud line. The VM goes"; fi
+    log "with lab close or Cloud cleanup."   # lot 01 de restes-cloud
   fi
   [ "$NEXT_LOCAL" != 1 ] || [ -z "$(cloud_queue_pos "$SLUG")" ] || { cloud_queue_rm "$SLUG"; log "Lane removed from the Cloud queue."; }   # lot 05
   if cloud_paused; then         # lot 09 de cmux-pro : la session attend sa réponse, VM en pause après LAB_CLOUD_IDLE_MAX
@@ -1932,8 +1954,9 @@ delivery_guard() {
   local report rc=0 reds red now poste proof
   # LAB_DOCTOR_NO_SERVICES : les services des couloirs fermés ne disent rien du code livré, et list coûterait jusqu'à 15 s ;
   # LAB_DOCTOR_NO_PROBES : les sondes en ligne non plus, jusqu'à 15 s (lot 03 de charge-processeur)
+  # LAB_DOCTOR_NO_DOCKER : la machine Docker non plus — la livraison ne lit jamais Docker (lot 03 de docker-menage)
   # sa sortie d'erreur avec : la dernière ligne dit s'il est allé au bout (revue du lot 03 : un code 1 en route n'est pas un bilan)
-  report="$(LAB_DOCTOR_NO_SERVICES=1 LAB_DOCTOR_NO_PROBES=1 "$LAB_ROOT/bin/lab" doctor "$P_NAME" --root "$WT" 2>&1)" || rc=$?
+  report="$(LAB_DOCTOR_NO_SERVICES=1 LAB_DOCTOR_NO_PROBES=1 LAB_DOCTOR_NO_DOCKER=1 "$LAB_ROOT/bin/lab" doctor "$P_NAME" --root "$WT" 2>&1)" || rc=$?
   [ "$rc" -eq 0 ] && return
   reds="$(printf '%s\n' "$report" | awk -F= '$1=="CHECK"{check=$2} $1=="STATUS" && $2=="RED"{print check}')"
   poste="$(printf '%s\n' "$reds" | awk -v p="$P_NAME." 'NF && index($0, p) != 1')"
@@ -1944,7 +1967,7 @@ delivery_guard() {
       # que la baseline illisible, sous le nom du projet
       case $'\n'"$poste"$'\n' in *$'\n'global.baseline$'\n'*) reds="$P_NAME.baseline" ;; *) rc=0 ;; esac
     else   # bilan arrêté en route (code 2, ou code 1 sans sa ligne finale) : le bilan du seul projet tranche, comme avant
-      rc=0; report="$(LAB_DOCTOR_NO_SERVICES=1 LAB_DOCTOR_NO_PROBES=1 "$LAB_ROOT/bin/lab" doctor "$P_NAME" --root "$WT" --project-only 2>/dev/null)" || rc=$?
+      rc=0; report="$(LAB_DOCTOR_NO_SERVICES=1 LAB_DOCTOR_NO_PROBES=1 LAB_DOCTOR_NO_DOCKER=1 "$LAB_ROOT/bin/lab" doctor "$P_NAME" --root "$WT" --project-only 2>/dev/null)" || rc=$?
       [ "$rc" -eq 0 ] || reds="$(printf '%s\n' "$report" | awk -F= '$1=="CHECK"{check=$2} $1=="STATUS" && $2=="RED"{print check}')"
     fi
     if [ "$rc" -eq 0 ]; then

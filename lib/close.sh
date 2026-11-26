@@ -998,6 +998,16 @@ close_lane_branches() { # branche courante puis celles annoncées par les fiches
 $branch"
   done <<<"$names"
 }
+# lot 03 de docker-menage : conteneurs et images à l'étiquette du couloir — annoncés avant l'accord (kv : --dry-run), retirés après la
+# livraison, avant le retrait du dossier. lib/docker.sh chargé à la demande, chaque passage en sous-shell : ni une erreur ni un
+# Docker absent, muet ou qui refuse n'arrêtent la fermeture (Docker absent : ni ligne ni processus Docker).
+close_docker_show() {
+  ( declare -F docker_lane_show >/dev/null || . "$LAB_ROOT/lib/docker.sh"; docker_lane_show "$P_NAME" "$SLUG" "${1:-}" ) || true
+}
+close_docker_remove() {
+  ( declare -F docker_close_lane >/dev/null || . "$LAB_ROOT/lib/docker.sh"; docker_close_lane "$P_NAME" "$SLUG" ) \
+    || warn_wrap "Docker cleaning of lane $SLUG stopped: lab docker clean $P_NAME removes what it left"
+}
 close_abandon_scan() { # pose CLOSE_ABANDON_BRANCHES, CLOSE_ABANDON_FILES (non suivis sous docs/, partent avec le dossier) et
   # CLOSE_ABANDON_OBSTACLE : la première cause qui interdit l'abandon, vide si le couloir n'a ni commit ni PR ni travail non enregistré
   local branch start info line path remote_head rc work=""
@@ -1054,6 +1064,7 @@ close_abandon() { # <confirmation> <posée=0|1>
   case "$docs" in "$WT"/*) ;; *) printf 'External documents kept, remove them yourself: %s and %s\n' "$(treeplan_file "$docs" "$SLUG")" "$(lots_dir "$docs" "$SLUG")" >&2 ;; esac
   printf 'Target tab: %s (%s)\n' "$name" "${surface:-not assigned}" >&2
   services_show "$WT"
+  close_docker_show
   close_procs_show "$(close_procs_plan)"
   close_confirm "$1" "$2" abandon || return 0
   load_project "$PROJECT"; close_abandon_guard
@@ -1071,6 +1082,7 @@ close_abandon() { # <confirmation> <posée=0|1>
   vm="$(wt_meta "$WT" cloud_machine)"; cws="$(cloud_pane | cut -f1)"   # workspace de la ligne d'état Cloud (lot 09)
   cd "$P_ROOT" || die "main checkout not found"
   services_close "$WT"   # le crochet du projet voit encore son dossier (lot 01 de services-couloir)
+  close_docker_remove
   close_procs_stop "$ws" "$surface"
   git -C "$P_ROOT" worktree remove --force "$WT" || die "branches removed but folder kept: git -C $WT switch <branch> is no longer possible, remove the folder with git -C $P_ROOT worktree remove --force $WT"
   agreement_clear "$SLUG"; rm -f "$(night_agreed_file)" "$(close_retire_file)"
@@ -1244,6 +1256,7 @@ close_obstacles() {
     case "$CLOSE_PR_STATE" in MERGED|EMPTY) ;; *) close_try base close_base_check "$CLOSE_HEAD" "$CLOSE_BASE" || true ;; esac
   fi
   kv SERVICES "$(services_state "$WT")"   # le crochet est seulement annoncé : --dry-run ne le lance jamais
+  close_docker_show kv   # lot 03 de docker-menage : lu, jamais retiré ici
   close_procs_kv "$(close_procs_plan)"   # ce que la fermeture arrêterait, rien n'est arrêté ici
   # lot 08 : projet doté d'une tour — la tour sait avant lab close si elle ferme seule ; aucun contrôle relancé ici
   if deploy_tower_project; then
@@ -1300,6 +1313,7 @@ cmd_close() {
     CLOSE_BLOCKED=0; close_try session close_session_guard || true; close_abandon_scan
     [ -z "$CLOSE_ABANDON_OBSTACLE" ] || close_obstacle abandon "$CLOSE_ABANDON_OBSTACLE: nothing abandoned"
     kv SERVICES "$(services_state "$WT")"   # annoncé, jamais lancé par un essai à blanc
+    close_docker_show kv
     close_procs_kv "$(close_procs_plan)"
     if [ "$CLOSE_BLOCKED" = 0 ]; then kv RESULT ok; return 0; fi
     kv RESULT blocked; return 1
@@ -1336,6 +1350,7 @@ cmd_close() {
   printf '%s\n' "$records" | awk -F '\t' '{ print "  " $1 ($5 == "" ? "" : " — " ($5 ~ /^#/ ? "delivered by " : "") $5) }' \
     | if { [ -t 2 ] || [ -n "${COLUMNS:-}" ]; } && declare -F onboard_wrap >/dev/null; then onboard_wrap "$(onboard_cols)"; else cat; fi >&2
   services_show "$WT"
+  close_docker_show
   close_procs_show "$(close_procs_plan)"
   CLOSE_CONFIRMED=""; [ "$confirmation_set" = 0 ] || CLOSE_CONFIRMED=1
   [ "$CLOSE_PR_STATE" != OPEN ] || close_recheck "$head" "$base"   # refus nommé avant même de demander l'accord
@@ -1404,6 +1419,7 @@ close_finish() {
   vm="$(wt_meta "$WT" cloud_machine)"; cws="$(cloud_pane | cut -f1)"   # workspace de la ligne d'état Cloud (lot 09)
   cd "$P_ROOT" || die "main checkout not found"
   services_close "$WT"   # après la livraison, avant le retrait : le crochet voit encore son dossier (veilleur compris)
+  close_docker_remove
   close_procs_stop "$ws" "$surface"
   git -C "$P_ROOT" worktree remove ${SERVICES_FORCE:+--force} "$WT" || die "delivery done but folder kept: run lab close $P_NAME $SLUG again"
   agreement_clear "$SLUG"; words_clear "$SLUG"   # lots 09 et 10 : accord et mots partent avec le couloir, jamais hérités d'un homonyme

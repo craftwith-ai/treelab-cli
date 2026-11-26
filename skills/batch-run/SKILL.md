@@ -1,11 +1,11 @@
 ---
 name: batch-run
-description: Runs the current batch's Goal step by step, with tests, evidence, log and commits, then applies batch-end. Use it in the fresh session opened by lab next.
+description: Runs the current batch's Goal step by step, with tests, evidence, log and commits, then applies batch-end. Use it in the session that planned the batch, right after batch-plan, or in the resumption opened by lab next.
 ---
 
 # batch-run — run a batch
 
-Prerequisite: the start message holds a precise Goal and the current batch is planned or in progress (`planifié`, `en cours` in a French batch file). Otherwise, apply `batch-plan`; never invent the expected result.
+Prerequisite: the current batch is planned or in progress (`planifié`, `en cours` in a French batch file) with a precise Goal — the session that planned it goes on with it, the resumption opened by lab next receives it in its start message. Otherwise, apply `batch-plan`; never invent the expected result.
 
 ## Start
 

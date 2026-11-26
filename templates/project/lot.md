@@ -2,7 +2,7 @@
 
 **State** : planned
 **Branch** : `{{BRANCH}}` · **Created** : {{DATE}}
-<!-- Execution line, written by batch-plan under the State line: "**Execution** : cloud" by default, or "**Execution** : mac — <need>: <detail>" with a need among secret, deploy, mac-tool, human, resource, live. Without it, lab next runs the batch on the Cloud; `lab deploy` or `lab lock` in Steps keeps it on the Mac. -->
+<!-- Execution line, written by batch-plan under the State line only by choice: "**Execution** : cloud" sends the run to a Cloud machine, "**Execution** : mac — <need>: <detail>" names why the Mac, with a need among secret, deploy, mac-tool, human, resource, live. Without it, the batch stays on the Mac; `lab deploy` or `lab lock` in Steps keeps it on the Mac even under cloud. -->
 
 ## Goal
 

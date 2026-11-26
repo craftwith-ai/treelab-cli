@@ -2,6 +2,25 @@
 
 Release notes of each published version of Treelab, newest first.
 
+## 1.8.0 — 2026-11-26
+
+**One task, one session: a few questions, then the agent codes**
+
+- When a worktree opens, the agent asks its questions in one go, then writes the lot, codes it and closes it in the same session: your answers are your agreement, with no plan to approve nor summary to confirm.
+- The next lots ask questions only when a decision remains open; otherwise the agent carries on without asking you.
+- A lot stays on your Mac by default: only a lot whose document asks for the Cloud goes to a Cloud machine.
+- Explaining a process (lab top --explain) opens a tab where Claude says what is running, cutting and changing nothing before you agree.
+- The home page publishes the new count: at least 3 actions from you for a worktree of two lots, measured with Claude Code and with Codex.
+
+## 1.7.0 — 2026-11-26
+
+**Docker no longer fills up: what lab starts goes away when it ends**
+
+- Closing a lane announces its Docker containers and images before your agreement, then removes them after the delivery, running ones stopped first; Docker missing, silent or refusing never blocks the closing.
+- lab docker clean also removes everything that lanes already closed left, whatever its age; never anything of another project nor without a label.
+- lab doctor warns, never fails, when Docker is short of room or leftovers of the project remain, with the figures and the command that removes them.
+- In a lab project, the agent no longer runs a Docker command that would leave leftovers: the guard gives the exact line, with --rm, the labels and the project's builder.
+
 ## 1.6.1 — 2026-11-25
 
 **The tower first: the main tab hands over to it**

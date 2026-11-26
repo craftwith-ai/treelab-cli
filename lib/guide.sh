@@ -33,7 +33,7 @@ guide_step_label() {
 guide_step_next() {
   case "$1" in
     1) echo 'Next: the agent asks you a few questions about your need, five at most.' ;;
-    2) echo 'Next: the agent writes the plan, then asks you to confirm it.' ;;
+    2) echo 'Next: the agent shows you the plan in plain words, then starts the work in the same session.' ;;
     3) echo 'Next: the agent does the work and checks it with tests, then proposes it to you as a pull request.' ;;
     4) echo 'Next: you try the result. If it suits you, say so: the agent delivers it.' ;;
   esac
