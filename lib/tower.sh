@@ -110,7 +110,15 @@ next_blocked_note() {
 # lue (vide quand une entrée d'attente ou une fusion en file a suffi), qui sépare recette, fermeture et suite à clarifier (Ginkgo).
 # --no-session (Ginkgo, qui ne lit ni TW_SESSION ni le motif d'un couloir qui n'attend rien) : le verrou de session n'est pas lu.
 # Nom du couloir, phase, attente et veilleurs lus sans sous-shell (lot 04 de charge-processeur) : mêmes valeurs.
+# Mesure partie de la base pendant que la PR du dernier lot attend sa recette (lot 01 de fix-mesure-dernier-lot) : le motif le dit d'abord.
 tower_waits_for() {
+  tower_waits_read "$@"
+  measure_return_set "$1"; [ -n "$MEASURE_RETURN" ] || return 0
+  head_branch_set "$1"
+  if reopen_branch_is "$HEAD_BRANCH"; then TW_WHY="measure C${BASH_REMATCH[1]} before the acceptance of #$MEASURE_RETURN_PR — $TW_WHY"
+  else TW_WHY="return to $MEASURE_RETURN before the acceptance of #$MEASURE_RETURN_PR — $TW_WHY"; fi
+}
+tower_waits_read() {
   local wt="$1" kind phase w f issue lane
   TW_WAITS=nothing; TW_WHY=""; TW_SESSION=none; TW_EVIDENCE=""; TW_PHASE=""
   [ "${2:-}" = --no-session ] || ! lock_alive "$wt/.lab/session.lock" || TW_SESSION=live

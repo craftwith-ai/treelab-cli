@@ -294,6 +294,9 @@ usage: lab <command> [options]
          that date, the batch goes waiting (section Waiting) and is delivered as usual; lab next opens the next batch, then
          reopens this one for Cn at its date (branch chore/<slug>.c<n>), before the next; one postponement per criterion;
          acceptance and lab close wait until every line is measured. CRITERION=, DUE=, REPORTS=, STATE=, ALARM=
+         Last batch PR waiting for its acceptance: the due measure of an earlier batch starts from the base, its branch is
+         kept aside (RETURN_TO= in lab next and lab status); after the merge of the measure, lab next goes back to it, merges
+         the base and opens the acceptance. A due measure of the last batch itself is refused, named, without lab merge
   batch  wait --done <Cn>   marks the criterion measured (time, revision): WAITING_LEFT=, STATE= (closed when none is left)
   wake   [--install|--remove|--status]   runs lab next for each lane whose waiting batch is due and has no live session,
          and for each tower without a live session (WOKEN=<p>/tower),
@@ -455,6 +458,7 @@ describe_wt() {
   kv BATCH_STATE "$LOT_STATE"
   lane_phase_set "$wt"; kv LANE_PHASE "$LANE_PHASE"; lane_last_set "$wt" "$lot"; kv LAST_BATCH "$LANE_LAST"
   wait_first_set "$wt"; if [ -n "$WAIT_FIRST" ]; then wait_summary_set "$WAIT_FIRST"; kv WAITING "$WAIT_SUMMARY"; fi   # lot 02 d'autonomie-tours
+  measure_return_set "$wt"; [ -z "$MEASURE_RETURN" ] || kv RETURN_TO "$MEASURE_RETURN_WHY"   # lot 01 de fix-mesure-dernier-lot
   ! lane_permanent "$wt" || kv PERMANENT yes   # jamais candidat au retrait ni à la recette (lot 01 d'autonomie-tours)
   agent_display_set "$wt"; kv AGENT "$AGENT_DISPLAY"
   if has_cmux; then cloud_display_set "$P_NAME" "$wt"; kv CLOUD "$CLOUD_DISPLAY"; fi   # règle cloud du couloir, sans cmux rien (lot 03 de cmux-pro)
@@ -1009,7 +1013,7 @@ launch_from_lot() {
 # de correction à la place de la session prévue, la cause en tête de son Goal, une seule fois par cause : la fois suivante, refus net.
 # La session de correction de ce conflit ne resynchronise pas : elle est là pour le résoudre.
 launch_sync() {
-  local session="$1" lot="$2" f base previous key tab=$'\t'
+  local session="$1" lot="$2" f
   LAUNCH_SESSION="$session"; f="$(correction_file)"
   case "$session:$(tail -1 "$f" 2>/dev/null | cut -f1)" in
     correction:sync-conflict|correction:stack-conflict|correction:sync-conflit|correction:stack-conflit) kv SYNC "ignored (conflict fix session)"; return 0 ;;
@@ -1021,6 +1025,13 @@ launch_sync() {
     conflict) ;;
     *) case "$SYNC_DETAIL" in "modifications non commitées"*|"uncommitted changes"*|"no remote "*) ;; *) warn "lab sync: $SYNC_DETAIL — launch continued" ;; esac; return 0 ;;
   esac
+  launch_sync_conflict "$lot"
+}
+# launch_sync_conflict <fiche> : conflit posé par sync_lane — marque de correction, une seule fois par conflit, puis LAUNCH_SESSION=correction ;
+# un second passage sur le même conflit est refusé. Partagée avec le retour après la mesure (measure_return_step, lib/waiting.sh)
+launch_sync_conflict() {
+  local lot="$1" f base previous key tab=$'\t'
+  f="$(correction_file)"
   kv CONFLICT_FILES "$(printf '%s\n' "$SYNC_FILES" | sync_join)"
   base="$(basename "$lot" .md)"; key="sync-conflict"; [ "${SYNC_KIND:-merge}" != stack ] || key="stack-conflict"
   # clé d'un lab d'avant le lot 09 : « sync-conflit » vaut « sync-conflict », la session de correction ne se rouvre pas
@@ -1260,7 +1271,7 @@ finish_lane() { # lot clos sans suite : conserve le couloir et ouvre la recette
   kv LANE_PHASE "$phase"
   # les fiches du couloir sont enregistrées avant l'essai : la révision des documents relevée par la recette couvre le lot entier (lot 03)
   docs_commit "$WT" "$(basename "$lot" .md) closed, acceptance opened"; NEXT_DOCS_COMMIT=0
-  log "Work finished — to try together. The lane $SLUG stays open."
+  log_wrap "Work finished — to try together. The lane $SLUG stays open."   # 40 colonnes : repliée au mot (lot 01 de fix-mesure-dernier-lot)
   tower_signal "$WT" acceptance "work finished, to try together"   # lot 03 d'autonomie-tours : entrée et notification
   if recette_production; then
     while IFS= read -r line; do log "$line"; done < <(recette_production_note)
@@ -1461,6 +1472,8 @@ cmd_next() {
   watch_refresh_lane            # PR de N fusionnée ou fermée hors de son veilleur : jamais une correction pour elle (lot 02 de close-pr-empilee)
   stack_check                   # lot empilé : CI rouge de N → correction sur N ; N corrigé → retour sur N+1 replacé (lot 14)
   [ "$STACK_SESSION" != 1 ] || return 0   # une session de correction vient d'être ouverte (appel hors ||, errexit intact : lot 17)
+  measure_return_step           # mesure partie de la base, PR du dernier lot en recette : attente de sa fusion, puis retour (lib/waiting.sh)
+  [ "$MEASURE_STOP" != 1 ] || return 0   # appel hors || : errexit reste actif dans tout son corps (lot 17)
   # une ligne d'État écrite dans une variante lisible est réécrite ; l'enregistrement unique de l'ouverture de session la couvre (lot 12).
   # Avec docs=repo, jamais : la fiche est un fichier suivi du couloir, la réécrire le salirait (revue du lot 12) — la lecture tolérante suffit.
   local current; current="$(wt_lot_file "$WT")"
@@ -1550,7 +1563,7 @@ next_lot_in_lane() {
   if [ -n "$(wt_meta "$WT" stacked_on)" ] && [ "$(wt_meta "$WT" stack_branch)" = "$br" ]; then   # profondeur 1 (lot 14)
     die "$br is still stacked on $(wt_meta "$WT" stacked_on) (#$(wt_meta "$WT" stacked_pr)): deliver it first with lab merge $P_NAME $SLUG — the watcher will move and push it after that merge; run lab next again then"
   fi
-  local info num="" state="" pbase="" stack=0
+  local info num="" state="" pbase="" stack=0 aside=0
   info="$(pr_info "$P_ROOT" "$br")"
   if [ -n "$info" ]; then
     num="$(printf '%s' "$info" | cut -f1)"; state="$(printf '%s' "$info" | cut -f2)"; pbase="$(printf '%s' "$info" | cut -f3)"
@@ -1573,13 +1586,21 @@ next_lot_in_lane() {
             stack=1 ;;
           red) ci_red_session "$br"; return 0 ;;
           *)
-            kv NEXT_COMMAND "lab merge $P_NAME $SLUG"
-            die "PR #$num still open: deliver this batch with lab merge $P_NAME $SLUG before continuing" ;;
+            # lot 01 de fix-mesure-dernier-lot : la PR du dernier lot attend sa recette, qui attend la mesure — la mesure due d'un lot
+            # antérieur part de la base et la branche du dernier lot est mise de côté ; sa propre mesure : refus nommé, sans lab merge
+            if [ -n "$due" ] && ! reopen_branch_is "$br" && [ -z "$(wt_meta "$WT" measure_return)" ] && [ "$(lane_last_lot "$WT" "$lot")" = yes ]; then
+              [ "$(basename "$reopen")" != "$(basename "$lot")" ] \
+                || die_wrap "due measure $(wait_summary "$due") belongs to the last batch $(basename "$lot" .md) itself, whose PR #$num waits for the acceptance: it cannot start from the base without that code — measure it on $br, then lab batch wait --done $cn from the lane (or postpone it once: lab batch wait $cn <date> \"<reason>\"); nothing reopened, nothing merged"
+              aside=1
+            else
+              kv NEXT_COMMAND "lab merge $P_NAME $SLUG"
+              die "PR #$num still open: deliver this batch with lab merge $P_NAME $SLUG before continuing"
+            fi ;;
         esac
       fi
     fi
   fi
-  local base start prev_start
+  local base start prev_start prev_kind prev_lot
   base="$(wt_meta "$WT" base)"; base="${base:-$(pr_base)}"
   if [ "$correction" = 1 ]; then
     start="$(git -C "$WT" rev-parse HEAD)"
@@ -1591,8 +1612,11 @@ next_lot_in_lane() {
     git -C "$WT" fetch --quiet "$P_REMOTE" 2>/dev/null || warn "fetch $P_REMOTE impossible (offline?): the branch will start from a possibly stale $P_REMOTE/$base"
     if has_remote_branch "$P_ROOT" "$base" "$P_REMOTE"; then start="$P_REMOTE/$base"; else start="$base"; fi
     prev_start="$(wt_meta "$WT" start)"
+    if [ "$aside" = 1 ]; then   # la PR du dernier lot reste ouverte et intacte : jamais livrée ni vérifiée ici
+      prev_kind="$(wt_meta "$WT" kind)"; kv_value "$WT/.lab/meta" lot || true; prev_lot="$KV_VALUE"   # rendus au retour (measure_return_step)
+      log_wrap "PR #$num of the last batch waits for its acceptance: $br set aside at $(git -C "$WT" rev-parse --short=12 "$br"); the measure starts from $start, without its code. lab next comes back to $br after the merge of the measure."
     # branch_merged conclut lui-même « sans commit » (branche vide déjà contenue dans la base) depuis le lot 11
-    if ! branch_merged "$P_ROOT" "$br" "$P_BASE" "$P_STAGING" "$prev_start"; then
+    elif ! branch_merged "$P_ROOT" "$br" "$P_BASE" "$P_STAGING" "$prev_start"; then
       local refus
       if branch_has_work "$P_ROOT" "$br" "$prev_start"; then
         refus="branch $br not merged (PR ${num:+#$num $state}${num:-none}): the previous session must create then merge its PR before the next batch"
@@ -1609,11 +1633,18 @@ next_lot_in_lane() {
     meta_set "$WT" stacked_on "$br"; meta_set "$WT" stacked_pr "$num"; meta_set "$WT" stack_tip "$start"; meta_set "$WT" stack_branch "$branch"
     kv STACKED_ON "$br"
   fi
+  if [ "$aside" = 1 ]; then   # retour par measure_return_step (lib/waiting.sh), après la fusion de la dernière mesure
+    meta_set "$WT" measure_return "$br"; meta_set "$WT" measure_return_pr "$num"; meta_set "$WT" measure_return_rev "$(git -C "$WT" rev-parse "$br")"
+    # départ, genre et lot du dernier lot : la mesure les remplace, le retour les rend (contrôle de régression de sa livraison)
+    meta_set "$WT" measure_return_start "$prev_start"; meta_set "$WT" measure_return_kind "$prev_kind"; meta_set "$WT" measure_return_lot "$prev_lot"
+  fi
   if [ -n "$reopen" ]; then   # la fiche relue depuis la branche neuve (docs=repo : celle de la base)
     reopen="$(current_lot_file "$(docs_dir "$WT")" "$(lot_bare_slug "$(basename "$reopen" .md)")" "$(wt_lane "$WT")")"; [ -f "$reopen" ] || die "batch file of $branch not found after the switch: $(basename "$(printf '%s' "$due" | cut -f2)")"
     wait_reopen_mark "$reopen" "$cn" "$(rdv_now)"
     kv PROJECT "$P_NAME"; kv LANE "$SLUG"; kv WORKTREE "$WT"; kv BRANCH "$branch"; kv BASE "$start"; kv PREVIOUS "$br"; kv AGENT "$agent"
     kv REOPENED "$(basename "$reopen" .md) $cn"; kv DUE "$(printf '%s' "$due" | cut -f4)"
+    measure_return_set "$WT"   # chaque mesure retenue : le retour exige la fusion de la dernière (measure_return_step)
+    [ -z "$MEASURE_RETURN" ] || { meta_set "$WT" measure_return_from "$branch"; kv RETURN_TO "$MEASURE_RETURN_WHY"; }
     log_wrap "Due measure: $(basename "$reopen" .md) reopened for $cn only ($(printf '%s' "$due" | cut -f5)), before any next batch."
     open_fresh_session "$agent" run "$reopen"; return
   fi
@@ -2118,7 +2149,9 @@ merge_run() {
   [ "$state" = OPEN ] || { kv ACTION none; kv REASON "PR $state"; return; }
   merge_dry_run
   overlap_merge_warn "$WT"
-  if [ "$(lane_last_lot "$WT")" != no ]; then
+  # une branche de mesure chore/<slug>.c<n> est toujours livrée comme un lot intermédiaire : avec les documents hors dépôt, la fiche
+  # de tête rendue par wt_lot_file la ferait prendre pour le dernier lot (lot 01 de fix-mesure-dernier-lot)
+  if ! reopen_branch_is "$br" && [ "$(lane_last_lot "$WT")" != no ]; then
     docs_commit "$WT" acceptance   # la recette écrite par l'agent est versionnée par lab, comme dans lab close (lot 03)
     close_prepare               # dernier lot : recette valide et PR à la révision essayée, avant toute fusion
     delivery_guard; pr_make_ready "$WT" "$num"

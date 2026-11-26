@@ -227,6 +227,81 @@ wait_reopen_mark() {
   lot_set_state "$1" 'in progress'
 }
 
+# ---------- retour après la mesure (lot 01 de fix-mesure-dernier-lot) ----------
+# La PR du dernier lot attend sa recette, qui attend les mesures : la mesure due d'un lot antérieur part de la base (next_lot_in_lane)
+# et la méta du couloir retient measure_return (branche du dernier lot), measure_return_pr, measure_return_rev (sa pointe à la mise
+# de côté), measure_return_start, _kind et _lot (sa méta, rendue au retour) et measure_return_from (la dernière branche de mesure) —
+# clés distinctes de return_to, réservée au lot empilé (stack_check).
+# measure_return_set <wt> : MEASURE_RETURN, MEASURE_RETURN_PR et MEASURE_RETURN_WHY, vides sans retour prévu ; sans processus
+measure_return_set() {
+  MEASURE_RETURN=''; MEASURE_RETURN_PR=''; MEASURE_RETURN_WHY=''
+  kv_value "$1/.lab/meta" measure_return || return 0
+  MEASURE_RETURN="$KV_VALUE"; [ -n "$MEASURE_RETURN" ] || return 0
+  kv_value "$1/.lab/meta" measure_return_pr || true; MEASURE_RETURN_PR="$KV_VALUE"
+  MEASURE_RETURN_WHY="$MEASURE_RETURN (PR #$MEASURE_RETURN_PR, acceptance after the measures)"
+}
+# measure_return_step : lab next, juste après stack_check. Sur la branche de mesure : la session reprend, une autre mesure due s'ouvre
+# (déduction normale, empilée si celle-ci est en file), la fusion attendue est dite (rc 0) ou demandée (lab merge). Fusionnée : retour
+# sur la branche du dernier lot, intacte, puis la base y est fusionnée (sync_lane) avant toute lecture des fiches — une fiche périmée
+# rouvrirait la mesure. MEASURE_STOP=1 : la réponse de lab next est donnée.
+# shellcheck disable=SC2034 # MEASURE_STOP est lu par cmd_next (bin/lab)
+measure_return_step() {
+  local ret pr rev br tip info num lot due from what k
+  MEASURE_STOP=0
+  measure_return_set "$WT"; ret="$MEASURE_RETURN"; [ -n "$ret" ] || return 0
+  pr="$MEASURE_RETURN_PR"; rev="$(wt_meta "$WT" measure_return_rev)"; br="$(branch_name "$WT")"
+  if [ "$br" != "$ret" ]; then
+    reopen_branch_is "$br" || die_wrap "the lane is on $br, neither a measure branch nor $ret, which waits for its acceptance after the measures (measure_return in $WT/.lab/meta): git -C $WT switch <branch>, then run lab next $P_NAME $SLUG again"
+    case "$(lot_state "$(wt_own_lot_file "$WT")")" in planned*|'in progress'*) kv RETURN_TO "$MEASURE_RETURN_WHY"; return 0 ;; esac   # la session de mesure reprend
+    # mesure suivante, une par une : sa réouverture dit RETURN_TO ; celle du dernier lot lui-même (branche <kind>/<slug> du retour)
+    # ne part jamais de la base : elle attend le retour, puis son refus nommé
+    due="$(wait_lane_due "$WT")"
+    if [ -n "$due" ] && [ "$(lot_bare_slug "$(basename "$(printf '%s' "$due" | cut -f2)" .md)")" != "${ret#*/}" ]; then return 0; fi
+    kv RETURN_TO "$MEASURE_RETURN_WHY"
+    with_timeout "${LAB_SYNC_TIMEOUT:-30}" git -C "$WT" fetch --quiet "$P_REMOTE" 2>/dev/null \
+      || die_wrap "return to $ret postponed: offline (fetch of $P_REMOTE failed) — nothing switched; run lab next $P_NAME $SLUG again once online"
+    if ! branch_merged "$P_ROOT" "$br" "$P_BASE" "$P_STAGING" "$(wt_meta "$WT" start)"; then
+      # CI rouge de la mesure : sa session de correction, comme pour un lot intermédiaire (une seule par révision rouge)
+      if [ "$(watch_state "$(watch_file "$br")")" = red ]; then ci_red_session "$br"; MEASURE_STOP=1; return 0; fi
+      info="$(pr_info "$P_ROOT" "$br")"; num="$(printf '%s' "$info" | cut -f1)"; what="${num:+#$num}"; what="${what:-$br}"
+      if [ -f "$(merge_queue_file "$SLUG" "$br")" ] || case "$(watch_state "$(watch_file "$br")")" in armed|waiting) true ;; *) false ;; esac; then
+        kv WAITING_FOR "merge of ${num:+#$num }$br"
+        log_wrap "Measure closed on $br: waiting for the merge of $what; lab next returns to $ret after it, then opens the acceptance of #$pr."
+        MEASURE_STOP=1; return 0
+      fi
+      kv NEXT_COMMAND "lab merge $P_NAME $SLUG"
+      die_wrap "measure closed on $br but not delivered${num:+ (PR #$num)}: deliver it with lab merge $P_NAME $SLUG — lab next returns to $ret after its merge"
+    fi
+    untracked_warn "$WT" "return continues" || die_wrap "uncommitted changes on $br ($(dirty_tracked_list)): commit them before going back to $ret"
+    tip="$(git -C "$WT" rev-parse --verify --quiet "refs/heads/$ret")" || die_wrap "branch $ret not found: it waited for its acceptance after the measures — measure_return kept in $WT/.lab/meta, nothing switched"
+    [ "$tip" = "$rev" ] || die_wrap "$ret moved since it was set aside (${rev:0:12} → ${tip:0:12}): check it; if this move is intended, git -C $WT switch $ret, then run lab next $P_NAME $SLUG again — nothing switched"
+    git -C "$WT" switch --quiet "$ret" || die_wrap "switch to $ret refused: the lane stays on $br"
+    log_wrap "Measure merged: back on $ret (${rev:0:12}); the base is merged into it before the acceptance of #$pr."
+  else
+    # déjà sur la branche du retour (synchro reportée, conflit résolu, ou bascule à la main) : la dernière mesure doit être fusionnée
+    kv RETURN_TO "$MEASURE_RETURN_WHY"
+    from="$(wt_meta "$WT" measure_return_from)"
+    if [ -n "$from" ] && has_local_branch "$P_ROOT" "$from"; then
+      with_timeout "${LAB_SYNC_TIMEOUT:-30}" git -C "$WT" fetch --quiet "$P_REMOTE" 2>/dev/null \
+        || die_wrap "return to $ret postponed: offline (fetch of $P_REMOTE failed) — measure_return kept, nothing reopened; run lab next $P_NAME $SLUG again once online"
+      branch_merged "$P_ROOT" "$from" "$P_BASE" "$P_STAGING" "$(wt_meta "$WT" start)" \
+        || die_wrap "the measure on $from is not merged yet: the return to $ret waits for it — git -C $WT switch $from, deliver it with lab merge $P_NAME $SLUG, then run lab next $P_NAME $SLUG again; measure_return kept"
+    fi
+  fi
+  sync_lane "$WT"; kv SYNC "$SYNC_STATE${SYNC_DETAIL:+ ($SYNC_DETAIL)}"
+  case "$SYNC_STATE" in
+    up-to-date|merged)
+      sync_mark_clear "$WT"
+      # départ, genre et lot du dernier lot rendus : le contrôle de régression de sa livraison couvre tout le lot
+      for k in start kind lot; do kv_value "$WT/.lab/meta" "measure_return_$k" || true; [ -z "$KV_VALUE" ] || meta_set "$WT" "$k" "$KV_VALUE"; done
+      for k in '' _pr _rev _from _start _kind _lot; do meta_unset "$WT" "measure_return$k"; done
+      kv RETURNED "$ret"; return 0 ;;
+    conflict)   # une session de correction, une seule fois pour ce conflit (comme lab launch) ; le retour reste prévu
+      lot="$(wt_lot_file "$WT")"; launch_sync_conflict "$lot"; open_fresh_session "$AGENT" correction "$lot"; MEASURE_STOP=1; return 0 ;;
+  esac
+  die_wrap "return to $ret postponed: $SYNC_DETAIL — measure_return kept, nothing reopened; run lab next $P_NAME $SLUG again"
+}
+
 # ---------- lab wake : l'alarme macOS ----------
 # wake_program → le lab que l'alarme lance : pour une release, le lien stable « current » (une mise à jour garde l'alarme sur la
 # nouvelle version), sinon ce programme lui-même (checkout de développement)

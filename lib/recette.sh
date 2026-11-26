@@ -355,6 +355,8 @@ phase_set() {
   # dernier lot fini, une mesure du couloir attend sa date : ni recette ni fermeture avant elle (lot 02 d'autonomie-tours)
   if [ "$last" = yes ]; then wait_first_set "$1"; if [ -n "$WAIT_FIRST" ]; then LANE_PHASE=waiting; return; fi; fi
   if [ "$last" != yes ] || ! lane_lots_closed "$1" "$lot"; then LANE_PHASE='to clarify'; return; fi
+  # mesure partie de la base, retour prévu (lot 01 de fix-mesure-dernier-lot) : la recette attend le retour sur la branche du dernier lot
+  measure_return_set "$1"; if [ -n "$MEASURE_RETURN" ]; then LANE_PHASE=work; return; fi
   LANE_PHASE='in acceptance'
   [ -r "$lot" ] || return 0
   recette_early_set "$lot"; [ -z "$RECETTE_EARLY" ] || return 0

@@ -27,10 +27,13 @@ doctor_say() {
     if [ "$DOC_REPORT" = 1 ]; then DOC_SAY_W="$(onboard_cols 2>&3)"; else DOC_SAY_W="$(onboard_cols)"; fi
   fi
   w="$DOC_SAY_W"
+  # texte replié lu en entier avant la première écriture : la fin de l'enfant d'une substitution `< <(…)` signalait pendant
+  # l'écriture vers le PTY, et bash sous Linux ne reprend pas un write interrompu (EINTR → ERROR=INTERNAL, release 1.8.1)
+  local wrapped; wrapped="$(onboard_wrap "$w" <<<"$1"; printf x)"; wrapped="${wrapped%x}"; wrapped="${wrapped%$'\n'}"
   while IFS= read -r line || [ -n "$line" ]; do
     while [ "${#line}" -gt "$w" ]; do printf '%s\n' "${line:0:$w}"; line="${line:$w}"; done
     printf '%s\n' "$line"
-  done < <(onboard_wrap "$w" <<<"$1")
+  done <<<"$wrapped"
 }
 doctor_report_fields() {
   local original="$1" suffix

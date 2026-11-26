@@ -2,6 +2,22 @@
 
 Release notes of each published version of Treelab, newest first.
 
+## 1.8.2 — 2026-11-26
+
+**The doctor no longer stops while wrapping its lines on Linux**
+
+- On Linux, lab doctor run in a terminal could stop in the middle of its report with “Diagnosis interrupted”: the line it was wrapping to the terminal width was cut while being written. The text is now fully wrapped before it is written.
+- First release of the content of 1.8.1, whose build stopped on this fault.
+
+## 1.8.1 — 2026-11-26
+
+**A dated measure no longer blocks the trial**
+
+- When the pull request of the last batch waits for your trial, a due measure of an earlier batch starts from the base, without the code not yet accepted; the branch of the last batch is kept aside, untouched.
+- Once the measure is merged, lab next goes back to that branch by itself, merges the base into it and opens the trial: no more loop between the measure, the merge and the trial, nothing to type.
+- During the measure, lab next and lab status say where the lane will come back, and the tower announces the measure to make before the trial.
+- A measure due on the last batch itself is refused with its cause and its remedy, without any merge.
+
 ## 1.8.0 — 2026-11-26
 
 **One task, one session: a few questions, then the agent codes**
