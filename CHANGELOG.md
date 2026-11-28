@@ -2,6 +2,33 @@
 
 Release notes of each published version of Treelab, newest first.
 
+## 1.11.0 — 2026-11-28
+
+**The Treelab app reads your account, sets Ginkgo, exports and erases your data**
+
+- The settings of the Treelab app go through the real lab: lab app account reads the account of this Mac (trial, subscription, renewal or end date, offer) without network and without writing anything, and lab app ginkgo reads and sets the listen mode, speech and quiet hours of Ginkgo.
+- Export your data: lab app data --export copies, as readable text and into a new folder, the account, the settings, your projects and lanes, the Ginkgo log and news, your agreements and the recorded words. Never the license nor the keychain key; any text shaped like a key or a token is replaced by [secret removed].
+- Erase your data: lab app data --erase first reads back what goes and what stays, then, with the token given back within two minutes, erases the Ginkgo log and news, what lab keeps for the app, the account cache and the OpenAI key. Your projects, lanes, batch files, agreements and license stay; it is your gesture, refused to an agent.
+
+## 1.10.0 — 2026-11-28
+
+**Ginkgo starts the way you like and keeps you posted on your whole Mac**
+
+- Three ways to start Ginkgo, chosen from its icon’s menu: on command, by holding ⌥ Space (microphone off between presses), or by hearing its name, recognized on this Mac only: nothing leaves it before it hears its name, and the sound of your other apps is no longer lowered while it waits.
+- One conversation for your whole Mac: lab ginkgo, started with or without a project, knows what waits in each of your projects, answers about each one and acts on the project you name.
+- Ginkgo tells you what waits for you in every project of this Mac, not only in the one it started from.
+- First release of the content of 1.9.0 (sessions start fresh before each action costs too much), whose build had stopped on two tests, now fixed.
+
+## 1.9.0 — 2026-11-27
+
+**Sessions start fresh before each action costs too much**
+
+- Each action sends the whole conversation back to the model: the longer a session, the more each of its actions costs. Above 250,000 tokens of context (context_max, set in ~/.lab/config, 0 turns it off), a Claude batch session is told to update its log and Handoff, then to start fresh with lab next; a message you send it goes to its Handoff first.
+- Each project’s tower starts fresh by itself too: it carries out your message first, finishes the gesture in progress, then hands over to a fresh session in the same tab, asking you nothing, and gets its 30-minute loop back even when its branch conflicts with the base.
+- Batches are sized to close under that threshold, and long outputs (tests, CI logs, wide searches) go to a subagent that returns a short summary; a need on the same subject, even during your trial, becomes one more batch of the same lane, opened with a single command, never a new lane suggested to you.
+- lab top shows the context of each live session, Claude and Codex, marked ! above the threshold, even when its last counter lies far back in its log; lab tower gives each session’s context and names those above it, without acting in their place. After a Claude Code compaction, even while idle, that context and the reminder follow the context left after it: a compacted session is no longer restarted by mistake.
+- lab usage <project> measures the share of tokens sent above the threshold over the last days, from the counters of the Claude journals only, never reading their content.
+
 ## 1.8.2 — 2026-11-26
 
 **The doctor no longer stops while wrapping its lines on Linux**

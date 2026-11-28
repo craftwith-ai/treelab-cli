@@ -11,7 +11,7 @@ claude_hooks_json() {
     PreToolUse:[{matcher:"Bash|Write|Edit",hooks:[{type:"command",command:($h+"/guard-tool.sh"|shellpath),timeout:5}]},
       {matcher:"AskUserQuestion",hooks:[{type:"command",command:($h+"/notify.sh"|shellpath),timeout:5}]}],
     Notification:[{matcher:"permission_prompt|idle_prompt|elicitation_dialog",hooks:[{type:"command",command:($h+"/notify.sh"|shellpath),timeout:5}]}],
-    PostToolUse:[{matcher:"AskUserQuestion",hooks:[{type:"command",command:($h+"/notify.sh"|shellpath),timeout:5}]}],
+    PostToolUse:[{matcher:"*",hooks:[{type:"command",command:($h+"/notify.sh"|shellpath),timeout:5}]}],
     Stop:[{hooks:[{type:"command",command:($h+"/notify.sh"|shellpath),timeout:5}]}],
     UserPromptSubmit:[{hooks:[{type:"command",command:($h+"/notify.sh"|shellpath),timeout:5}]}]
   }}'

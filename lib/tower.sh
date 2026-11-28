@@ -6,6 +6,7 @@
 # crochets Claude (question, autorisation) et par lab next (recette prête, refus) ; dans tous les projets, avec ou sans tour.
 declare -F kv_value >/dev/null || . "${BASH_SOURCE[0]%/*}/kv.sh"
 declare -F snap_mark >/dev/null || . "${BASH_SOURCE[0]%/*}/snapshot.sh"   # instantané de Treelab.app (lot 03 d'app-treelab)
+declare -F context_tokens >/dev/null || . "${BASH_SOURCE[0]%/*}/context.sh"   # contexte des sessions de couloir (lot 03 de contexte-neuf)
 TOWER_LANE=tower
 lane_role() { wt_meta "$1" role; }
 # la marque role=tower vit dans le couloir, que son agent peut écrire : la tour n'est reconnue que si la marque posée par lab tower
@@ -178,18 +179,64 @@ tower_waits_read() {
 # tower_yours : rc 0 si l'attente posée par tower_waits_for est l'affaire de l'utilisateur — une recette sur check: seul ou sur ses
 # mots est l'affaire de la tour ; des captures à montrer attendent son oui (lot 07). La vue de la tour et lab app lisent cette règle
 tower_yours() { case "$TW_WAITS:$TW_EVIDENCE" in acceptance:check|acceptance:words) return 1 ;; you:*|acceptance:*) return 0 ;; esac; return 1; }
-# tower_view [point] : un bloc par couloir hors tour (LANE, WAITS_FOR, WHY, SESSION), puis WAITING_FOR_YOU, sur stderr une phrase repliée ;
+# tower_context <wt> : TW_CONTEXT, le contexte de la session vivante du couloir (lot 03 de contexte-neuf) — none sans session vivante,
+# unknown si son transcript (<couloir>/.lab/transcript, rangé par le crochet SessionStart) manque, ne dit rien ou vient de l'autre
+# outil (un rollout-*.jsonl est de Codex : le chemin laissé par une session Claude d'avant n'est jamais lu pour une session Codex, ni
+# l'inverse) ; TW_AGENT, l'agent du verrou (claude par défaut). Lecture seule : la tour ne fait rien à la place de la session — une
+# session Claude reçoit elle-même le rappel LAB: au-delà du seuil, une session Codex aucun (pas de PostToolUse).
+tower_context() {
+  local t='' kind=claude agent=''
+  TW_CONTEXT=none; TW_AGENT=''; [ "$TW_SESSION" = live ] || return 0
+  TW_CONTEXT=unknown
+  { IFS= read -r t <"$1/.lab/transcript"; } 2>/dev/null || true
+  case "${t##*/}" in rollout-*.jsonl) kind=codex ;; esac
+  kv_value "$1/.lab/session.lock" agent && agent="$KV_VALUE"
+  TW_AGENT="${agent:-claude}"
+  # lot 05 : .lab/transcript absent ou vers un fichier disparu (chemin d'essai resté) → le journal du pid du verrou, Claude seul
+  if [ "$TW_AGENT" = claude ] && { [ -z "$t" ] || [ ! -f "$t" ]; }; then t="$(tower_lock_journal "$1")"; kind=claude; fi
+  [ -n "$t" ] && [ "$TW_AGENT" = "$kind" ] && context_tokens "$t" || return 0
+  TW_CONTEXT="$CONTEXT_TOKENS"
+}
+# tower_lock_journal <wt> : sur stdout le journal Claude de la session qui tient le verrou — <claude>/sessions/<pid>.json porte son
+# sessionId (tenu à jour par Claude Code après /clear et /resume, comme lu par lab top), le journal est <claude>/projects/*/<id>.jsonl ;
+# rien si l'un manque. Lecture seule, aucun processus de plus qu'un sed.
+tower_lock_journal() {
+  local pid sid g ch="${LAB_CLAUDE_HOME:-$HOME/.claude}"
+  kv_value "$1/.lab/session.lock" pid || return 0; pid="$KV_VALUE"
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  [ -f "$ch/sessions/$pid.json" ] || return 0
+  sid="$(LC_ALL=C sed -n 's/.*"sessionId":"\([0-9A-Fa-f-][0-9A-Fa-f-]*\)".*/\1/p' "$ch/sessions/$pid.json" 2>/dev/null | head -n 1)" || sid=''
+  [ -n "$sid" ] || return 0
+  for g in "$ch"/projects/*/"$sid".jsonl; do if [ -f "$g" ]; then printf '%s\n' "$g"; return 0; fi; done
+}
+# tower_ktok <tokens> : 214000 → 214k, 1200000 → 1.2M, 1000000 → 1M (arrondis comme ktok de la vue de lab top)
+tower_ktok() {
+  local d; if [ "$1" -lt 999500 ]; then printf '%sk' $((($1 + 500) / 1000)); return; fi
+  d=$((($1 + 50000) / 100000)); if [ $((d % 10)) = 0 ]; then printf '%sM' $((d / 10)); else printf '%s.%sM' $((d / 10)) $((d % 10)); fi
+}
+# tower_view [point] : un bloc par couloir hors tour (LANE, WAITS_FOR, WHY, SESSION, CONTEXT), puis CONTEXT_MAX, ABOVE_CONTEXT_MAX
+# (couloirs dont la session dépasse le seuil : leur WHY le dit aussi, clé déjà lue par les tours ouvertes) et WAITING_FOR_YOU, sur
+# stderr une phrase repliée ;
 # point (lab tower seul, jamais Ginkgo) : l'onglet main et ses passations, puis la santé de la prod (tower_health), avant LANES ; la
 # phrase de la santé après celle des couloirs
 tower_view() {
-  local wt lane yours="" n=0 s
-  TH_RED=''; TH_SAY=()
+  local wt lane yours="" n=0 s above="" heavy="" k told told_any=""
+  TH_RED=''; TH_SAY=(); context_max_set
   for wt in "$P_ROOT"/.worktrees/*/; do
     [ -d "$wt" ] || continue; wt="${wt%/}"
     ! lane_is_tower "$wt" || continue
     lane="$(wt_lane "$wt")"; n=$((n + 1))
-    tower_waits_for "$wt"
-    kv LANE "$lane"; kv WAITS_FOR "$TW_WAITS"; kv WHY "$TW_WHY"; [ -z "$TW_EVIDENCE" ] || kv EVIDENCE "$TW_EVIDENCE"; kv SESSION "$TW_SESSION"; sep
+    tower_waits_for "$wt"; tower_context "$wt"
+    case "$TW_CONTEXT" in none|unknown) ;; *)
+      if [ "$CONTEXT_MAX" -gt 0 ] && [ "$TW_CONTEXT" -gt "$CONTEXT_MAX" ]; then
+        k="$(tower_ktok "$TW_CONTEXT")"; told='the session is told to hand off and start fresh'
+        if [ "$TW_AGENT" = codex ]; then told='a Codex session gets no reminder'; k="$k, Codex: no reminder"; else told_any=1; fi
+        above="${above:+$above }$lane"; heavy="${heavy:+$heavy, }$lane ($k)"
+        TW_WHY="$TW_WHY — context $(tower_ktok "$TW_CONTEXT") tokens, above context_max $(tower_ktok "$CONTEXT_MAX"): $told, the tower does not step in"
+      fi ;;
+    esac
+    kv LANE "$lane"; kv WAITS_FOR "$TW_WAITS"; kv WHY "$TW_WHY"; [ -z "$TW_EVIDENCE" ] || kv EVIDENCE "$TW_EVIDENCE"; kv SESSION "$TW_SESSION"
+    kv CONTEXT "$TW_CONTEXT"; sep
     ! tower_yours || yours="${yours:+$yours }$lane"
   done
   deploy_queue_status_kv   # file de prod de chaque cible, après les couloirs (lot 05)
@@ -198,8 +245,12 @@ tower_view() {
   # sans aucun appel cmux
   if [ "${1:-}" = point ]; then main_tab_load; main_tab_skill_nudge; main_tab_view point; [ -z "$MT_YOURS" ] || yours="${yours:+$yours }$MT_YOURS"; fi
   [ "${1:-}" != point ] || tower_health || true   # un rouge de santé ne bloque rien, pas même lab tower
+  kv CONTEXT_MAX "$CONTEXT_MAX"; kv ABOVE_CONTEXT_MAX "$above"
   kv LANES "$n"; kv WAITING_FOR_YOU "$yours"   # des couloirs (et main, au point de lab tower) : Ginkgo et la tour la lisent
   if [ -n "$yours" ]; then log_wrap "Waiting for you: $yours."; elif [ -z "$TH_RED" ]; then log_wrap "Nothing waits for you in $P_NAME."; fi
+  # « told » seulement si une session Claude dépasse : une session Codex ne reçoit aucun rappel
+  if [ -n "$told_any" ]; then s='A Claude session is told to hand off and start fresh; the tower does not step in.'; else s='The tower does not step in.'; fi
+  [ -z "$heavy" ] || log_wrap "Above context_max ($(tower_ktok "$CONTEXT_MAX")): $heavy. $s"
   for s in "${TH_SAY[@]+"${TH_SAY[@]}"}"; do log_wrap "$s"; done
   tower_propose_kv
 }

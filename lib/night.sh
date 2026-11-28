@@ -129,13 +129,31 @@ night_words_reason() {
 # par agreement_by_words) tient lieu d'accord de nuit rouge — un seul « oui ferme » suffit, la nuit nommée par lab sans question
 night_order_reason() { printf 'user'"'"'s order to close: "%s", given with the acceptance, red night named by lab' "$AG_SAID"; }
 # night_fix_proof <tête> → « <run> <sha> », rc 0 : la plus récente nuit manuelle (workflow_dispatch) verte du workflow de la nuit
-# rouge, sur une révision qui contient le premier rouge et précède la tête (lot 02 de fix-nuit-2026-11-14). Une lecture gh, aucun
-# fetch : une révision absente du dépôt local n'est l'ancêtre d'aucune tête locale. Sans gh, gh en panne ou rien de valide → rc 1.
+# rouge, sur une révision qui contient le premier rouge et précède la tête (lot 02 de fix-nuit-2026-11-14), qui a joué en vert
+# chaque tâche rouge de la nuit rouge (lot 02 de ci-legere : la nuit manuelle est Linux seule sauf case macos cochée — verte sans
+# macOS, elle ne prouve pas un rouge macOS). Lectures gh : la liste, puis les tâches de la nuit rouge et de chaque candidate ; aucun
+# fetch : une révision absente du dépôt local n'est l'ancêtre d'aucune tête locale. Sans gh, gh en panne, tâches illisibles ou
+# rien de valide → rc 1.
 # shellcheck disable=SC2016 # programme jq littéral
 NIGHT_PROOF_JQ='[ .[] | select(.status == "completed" and .conclusion == "success" and .workflowName == $wf) ]
   | sort_by(.createdAt) | reverse | .[] | "\(.databaseId) \(.headSha)"'
+# night_run_jobs <run> [-R <dépôt>] → « conclusion<TAB>nom » par tâche de la dernière tentative ; une liste vide (startup_failure)
+# est lisible et ne rend rien ; rc ≠ 0 si gh échoue ou si la réponse n'a pas de liste de tâches
+night_run_jobs() {
+  local run="$1" json; shift
+  json="$(with_timeout 20 gh run view "$run" "$@" --json jobs 2>/dev/null)" || return 1
+  printf '%s' "$json" | jq -r '.jobs | if type == "array" then .[] | [(.conclusion // ""), .name] | @tsv else error("no jobs") end' 2>/dev/null
+}
+# night_covers <tâches rouges> <tâches de la candidate> : rc 0 si chaque nom rouge y est conclu success
+night_covers() {
+  local name ok=$'success\t'
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    grep -qxF "$ok$name" <<<"$2" || return 1
+  done <<<"$1"
+}
 night_fix_proof() {
-  local head="$1" wf first s json id sha; local -a rargs=()
+  local head="$1" wf first s json id sha red="" reds="" jobs; local -a rargs=()
   night_red "$P_NAME" && [ -n "$head" ] || return 1
   wf="$(night_get "$P_NAME" workflow)"; first="$(night_get "$P_NAME" first_red_sha)"
   [ -n "$wf" ] && [ -n "$first" ] && has_gh || return 1
@@ -146,6 +164,15 @@ night_fix_proof() {
     [ -n "$sha" ] || continue
     git -C "$P_ROOT" merge-base --is-ancestor "$first" "$sha" 2>/dev/null || continue
     git -C "$P_ROOT" merge-base --is-ancestor "$sha" "$head" 2>/dev/null || continue
+    # tâches rouges de la nuit rouge, lues une fois et seulement devant une candidate : illisibles → aucune preuve
+    if [ -z "$red" ]; then
+      jobs="$(night_run_jobs "$(night_get "$P_NAME" run)" "${rargs[@]+"${rargs[@]}"}")" || return 1
+      reds="$(awk -F '\t' 'NF >= 2 && $1 != "success" && $1 != "skipped" && $1 != "neutral" { print $2 }' <<<"$jobs")"; red=1
+    fi
+    if [ -n "$reds" ]; then
+      jobs="$(night_run_jobs "$id" "${rargs[@]+"${rargs[@]}"}")" || continue
+      night_covers "$reds" "$jobs" || continue
+    fi
     printf '%s %s\n' "$id" "$sha"; return 0
   done < <(printf '%s' "$json" | jq -r --arg wf "$wf" "$NIGHT_PROOF_JQ" 2>/dev/null)
   return 1

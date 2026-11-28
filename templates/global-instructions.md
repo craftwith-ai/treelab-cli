@@ -13,11 +13,11 @@
 - For a choice: measured state, recommendation, cost — one line each. If the request is unclear or an important decision remains doubtful, ask a question.
 
 ## Work cycle
-- One project = one main checkout, no commit on it. One need = one lane, `.worktrees/<lane>` by `lab new` only, never `git worktree`; small fixes join the right open lane. Skill `lab-cli`.
+- One project = one main checkout, no commit on it. One need = one lane, `.worktrees/<lane>` by `lab new` only, never `git worktree`; small fixes join the right open lane; same subject, even in acceptance: one more batch there, never a new lane. Skill `lab-cli`.
 - From `main` or the tower, a vague request triggers `lab new`, then a short `grill-me`: ten questions at most and five follow-ups only if an important decision is missing. The answers are the agreement: verifiable overall goal (masterplan), lane roadmap (treeplan), first batch by `batch-plan` and `use-goal`.
-- One batch = one branch `feat|fix|chore/<slug>` and one session: grill-me on open decisions → `batch-plan` → `batch-run` → `batch-end`. `lab next <project> <lane>` works out the next step (launch, resume, next batch, acceptance); it never merges nor deletes anything.
+- One batch = one branch `feat|fix|chore/<slug>` and one session: grill-me on open decisions → `batch-plan` → `batch-run` → `batch-end`. `lab next <project> <lane>` works out the next step; it never merges nor deletes anything.
 - `better` is available when a batch changes the declared interface (`Interface :` of `AGENTS.md`); the listed screens are still checked for real (`batch-end` §3).
-- Never `/compact`. Heavy context: log and Handoff up to date, then `lab next` opens a fresh session in the same tab. The agent changes between two batches, never in the middle.
+- Never `/compact`. `LAB:` reminder or long session: log, Handoff, `lab next`. Long outputs: a file read by its summary, or a sub-agent. Agent switch: between batches.
 - If the startup context announces `LOCK=ANOTHER LIVE SESSION`, write nothing in this lane.
 
 ## Delivery and quality
@@ -29,6 +29,6 @@
 - Forbidden: `git push --force` on main/staging, `git reset --hard`, `git clean -f`, `git checkout -- .`, `rm -rf` outside the worktree.
 
 ## Docs and context
-- Documents: `docs/masterplan.md` (why) · `docs/treeplans/<lane>.md` (order and intent) · `docs/lots/<lane>/lot-NN-<slug>.md` (Goal, plan, log, Handoff) · `docs/lots/<lane>/CHANGELOG.md`. With `LAB_DOCS=<path>`, they live there, outside the repository. Batch files written in French keep their French headings.
+- Documents: `docs/masterplan.md` (why) · `docs/treeplans/<lane>.md` (order and intent) · `docs/lots/<lane>/lot-NN-<slug>.md` (Goal, plan, log, Handoff) · `docs/lots/<lane>/CHANGELOG.md`. With `LAB_DOCS=<path>`, they live there. Batch files written in French keep their French headings.
 - Lasting rule → `AGENTS.md`, one line · pitfall of a subsystem → project skill · rule tied to files → rule with `paths:` · story or measurement → `docs/` · information derivable from code → nowhere.
 - Budgets: `AGENTS.md` ≤ 80 lines; `CLAUDE.md` = `@AGENTS.md` + ≤ 20 Claude-specific lines.

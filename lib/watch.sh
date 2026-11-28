@@ -108,13 +108,13 @@ watch_arm() {
   watch_spawn "$br"
   kv WATCHER_PID "$(watch_get "$f" pid)"; kv WATCH_LOG "$f.log"
 }
-# watch_stop <fichier> : arrête le veilleur vivant de ce fichier (groupe entier : gh et sleep compris)
+# watch_stop <fichier> [motif] : arrête le veilleur vivant de ce fichier (groupe entier : gh et sleep compris) ; sans motif, un remplacement
 watch_stop() {
   local pid; pid="$(watch_get "$1" pid)"
   case "$(lang_code "$(watch_get "$1" issue)")" in armed|waiting) ;; *) return 0 ;; esac
   pid_alive "$pid" || return 0
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-  log "previous watcher of $(watch_get "$1" branch) (pid $pid) stopped: replaced by this new one"
+  log "previous watcher of $(watch_get "$1" branch) (pid $pid) stopped: ${2:-replaced by this new one}"
 }
 # watch_done <branche> <issue> <détail> : lab merge ou lab close ont livré sur place — l'issue ancienne (rouge…) ne reste pas affichée
 # Couloir déjà retiré (lab merge du dernier lot) : son dossier peut partir avec la tour ou un lab next entre-temps (lot 01 de

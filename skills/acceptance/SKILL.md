@@ -24,7 +24,7 @@ Acceptance covers the result of the whole lane. The last batch is technically cl
 
 ## Fix a piece of feedback
 
-Record the acceptance record before changing batch. Open the fix in the same lane: `lab next <project> <lane> --batch <fix> --kind fix`. Run from the still-live acceptance session, the same command replaces that session in its tab, once the record is recorded.
+Record the acceptance record before changing batch. A need on the same subject as the lane, even one the initial agreement left out, is one more batch of this lane, never a new lane to suggest: `lab next <project> <lane> --batch <slug>` opens it (`fix/<slug>`; `--kind feat` or `chore` when it fits). It opens even when the last batch is stacked on a PR not yet merged: the new batch carries it, nothing is pushed nor merged, and `lab close` delivers both. Run from the still-live acceptance session, the same command replaces that session in its tab, once the record is recorded.
 
 The CLI keeps the unmerged result and adds the batch to the lane's treeplan only. Do not rewrite the Handoff in advance to announce this fix: let the CLI create the batch. The new session applies batch-plan, then batch-run and batch-end. A new acceptance follows the fix.
 

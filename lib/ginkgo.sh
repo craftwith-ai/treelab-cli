@@ -21,7 +21,25 @@ ginkgo_lab() {
   declare -F wake_program >/dev/null || . "$LAB_ROOT/lib/waiting.sh"
   if [ "$(cd "$LAB_HOME/current" 2>/dev/null && pwd -P)" = "$LAB_ROOT" ]; then wake_program; else printf '%s/bin/lab\n' "$LAB_ROOT"; fi
 }
+# lot 06 : le canal de l'app Treelab — le contrat que parle l'app (clé GinkgoProtocol de son Info.plist, vide avant le canal) et son
+# socket (<état de lab>/ginkgo/app.sock, 103 octets au plus : sun_path, jamais tronqué)
+GINKGO_SOCKET_MAX=103
+# Info.plist absent ou illisible : rien, jamais un échec (sed rc 2 sous pipefail arrêtait lab ginkgo status, revue du lot 06)
+ginkgo_app_protocol() { { sed -n 's:.*<key>GinkgoProtocol</key><integer>\([0-9][0-9]*\)</integer>.*:\1:p' "$1/Contents/Info.plist" 2>/dev/null || true; } | head -1; }
+ginkgo_socket() { printf '%s/app.sock\n' "$(ginkgo_dir)"; }
 ginkgo_app_version() { sed -n 's:.*<key>CFBundleShortVersionString</key><string>\([^<]*\)</string>.*:\1:p' "$1/Contents/Info.plist" 2>/dev/null | head -1; }
+# ginkgo_stop : SIGTERM, le départ propre de l'app (annonces rendues à lab, 5 s au plus, notification 2 s, bye au canal) attendu
+# 8 s, puis SIGKILL ; rc 0 arrêtée, 1 encore là (revue du lot 06 : 3 s ne suffisaient pas, la relance se perdait)
+GINKGO_STOP_TENTHS=80
+ginkgo_stop() {
+  local i=0
+  pkill -x Ginkgo >/dev/null 2>&1 || true
+  while pgrep -x Ginkgo >/dev/null 2>&1; do
+    [ "$i" -ne "$GINKGO_STOP_TENTHS" ] || pkill -KILL -x Ginkgo >/dev/null 2>&1 || true   # au-delà de l'adieu : arrêt forcé
+    [ "$i" -lt $((GINKGO_STOP_TENTHS + 20)) ] || return 1                                  # puis 2 s au plus
+    sleep 0.1; i=$((i + 1))
+  done
+}
 # ginkgo_platform : Apple Silicon et macOS 14 ou plus (Info.plist : LSMinimumSystemVersion), sinon refus nommé ; le reste de treelab marche
 ginkgo_platform() {
   local v; [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] \
@@ -39,6 +57,125 @@ ginkgo_key_ok() { (LC_ALL=C; case "$1" in sk-*) ;; *) exit 1 ;; esac; case "$1" 
 ginkgo_source_hash() { "$LAB_ROOT/scripts/ginkgo-build.sh" --hash 2>/dev/null || true; }
 ginkgo_app_hash() { cat "$(ginkgo_app)/Contents/Resources/source-hash" 2>/dev/null || true; }
 
+# ---------- les modes d'écoute (lot 05) ----------
+# ginkgo_listen= de ~/.lab/config : command (par défaut : la conversation s'ouvre au lancement, parole libre), key (⌥ Espace tenue),
+# name (« Ginkgo » entendu sur le Mac seul). Une valeur illisible : command, avertie sur stderr.
+GINKGO_HOTKEY_DEFAULT=option+space
+# ginkgo_listen_read : GINKGO_LISTEN = command, key ou name, vide pour une valeur illisible ; GINKGO_LISTEN_RAW, la valeur lue sans blanc
+# ni majuscule. Sans processus (ginkgo_config_set), sauf une majuscule à baisser : le doctor tient son budget (tests/charge.bats)
+ginkgo_listen_read() {
+  ginkgo_config_set ginkgo_listen; GINKGO_LISTEN_RAW="$GINKGO_CONF"
+  case "$GINKGO_LISTEN_RAW" in
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) GINKGO_LISTEN_RAW="$(printf '%s' "$GINKGO_LISTEN_RAW" | tr '[:upper:]' '[:lower:]')" ;;
+  esac
+  case "$GINKGO_LISTEN_RAW" in ''|command) GINKGO_LISTEN='command' ;; key|name) GINKGO_LISTEN="$GINKGO_LISTEN_RAW" ;; *) GINKGO_LISTEN="" ;; esac
+}
+ginkgo_listen_mode() {
+  ginkgo_listen_read
+  [ -n "$GINKGO_LISTEN" ] || { log_wrap "ginkgo_listen=$GINKGO_LISTEN_RAW in ~/.lab/config is not command, key or name: command is used."; GINKGO_LISTEN='command'; }
+  echo "$GINKGO_LISTEN"
+}
+# ginkgo_hotkey_value : ginkgo_hotkey= en forme canonique « ctrl+option+shift+cmd+<touche> » — la grammaire de Hotkey.parse de l'app :
+# ⌃ ⌥ ⌘ ⇧ (ou ctrl, option, alt, cmd, shift) joints par + ou - ; l'espace ou une lettre demandent ⌃, ⌥ ou ⌘, une touche F1 à F20 peut
+# être seule. Illisible : option+space, averti sur stderr.
+ginkgo_hotkey_value() {
+  local raw t key="" ctrl=0 opt=0 shift=0 cmd=0 fn=0 bad=0 out=""; local -a toks=()
+  raw="$(global_config_get ginkgo_hotkey)"
+  [ -n "$(printf '%s' "$raw" | tr -d '[:space:]')" ] || { echo "$GINKGO_HOTKEY_DEFAULT"; return 0; }
+  # read -a ne développe aucun motif (une valeur « option+* » reste un mot)
+  read -ra toks <<<"$(printf '%s' "$raw" | LC_ALL=C sed 's/⌃/ ctrl /g; s/⌥/ option /g; s/⌘/ cmd /g; s/⇧/ shift /g' | LC_ALL=C tr 'A-Z+-' 'a-z  ')"
+  for t in "${toks[@]+"${toks[@]}"}"; do
+    case "$t" in
+      ctrl|control) ctrl=1 ;; opt|option|alt) opt=1 ;; cmd|command) cmd=1 ;; shift) shift=1 ;;
+      *) if [ -n "$key" ]; then bad=1; break; fi
+         case "$t" in
+           space|[abcdefghijklmnopqrstuvwxyz]) key="$t" ;;
+           f[123456789]|f1[0123456789]|f20) key="$t"; fn=1 ;;
+           *) bad=1; break ;;
+         esac ;;
+    esac
+  done
+  if [ "$bad" = 1 ] || [ -z "$key" ] || { [ "$fn" = 0 ] && [ "$ctrl$opt$cmd" = 000 ]; }; then
+    log_wrap "ginkgo_hotkey=$raw in ~/.lab/config is not ctrl, option or cmd with space or a letter, or a key F1 to F20: $GINKGO_HOTKEY_DEFAULT is used."
+    echo "$GINKGO_HOTKEY_DEFAULT"; return 0
+  fi
+  [ "$ctrl" = 0 ] || out="${out}ctrl+"; [ "$opt" = 0 ] || out="${out}option+"; [ "$shift" = 0 ] || out="${out}shift+"; [ "$cmd" = 0 ] || out="${out}cmd+"
+  echo "$out$key"
+}
+# ginkgo_hotkey_display <canonique> → « ⌥ Space », « ⌃⌥ G », « ⇧⌘ F5 », « F13 » (l'affichage de l'app, ordre d'Apple ⌃ ⌥ ⇧ ⌘)
+ginkgo_hotkey_display() {
+  local m="" k="${1##*+}"
+  case "+$1+" in *+ctrl+*) m="${m}⌃" ;; esac; case "+$1+" in *+option+*) m="${m}⌥" ;; esac
+  case "+$1+" in *+shift+*) m="${m}⇧" ;; esac; case "+$1+" in *+cmd+*) m="${m}⌘" ;; esac
+  case "$k" in space) k=Space ;; *) k="$(printf '%s' "$k" | tr '[:lower:]' '[:upper:]')" ;; esac
+  if [ -n "$m" ]; then printf '%s %s\n' "$m" "$k"; else printf '%s\n' "$k"; fi
+}
+# ginkgo_listen_phrase <mode> [touche canonique] : GINKGO_PHRASE, comment Ginkgo démarre, en quelques mots (doctor) ; sans processus
+# hors du mode touche
+ginkgo_listen_phrase() {
+  # shellcheck disable=SC2034 # GINKGO_PHRASE est lu par doctor_ginkgo (lib/doctor.sh)
+  case "$1" in
+    key) GINKGO_PHRASE="starts while $(ginkgo_hotkey_display "$2") is held" ;;
+    name) GINKGO_PHRASE='starts on its name, heard on this Mac only' ;;
+    *) GINKGO_PHRASE='starts on command' ;;
+  esac
+}
+
+# ginkgo_lock <dossier> : verrou mkdir, LAB_CONFIG_LOCK_TRIES essais de 0,1 s (50), chaque passage compté ; repris seulement d'un
+# processus prouvé mort (pid_dead de lib/lock.sh : kill -0 seul échoue sur un vivant sous bac à sable), ou sans pid depuis plus de
+# 5 s (tué entre mkdir et le pid). rc 1 : tenu par un autre ; rc 2 : le dossier ne peut pas être créé (état non inscriptible), sans
+# boucle (revue du lot 05)
+ginkgo_lock() {
+  local d="$1" i=0 p
+  until mkdir "$d" 2>/dev/null; do
+    if [ ! -d "$d" ]; then mkdir "$d" 2>/dev/null && break; return 2; fi   # relâché entre-temps : une seconde chance, puis refus
+    p="$(cat "$d/pid" 2>/dev/null)" || p=""
+    if { [ -n "$p" ] && pid_dead "$p"; } || { [ -z "$p" ] && [ "$(perl -e 'print time - (stat shift)[9]' "$d" 2>/dev/null || echo 0)" -gt 5 ]; }; then
+      rm -f "$d/pid"; rmdir "$d" 2>/dev/null || true
+    fi
+    i=$((i + 1)); [ "$i" -lt "${LAB_CONFIG_LOCK_TRIES:-50}" ] || return 1; sleep 0.1
+  done
+  printf '%s\n' "$$" >"$d/pid"
+}
+ginkgo_unlock() { rm -f "$1/pid"; rmdir "$1" 2>/dev/null || true; }
+# ginkgo_config_write <clé> <valeur> : la première écriture de ~/.lab/config par lab (lot 05). Sous verrou ($LAB_STATE/config.lock),
+# dans un fichier temporaire du même dossier, puis mv : les autres lignes restent telles quelles et à leur place, la clé est remplacée
+# à la sienne (ses doublons retirés) ou ajoutée à la fin, les droits du fichier sont gardés. Le dépôt git de ~/.lab suit config mais
+# lab n'y commite que des chemins nommés (docs_commit) : l'écriture reste une modification de la copie de travail.
+ginkgo_config_write() {
+  local k="$1" v="$2" f="$LAB_HOME/config" lock="$LAB_STATE/config.lock" tmp mode=644
+  [ ! -L "$f" ] || die "$f is a symbolic link: write $k=$v in it by hand"
+  mkdir -p "$LAB_HOME" "$LAB_STATE"
+  local rc=0; ginkgo_lock "$lock" || rc=$?
+  case "$rc" in
+    0) ;;
+    2) die "cannot take the lock $lock ($LAB_STATE is not writable): nothing changed" ;;
+    *) die "another lab is writing $f: nothing changed, try again in a moment" ;;
+  esac
+  if ! tmp="$(mktemp "$LAB_HOME/.config.tmp.XXXXXXXX")"; then ginkgo_unlock "$lock"; die "cannot write in $LAB_HOME: nothing changed"; fi
+  [ ! -f "$f" ] || mode="$(stat -f %Lp "$f" 2>/dev/null || echo 644)"
+  if [ -f "$f" ]; then
+    awk -v k="$k" -v v="$v" 'index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next } { print } END { if (!done) print k "=" v }' "$f" >"$tmp"
+  else printf '%s=%s\n' "$k" "$v" >"$tmp"; fi
+  if ! { chmod "$mode" "$tmp" && mv -f "$tmp" "$f"; }; then rm -f "$tmp"; ginkgo_unlock "$lock"; die "cannot write $f: nothing changed"; fi
+  ginkgo_unlock "$lock"
+}
+
+# ---------- lab ginkgo listen [command|key|name] ----------
+ginkgo_listen() {
+  [ "$#" -le 1 ] || usage
+  [ "$#" = 1 ] || { kv LISTEN "$(ginkgo_listen_mode)"; return 0; }
+  case "$1" in command|key|name) ;; *) die "unknown listen mode: $1 (command, key or name)" ;; esac
+  ginkgo_config_write ginkgo_listen "$1"
+  kv LISTEN "$1"
+  case "$1" in
+    command) log_wrap "Ginkgo now starts on command: lab ginkgo <project> opens the conversation, then speak freely." ;;
+    key) log_wrap "Ginkgo now listens only while you hold $(ginkgo_hotkey_display "$(ginkgo_hotkey_value)"); the microphone is off otherwise." ;;
+    name) log_wrap "Ginkgo now waits for its name, heard on this Mac only: nothing leaves it before it hears \"Ginkgo\"." ;;
+  esac
+  log_wrap "A running Ginkgo keeps its mode until lab ginkgo <project> opens it again; its menu bar icon changes it at once."
+}
+
 # ---------- lab ginkgo status ----------
 ginkgo_status() {
   local app; app="$(ginkgo_app)"
@@ -46,6 +183,12 @@ ginkgo_status() {
   if ginkgo_key_present; then kv KEY present; else kv KEY absent; fi
   if [ -d "$app" ]; then kv APP "$app"; else kv APP absent; fi
   kv SOURCE "$(ginkgo_source)"
+  kv LISTEN "$(ginkgo_listen_mode)"
+  kv HOTKEY "$(ginkgo_hotkey_value)"
+  # contrat v1.1 (lot 06) : l'app Treelab lit PROTOCOL= avant tout lancement — sans la ligne, « mise à jour de Ginkgo nécessaire »
+  local proto=""; [ ! -d "$app" ] || proto="$(ginkgo_app_protocol "$app")"
+  [ -z "$proto" ] || kv PROTOCOL "$proto"
+  kv SOCKET "$(ginkgo_socket)"
   ginkgo_key_present || log_wrap "No OpenAI key yet: lab ginkgo key openai stores it in the macOS keychain."
 }
 
@@ -71,12 +214,115 @@ ginkgo_key() {
 # ---------- lab ginkgo state <projet> : lecture seule, jamais de tour créée ----------
 ginkgo_state() {
   [ "$#" -le 1 ] || usage
+  [ "${1:-}" != --all ] || { ginkgo_state_all; return 0; }
   local p wt; p="$(resolve_project "${1:-}")"; load_project "$p"
   wt="$(worktree_path "$TOWER_LANE")"
   kv PROJECT "$p"
   if [ -d "$wt" ] && lane_is_tower "$wt"; then kv TOWER present; sep; tower_view; return 0; fi
   kv TOWER absent
   log_wrap "No tower in $p: nothing read, nothing created (lab tower $p creates it)."
+}
+
+# ---------- lab ginkgo state --all : le poste (lot 07) ----------
+# Ginkgo est au-dessus de toutes les conversations : ce qui attend l'utilisateur dans chaque projet du registre. La vue complète de la
+# tour (contexte de chaque session, file de prod) coûtait 22 s pour 15 projets sur le Mac d'Alex (14 s pour 51 couloirs) : ici, ce
+# qu'un couloir attend seulement (tower_waits_for), les couloirs qui attendent l'utilisateur seuls écrits, un projet par processus.
+# ginkgo_state_project <projet> : un bloc PROJECT=, TOWER=present|absent, puis LANE=/WAITS_FOR=/WHY=/EVIDENCE= des couloirs à lui,
+# LANES=, WAITING_FOR_YOU= ; rc ≠ 0 si le projet est illisible (config, checkout disparu)
+ginkgo_state_project() {
+  local wt lane yours="" n=0 aside=""
+  load_project "$1"
+  kv PROJECT "$1"
+  wt="$P_ROOT/.worktrees/$TOWER_LANE"   # worktree_path, sans sous-shell (lot 08)
+  if [ ! -d "$wt" ] || ! lane_is_tower "$wt"; then kv TOWER absent; return 0; fi
+  kv TOWER present
+  for wt in "$P_ROOT"/.worktrees/*/; do
+    [ -d "$wt" ] || continue; wt="${wt%/}"
+    ! lane_is_tower "$wt" || continue
+    n=$((n + 1)); ginkgo_lane_set "$wt" state
+    [ "$GK_YOURS" = 1 ] || continue
+    wt_lane_set "$wt"; lane="$WT_LANE"; yours="${yours:+$yours }$lane"
+    kv LANE "$lane"; kv WAITS_FOR "$TW_WAITS"; kv WHY "$TW_WHY"; [ -z "$TW_EVIDENCE" ] || kv EVIDENCE "$TW_EVIDENCE"
+    # lot 09 : les couloirs que les précisions de la personne mettent de côté, tus dans un résumé (une boîte capturée : question)
+    if [ "${GP_N:-0}" -gt 0 ]; then
+      ginkgo_kind_set "$wt"
+      case "$GK_KIND" in question|permission) [ ! -s "$wt/.lab/waits-question.json" ] || GK_KIND=question ;; esac
+      ginkgo_prec_match "$1" "$lane" "$GK_KIND"; [ "$GK_ASIDE" = 0 ] || aside="${aside:+$aside }$lane"
+    fi
+  done
+  kv LANES "$n"; kv WAITING_FOR_YOU "$yours"; [ "${GP_N:-0}" = 0 ] || kv SET_ASIDE "$aside"
+}
+# ginkgo_state_all : chaque projet dans son processus (sortie dans un fichier), attendu par son pid, puis les blocs dans l'ordre du
+# registre ; un projet illisible donne TOWER=unreadable sans cacher les autres ; rien n'est créé (aucune tour, aucun onglet)
+ginkgo_state_all() {
+  local d p i=0 n=0; local -a pids=()
+  ginkgo_feed_set; ginkgo_prec_load   # lot 09 : lues une fois, héritées par chaque projet
+  d="$(mktemp -d "${TMPDIR:-/tmp}/lab-ginkgo-all.XXXXXXXX")" || die "cannot create a temporary folder: nothing read"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    # die sort du sous-shell qui l'appelle : la lecture a le sien, le repli « illisible » reste dans celui du projet
+    ( ( ginkgo_state_project "$p" ) >"$d/$n" 2>/dev/null || printf 'PROJECT=%s\nTOWER=unreadable\n' "$p" >"$d/$n" ) &
+    pids+=("$!"); n=$((n + 1))
+  done <<<"$(project_names)"
+  for p in "${pids[@]+"${pids[@]}"}"; do wait "$p" || true; done
+  while [ "$i" -lt "$n" ]; do cat "$d/$i"; sep; i=$((i + 1)); done
+  rm -f "$d"/*; rmdir "$d" 2>/dev/null || true
+  kv PROJECTS "$n"; ginkgo_feed_kv; ginkgo_prec_kv
+}
+
+# ---------- le fil de l'app Treelab (lot 08) ----------
+# L'instantané des couloirs ($LAB_STATE/app-snapshot, lib/snapshot.sh et lib/app.sh, couloir app-treelab) est le résumé que lab tient
+# à jour à chaque point d'écriture tant que l'app Treelab en est le lecteur vivant : WAITS_FOR=, WHY=, FOR_YOU= de chaque couloir.
+# Lire un bloc coûte un fichier ; le calculer, la phase du couloir (25 s de processeur pour 17 projets sur le Mac d'Alex, 2026-11-27).
+# Ginkgo le lit seulement : jamais de marque de lecteur, ni de .dead.<pid>, ni d'écrivain lancé.
+# ginkgo_feed_set : GK_FEED, le dossier du fil s'il a un lecteur vivant et la version de ce lab (un autre lab écrit d'autres blocs),
+# sinon vide
+ginkgo_feed_set() {
+  local pid='' v='' mine=''
+  GK_FEED=''
+  declare -F snap_dir_set >/dev/null || . "$LAB_ROOT/lib/snapshot.sh"
+  snap_dir_set
+  { IFS= read -r pid <"$SNAP_DIR/reader"; } 2>/dev/null || return 0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  [ ! -e "$SNAP_DIR/.dead.$pid" ] && snap_pid_alive "$pid" || return 0
+  { IFS= read -r v <"$SNAP_DIR/version"; } 2>/dev/null || true
+  { IFS= read -r mine <"$LAB_ROOT/VERSION"; } 2>/dev/null || true
+  [ -n "$v" ] && [ "$v" = "${mine:-unknown}" ] || return 0
+  # revue du lot 08 : le lecteur inscrit après la dernière réécriture complète (app relancée) lirait le fil figé à l'arrêt de la
+  # précédente ; même seconde acceptée, reader est écrit avant app_snap_full (lib/app.sh)
+  [ -e "$SNAP_DIR/.full.work" ] && [ ! "$SNAP_DIR/reader" -nt "$SNAP_DIR/.full.work" ] || return 0
+  GK_FEED="$SNAP_DIR"
+}
+ginkgo_feed_kv() { if [ -n "${GK_FEED:-}" ]; then kv SOURCE feed; else kv SOURCE computed; fi; }   # SOURCE=feed|computed
+# ginkgo_lane_set <wt> <news|state> : TW_WAITS, TW_WHY, TW_EVIDENCE, TW_PHASE et GK_YOURS (1 : l'affaire de la personne) du couloir
+# du projet chargé — son bloc dans le fil s'il y est, sinon calculés. Le fil ne dit ni preuve ni phase : une recette se lit dans
+# WAITS_FOR=acceptance, une recette passée qui attend la personne dans « closing: » (la vue de la tour les écrit ainsi), et FOR_YOU
+# vaut tower_yours. Calculé, news garde son filtre du lot 03 (une recette sur check: seul est l'affaire de la tour), state tower_yours.
+ginkgo_lane_set() {
+  local f='' line yours='' settled=0
+  [ -z "${GK_FEED:-}" ] || f="$GK_FEED/projects/$P_NAME/lanes/${1##*/}"
+  if [ -n "$f" ] && [ -f "$f" ]; then
+    TW_WAITS=nothing; TW_WHY=''; TW_EVIDENCE=''; TW_PHASE=''
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in WAITS_FOR=*) TW_WAITS="${line#WAITS_FOR=}" ;; WHY=*) TW_WHY="${line#WHY=}" ;; FOR_YOU=*) yours="${line#FOR_YOU=}" ;; esac
+    done <"$f"
+    # revue du lot 08 : une attente déclarée (waits_label, lib/tower.sh) que le couloir a réglée depuis, le bloc pas encore réécrit
+    # par l'écrivain : le couloir calculé, jamais une fausse annonce de blocage
+    case "$TW_WHY" in
+      'question waiting: '*|'permission requested: '*|'lane blocked: '*)
+        kv_value "$1/.lab/waits-for" kind || true; [ -n "$KV_VALUE" ] || settled=1 ;;
+    esac
+    if [ "$settled" = 0 ]; then
+      case "$TW_WAITS:$TW_WHY" in acceptance:*) TW_PHASE='in acceptance' ;; you:closing:*) TW_PHASE='acceptance passed' ;; esac
+      GK_YOURS=0; [ "$yours" != yes ] || GK_YOURS=1
+      return 0
+    fi
+  fi
+  tower_waits_for "$1" --no-session
+  GK_YOURS=0
+  if [ "$2" = news ]; then
+    case "$TW_WAITS:$TW_EVIDENCE" in acceptance:check) ;; you:*|acceptance:*) GK_YOURS=1 ;; esac
+  elif tower_yours; then GK_YOURS=1; fi
 }
 
 # ---------- outils communs (lot 02) ----------
@@ -513,58 +759,124 @@ ginkgo_quiet_now_set() { # <début fin|off> : GINKGO_QUIET, un seul date (l'heur
 # ginkgo_waits : une ligne par attente de la personne, « <clé>\t<couloir>\t<sorte>\t<texte> », dans l'ordre des couloirs — ce que la
 # vue de la tour range dans WAITING_FOR_YOU (une recette sur check: seul est l'affaire de la tour), plus question|permission de la tour
 # Lot 04 de charge-processeur : couloir, attente et motif lus sans sous-shell, verrou de session non lu — mêmes lignes.
-ginkgo_waits() {
+# Lot 08 : un seul programme par lecture, quel que soit le nombre de couloirs — ginkgo_waits_raw écrit les champs de chaque attente
+# (séparés par NUL), ginkgo_waits_finish (un perl) en tire empreintes, QID et question des boîtes, mêmes clés que printf | shasum -a 256
+# | cut -c1-16 ; le texte reste brut sur une ligne, nettoyé par words_clean à l'annonce seule (NEW_n_TEXT). Mesuré sur le Mac d'Alex le
+# 2026-11-27 : une dizaine de programmes par couloir, 8 s de processeur par lecture pour 103 attentes, relue toutes les 30 s.
+ginkgo_waits() { ginkgo_waits_raw | ginkgo_waits_finish; }
+# ginkgo_kind_set <wt> : GK_KIND, la sorte d'attente d'un couloir à toi, après ginkgo_lane_set — celle que déclare .lab/waits-for
+# (question, permission, blocked : GK_DECLARED=1), sinon celle de sa phase (recette, fermeture, blocage) ; la même pour news et pour
+# les précisions de state --all (lot 09)
+ginkgo_kind_set() {
+  kv_value "$1/.lab/waits-for" kind || true; GK_KIND="$KV_VALUE"; GK_DECLARED=1
+  case "$GK_KIND" in question|permission|blocked) return 0 ;; esac
+  GK_DECLARED=0
+  case "$TW_PHASE" in 'in acceptance') GK_KIND=acceptance ;; 'acceptance passed') GK_KIND=closing ;; *) GK_KIND=blocked ;; esac
+}
+# ginkgo_waits_raw : par attente, six champs terminés par NUL — <préfixe><couloir>, couloir, sorte, jeton, texte, boîte (fichier de la
+# question capturée, vide sans elle)
+ginkgo_waits_raw() {
   local wt lane kind tok text q
   for wt in "$P_ROOT"/.worktrees/*/; do
     [ -d "$wt" ] || continue; wt="${wt%/}"; wt_lane_set "$wt"; lane="$WT_LANE"
     case "$lane" in ''|.*|*[!A-Za-z0-9._-]*) continue ;; esac
+    # l'adieu (--only-forgotten) : les seuls couloirs des attentes rendues, tour comprise
+    if [ -n "${GK_ONLY:-}" ] && ! ginkgo_has "$GK_ONLY" "${GK_KEY_PREFIX:-}$lane"; then continue; fi
     kv_value "$wt/.lab/waits-for" kind || true; kind="$KV_VALUE"
     if lane_is_tower "$wt"; then
       case "$kind" in question|permission) ;; *) continue ;; esac
       kv_value "$wt/.lab/waits-for" at || true; tok="at=$KV_VALUE"; kv_value "$wt/.lab/waits-for" why || true; text="$KV_VALUE"
     else
-      tower_waits_for "$wt" --no-session
-      case "$TW_WAITS:$TW_EVIDENCE" in acceptance:check) continue ;; you:*|acceptance:*) ;; *) continue ;; esac
-      case "$kind" in
-        question|permission|blocked) kv_value "$wt/.lab/waits-for" at || true; tok="at=$KV_VALUE"; kv_value "$wt/.lab/waits-for" why || true; text="$KV_VALUE" ;;
-        *)   # la phase seule : son motif, sans date, fait l'empreinte ; le texte de la sorte est dit par Ginkgo
-          case "$TW_PHASE" in 'in acceptance') kind=acceptance ;; 'acceptance passed') kind=closing ;; *) kind=blocked ;; esac
-          tok="why=$TW_WHY"; text="" ;;
-      esac
+      ginkgo_lane_set "$wt" news   # lot 08 : le bloc du fil s'il est vivant, sinon calculé
+      [ "$GK_YOURS" = 1 ] || continue
+      ginkgo_kind_set "$wt"; kind="$GK_KIND"
+      if [ "$GK_DECLARED" = 1 ]; then
+        kv_value "$wt/.lab/waits-for" at || true; tok="at=$KV_VALUE"; kv_value "$wt/.lab/waits-for" why || true; text="$KV_VALUE"
+      else tok="why=$TW_WHY"; text=""; fi   # la phase seule : son motif, sans date, fait l'empreinte ; le texte de la sorte est dit par Ginkgo
     fi
     # une boîte capturée (lot 02) a pour clé son QID : la Notification d'autorisation que Claude Code envoie pendant la boîte
     # réécrit l'attente (permission, nouvelle date) sans en faire une nouvelle (essai réel du 2026-11-20 : annoncée deux fois)
-    case "$kind" in
-      question|permission)
-        if q="$(ginkgo_box "$wt")"; then
-          kind=question; tok="qid=$(ginkgo_qid "$q")"; text="$(jq -r '.questions[0].question // empty' "$q" 2>/dev/null || true)"
-        fi ;;
-    esac
-    printf '%s|%s|%s\t%s\t%s\t%s\n' "$lane" "$kind" "$(printf '%s' "$tok" | shasum -a 256 | cut -c1-16)" "$lane" "$kind" \
-      "$(printf '%s' "$text" | words_clean "$GINKGO_NEWS_TEXT_MAX")"
+    q=''; case "$kind" in question|permission) q="$wt/.lab/waits-question.json"; [ -s "$q" ] || q='' ;; esac
+    printf '%s\0%s\0%s\0%s\0%s\0%s\0' "${GK_KEY_PREFIX:-}$lane" "$lane" "$kind" "$tok" "$text" "$q"
   done
+}
+# ginkgo_waits_finish : les champs de ginkgo_waits_raw → « <préfixe><couloir>|<sorte>|<empreinte>\t<couloir>\t<sorte>\t<texte> ».
+# Une boîte dont .questions est une liste non vide (celle que lab écrit, tower.sh) : sorte question, jeton qid=<16 premiers hex du
+# sha256 du fichier> (ginkgo_qid), texte sa première question, fins de ligne finales retirées comme $(jq -r …) ; sinon la sorte, le
+# jeton et le texte de l'attente. Empreinte : 16 premiers hex du sha256 du jeton, en octets. Retours à la ligne, retours chariot et
+# tabulations du texte rendus en espaces, le premier pas de words_clean.
+# shellcheck disable=SC2016 # du perl : ses $ ne sont pas du shell
+GINKGO_WAITS_PL='use strict; no warnings; use Digest::SHA qw(sha256_hex); use JSON::PP ();
+my $js = JSON::PP->new->utf8; $/ = "\0";
+while (1) {
+  my @f; for (1 .. 6) { my $x = <STDIN>; last unless defined $x; chomp $x; push @f, $x; }
+  last unless @f == 6;
+  my ($head, $lane, $kind, $tok, $text, $box) = @f;
+  if ($box ne "" && open(my $fh, "<:raw", $box)) {
+    my $raw = do { local $/; <$fh> }; close $fh;
+    my $d = eval { $js->decode($raw) };
+    if (ref $d eq "HASH" && ref $d->{questions} eq "ARRAY" && @{$d->{questions}}) {
+      my $q = $d->{questions}[0]; $q = ref $q eq "HASH" ? $q->{question} : undef;
+      $kind = "question"; $tok = "qid=" . substr(sha256_hex($raw), 0, 16);
+      $text = (defined $q && !ref $q) ? $q : ""; utf8::encode($text); $text =~ s/\n+\z//;
+    }
+  }
+  $text =~ tr/\n\r\t/   /;
+  print "$head|$kind|", substr(sha256_hex($tok), 0, 16), "\t$lane\t$kind\t$text\n";
+}'
+ginkgo_waits_finish() { perl -e "$GINKGO_WAITS_PL" 2>/dev/null || true; }
+# ginkgo_waits_all : les attentes de tout le poste (lot 08), la clé préfixée de son projet (<projet>|<couloir>|<sorte>|<empreinte>),
+# chaque projet dans son processus comme state --all ; un projet illisible n'en donne aucune et ne cache pas les autres ; un seul
+# ginkgo_waits_finish pour tout le poste, sur les champs des projets dans l'ordre du registre
+ginkgo_waits_all() {
+  local d p n=0; local -a pids=() files=()
+  d="$(mktemp -d "${TMPDIR:-/tmp}/lab-ginkgo-news.XXXXXXXX")" || die "cannot create a temporary folder: nothing read"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if [ -n "${GK_ONLY:-}" ]; then case $'\n'"$GK_ONLY" in *$'\n'"$p|"*) ;; *) continue ;; esac; fi   # --only-forgotten
+    ( ( load_project "$p"; GK_KEY_PREFIX="$p|"; ginkgo_waits_raw ) >"$d/$n" 2>/dev/null || : >"$d/$n" ) &
+    pids+=("$!"); files+=("$d/$n"); n=$((n + 1))
+  done <<<"$(project_names)"
+  for p in "${pids[@]+"${pids[@]}"}"; do wait "$p" || true; done
+  [ "$n" = 0 ] || cat "${files[@]}" | ginkgo_waits_finish
+  rm -f "$d"/*; rmdir "$d" 2>/dev/null || true
 }
 ginkgo_has() { case $'\n'"$1"$'\n' in *$'\n'"$2"$'\n'*) return 0 ;; esac; return 1; }   # <liste, une par ligne> <élément>
 ginkgo_drop() { local k; while IFS= read -r k; do if [ -n "$k" ] && ! ginkgo_has "$2" "$k"; then printf '%s\n' "$k"; fi; done <<<"$1"; }
 ginkgo_news() {
   [ "$#" -ge 2 ] || usage
-  local p="$1" open="" base=0 forget=""; shift
+  local p="$1" open="" base=0 forget="" only=0; shift
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --open) [ "$#" -ge 2 ] || usage; case "$2" in yes|no) open="$2" ;; *) usage ;; esac; shift 2 ;;
       --baseline) base=1; shift ;;
       --forget) [ "$#" -ge 2 ] || usage; case "$2" in ''|*[!A-Za-z0-9._\|-]*) usage ;; esac; forget="$forget$2"$'\n'; shift 2 ;;
+      --only-forgotten) only=1; shift ;;
       *) usage ;;
     esac
   done
   if [ "$base" = 1 ]; then [ -z "$open" ] && [ -z "$forget" ] || usage; else [ -n "$open" ] || usage; fi
-  project_exists "$p" || die "unknown project: $p"
-  load_project "$p"
+  # revue du lot 08 : l'adieu de Ginkgo (--only-forgotten) ne relit que les couloirs des annonces non dites, GK_ONLY leurs paires
+  # <projet>|<couloir> ; avec --all, --open et au moins un --forget seulement
+  GK_ONLY=''
+  if [ "$only" = 1 ]; then
+    [ "$p" = --all ] && [ -n "$open" ] && [ -n "$forget" ] || usage
+    local fk
+    while IFS= read -r fk; do
+      if [ -n "$fk" ] && ! ginkgo_has "$GK_ONLY" "${fk%|*|*}"; then GK_ONLY="$GK_ONLY${fk%|*|*}"$'\n'; fi
+    done <<<"$forget"
+  fi
+  # lot 08 : --all, tout le poste — mémoire du poste ($LAB_STATE/ginkgo/news), clés préfixées du projet, NEW_n_PROJECT=, SOURCE= ;
+  # news <projet> garde sa mémoire et sa sortie du lot 03
+  local all_mode=0 where="in $p"
+  if [ "$p" = --all ]; then all_mode=1; where="on this computer"
+  else project_exists "$p" || die "unknown project: $p"; load_project "$p"; fi
   # la mémoire de ce qui a été dit à la personne : un agent qui la viderait ferait taire une attente (revue de sécurité du lot)
   ginkgo_human news
   local speak range quiet f cur told="" held="" line key all="" fresh="" kept="" say="" recap="" channel=none keep_held=""
   ginkgo_speak_mode_set; speak="$GINKGO_SPEAK"; ginkgo_quiet_range_set; range="$GINKGO_RANGE"; ginkgo_quiet_now_set "$range"; quiet="$GINKGO_QUIET"
-  f="$LAB_STATE/$p/ginkgo/news"
+  ginkgo_feed_set
+  if [ "$all_mode" = 1 ]; then f="$(ginkgo_dir)/news"; else f="$LAB_STATE/$p/ginkgo/news"; fi
   # sa mémoire en une lecture du shell, les valeurs comme sed -n 's/^told=//p' les rendait (fins de ligne finales retirées)
   if [ -f "$f" ] && [ -r "$f" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
@@ -574,17 +886,37 @@ ginkgo_news() {
     while [ "${held%$'\n'}" != "$held" ]; do held="${held%$'\n'}"; done
   fi
   [ -z "$forget" ] || { told="$(ginkgo_drop "$told" "$forget")"; held="$(ginkgo_drop "$held" "$forget")"; }
-  cur="$(ginkgo_waits)"
+  if [ "$all_mode" = 1 ]; then cur="$(ginkgo_waits_all)"; else cur="$(ginkgo_waits)"; fi
+  # lot 09 : les précisions de la personne — une attente mise de côté n'est ni dite ni retenue, ni notée vue (annoncée une fois la
+  # précision levée ou échue ; déjà dite, elle le reste) ; même la nuit : dite pendant les heures calmes (_n), le reste retenu (_d)
+  local aside=0 rest wl wk wp kept_n="" kept_d="" fresh_n="" fresh_d=""
+  ginkgo_prec_load
   # chaque attente présente : déjà dite ou vue, retenue cette nuit, ou nouvelle ; les clés absentes sont oubliées
   while IFS= read -r line; do
-    [ -n "$line" ] || continue; key="${line%%$'\t'*}"; all="$all$key"$'\n'
+    [ -n "$line" ] || continue; key="${line%%$'\t'*}"
+    GK_ASIDE=0; GK_NIGHT=0
+    if [ "$GP_N" -gt 0 ]; then
+      rest="${line#*$'\t'}"; wl="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"; wk="${rest%%$'\t'*}"
+      wp="$p"; [ "$all_mode" = 0 ] || wp="${key%%|*}"
+      ginkgo_prec_match "$wp" "$wl" "$wk"
+    fi
+    if [ "$GK_ASIDE" = 1 ]; then
+      if ginkgo_has "$told" "$key"; then all="$all$key"$'\n'; else aside=$((aside + 1)); fi
+      continue
+    fi
+    all="$all$key"$'\n'
     if ginkgo_has "$told" "$key"; then continue; fi
-    if ginkgo_has "$held" "$key"; then kept="$kept$line"$'\n'; elif [ "$base" = 0 ]; then fresh="$fresh$line"$'\n'; fi
+    if ginkgo_has "$held" "$key"; then
+      kept="$kept$line"$'\n'; if [ "$GK_NIGHT" = 1 ]; then kept_n="$kept_n$line"$'\n'; else kept_d="$kept_d$line"$'\n'; fi
+    elif [ "$base" = 0 ]; then
+      fresh="$fresh$line"$'\n'; if [ "$GK_NIGHT" = 1 ]; then fresh_n="$fresh_n$line"$'\n'; else fresh_d="$fresh_d$line"$'\n'; fi
+    fi
   done <<<"$cur"
   if [ "$base" = 1 ]; then keep_held="$kept"   # une relance de nuit garde ce qui attend le récapitulatif (revue du lot)
   elif [ "$speak" = never ]; then :
   elif [ "$open" = yes ]; then say="$kept$fresh"; [ -z "$say" ] || channel=voice   # heures calmes comprises : la personne a ouvert
   elif [ "$speak" = conversation ]; then :   # vue conversation fermée : jamais annoncée plus tard
+  elif [ "$quiet" = yes ] && [ -n "$kept_n$fresh_n" ]; then say="$kept_n$fresh_n"; keep_held="$kept_d$fresh_d"; channel=notify   # même la nuit
   elif [ "$quiet" = yes ]; then say="$fresh"; keep_held="$kept$fresh"; [ -z "$fresh" ] || channel=hold
   elif [ -n "$kept" ]; then recap="$kept$fresh"; channel=notify   # premier passage après la plage : un seul récapitulatif
   else say="$fresh"; [ -z "$fresh" ] || channel=notify; fi
@@ -596,9 +928,20 @@ ginkgo_news() {
     [ -n "$k" ] || continue
     if ginkgo_has "$held_keys" "$k"; then out="${out}held=$k"$'\n'; else out="${out}told=$k"$'\n'; fi
   done <<<"$all"
+  # --only-forgotten : les couloirs non relus gardent leur mémoire telle quelle
+  if [ -n "$GK_ONLY" ]; then
+    while IFS= read -r k; do
+      if [ -n "$k" ] && ! ginkgo_has "$GK_ONLY" "${k%|*|*}"; then out="${out}told=$k"$'\n'; fi
+    done <<<"$told"
+    while IFS= read -r k; do
+      if [ -n "$k" ] && ! ginkgo_has "$GK_ONLY" "${k%|*|*}"; then out="${out}held=$k"$'\n'; fi
+    done <<<"$held"
+  fi
   [ -d "${f%/*}" ] || mkdir -p "${f%/*}"
   ( umask 077; printf '%s' "$out" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f" ) || die "cannot write $f: nothing announced"
   kv SPEAK "$speak"; kv QUIET "$quiet"; kv CHANNEL "$channel"
+  [ "$all_mode" = 0 ] || ginkgo_feed_kv
+  [ "$GP_N" = 0 ] || kv ASIDE "$aside"   # lot 09 : les attentes que les précisions taisent (jamais dites avant)
   local n=0 r=0 i lane kind text
   # les lignes non vides, comme grep -c . (chaque ligne porte au moins sa clé)
   while IFS= read -r line; do [ -z "$line" ] || n=$((n + 1)); done <<<"$say"
@@ -606,19 +949,182 @@ ginkgo_news() {
   kv NEW "$n"; i=0
   while IFS=$'\t' read -r key lane kind text; do
     [ -n "$key" ] || continue; i=$((i + 1))
-    kv "NEW_${i}_LANE" "$lane"; kv "NEW_${i}_KIND" "$kind"; kv "NEW_${i}_TEXT" "$text"; kv "NEW_${i}_KEY" "$key"
+    [ "$all_mode" = 0 ] || kv "NEW_${i}_PROJECT" "${key%%|*}"
+    # le texte brut de ginkgo_waits, nettoyé ici seulement : une annonce, pas chaque couloir à chaque lecture (lot 08)
+    kv "NEW_${i}_LANE" "$lane"; kv "NEW_${i}_KIND" "$kind"
+    kv "NEW_${i}_TEXT" "$(printf '%s' "$text" | words_clean "$GINKGO_NEWS_TEXT_MAX")"; kv "NEW_${i}_KEY" "$key"
   done <<<"$say"
   kv RECAP "$r"; i=0
   while IFS=$'\t' read -r key lane kind text; do
-    [ -n "$key" ] || continue; i=$((i + 1)); kv "RECAP_${i}_LANE" "$lane"; kv "RECAP_${i}_KEY" "$key"
+    [ -n "$key" ] || continue; i=$((i + 1)); [ "$all_mode" = 0 ] || kv "RECAP_${i}_PROJECT" "${key%%|*}"; kv "RECAP_${i}_LANE" "$lane"; kv "RECAP_${i}_KEY" "$key"
   done <<<"$recap"
   case "$channel" in
-    voice) log_wrap "$n new for you in $p: Ginkgo says it out loud." ;;
-    notify) if [ "$r" -gt 0 ]; then log_wrap "Quiet hours over: $r still wait for you in $p, in one notification."
-            else log_wrap "$n new for you in $p: a Ginkgo notification."; fi ;;
-    hold) log_wrap "$n new for you in $p, held for the end of the quiet hours." ;;
-    *) [ "$base" = 0 ] || log_wrap "What waits now in $p is seen: only what comes next is announced." ;;
+    voice) log_wrap "$n new for you $where: Ginkgo says it out loud." ;;
+    notify) if [ "$r" -gt 0 ]; then log_wrap "Quiet hours over: $r still wait for you $where, in one notification."
+            else log_wrap "$n new for you $where: a Ginkgo notification."; fi ;;
+    hold) log_wrap "$n new for you $where, held for the end of the quiet hours." ;;
+    *) [ "$base" = 0 ] || log_wrap "What waits now $where is seen: only what comes next is announced." ;;
   esac
+}
+
+# ---------- lab ginkgo precision : les précisions de la personne (lot 09) ----------
+# Ce qu'Alex dit à Ginkgo — « ignore X », « seulement X », « même la nuit pour X » — rangé à un seul endroit, $LAB_STATE/ginkgo/
+# precisions, une ligne par précision : <id> <sorte> <projet> <couloir> <attente> <échéance epoch|never> <mots dits>,
+# séparés par des tabulations, « - » pour un champ vide (read fond les tabulations voisines). Une précision couvre une attente quand
+# chacun de ses champs posés (projet, couloir, sorte d'attente) est le sien ; news l'applique aux annonces, state --all aux réponses.
+# Grill-me du 2026-11-28 : rangée tout de suite et redite par Ginkgo ; jusqu'à contre-ordre sans durée ; écrite par la personne seule.
+GINKGO_PREC_SAID_MAX=200   # octets des mots dits gardés avec une précision
+# shellcheck disable=SC2016 # du perl : ses $ ne sont pas du shell
+GINKGO_PREC_TIME_PL='use POSIX (); my ($y, $mo, $d, $h, $mi) = $ARGV[0] =~ /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)$/ or exit 1;
+my $e = POSIX::mktime(0, $mi, $h, $d, $mo - 1, $y - 1900, 0, 0, -1); defined $e or exit 1;
+POSIX::strftime("%Y-%m-%dT%H:%M", localtime $e) eq $ARGV[0] or exit 1; print "$e\n";'
+# ginkgo_prec_load : GP_N et les tableaux GP_ID, GP_KIND, GP_PROJ, GP_LANE, GP_WAIT, GP_UNTIL, GP_SAID des précisions en
+# cours — une échue (échéance atteinte) ou une ligne illisible est sautée ; GP_NOW, l'heure de la lecture (LAB_NOW_EPOCH en test)
+ginkgo_prec_load() {
+  local f id kind pj ln wt un said
+  GP_N=0; GP_ID=(); GP_KIND=(); GP_PROJ=(); GP_LANE=(); GP_WAIT=(); GP_UNTIL=(); GP_SAID=()
+  GP_NOW="${LAB_NOW_EPOCH:-}"; [ -n "$GP_NOW" ] || GP_NOW="$(exec date +%s)"
+  f="$(ginkgo_dir)/precisions"
+  [ -f "$f" ] && [ -r "$f" ] || return 0
+  while IFS=$'\t' read -r id kind pj ln wt un said || [ -n "$id" ]; do
+    case "$id" in ''|*[!0-9]*) continue ;; esac
+    case "$kind" in ignore|only|night) ;; *) continue ;; esac
+    case "$un" in never) ;; ''|*[!0-9]*) continue ;; *) [ "$un" -gt "$GP_NOW" ] || continue ;; esac
+    [ "$pj" != - ] || pj=''; [ "$ln" != - ] || ln=''; [ "$wt" != - ] || wt=''; [ "${said:--}" != - ] || said=''
+    GP_ID[GP_N]="$id"; GP_KIND[GP_N]="$kind"; GP_PROJ[GP_N]="$pj"; GP_LANE[GP_N]="$ln"; GP_WAIT[GP_N]="$wt"
+    GP_UNTIL[GP_N]="$un"; GP_SAID[GP_N]="$said"; GP_N=$((GP_N + 1))
+  done <"$f"
+}
+# ginkgo_prec_match <projet> <couloir> <sorte> : GK_ASIDE=1 quand les précisions mettent l'attente de côté (un ignore la couvre, ou
+# des only existent et aucun ne la couvre : plusieurs only s'ajoutent), GK_NIGHT=1 quand un night la couvre et qu'elle n'est pas de
+# côté (ignore l'emporte) ; sans sous-shell, appelée pour chaque attente de chaque lecture
+ginkgo_prec_match() {
+  local i=0 only=0 in_only=0 night=0
+  GK_ASIDE=0; GK_NIGHT=0
+  while [ "$i" -lt "$GP_N" ]; do
+    [ "${GP_KIND[i]}" != only ] || only=1
+    if { [ -z "${GP_PROJ[i]}" ] || [ "${GP_PROJ[i]}" = "$1" ]; } && { [ -z "${GP_LANE[i]}" ] || [ "${GP_LANE[i]}" = "$2" ]; } \
+      && { [ -z "${GP_WAIT[i]}" ] || [ "${GP_WAIT[i]}" = "$3" ]; }; then
+      case "${GP_KIND[i]}" in ignore) GK_ASIDE=1 ;; only) in_only=1 ;; night) night=1 ;; esac
+    fi
+    i=$((i + 1))
+  done
+  if [ "$only" = 1 ] && [ "$in_only" = 0 ]; then GK_ASIDE=1; fi
+  if [ "$GK_ASIDE" = 0 ] && [ "$night" = 1 ]; then GK_NIGHT=1; fi
+}
+# ginkgo_prec_write : les précisions chargées réécrites d'un coup, sauf celles dont la sorte vaut « - » (retirées) ; échues et lignes
+# illisibles, jamais chargées, disparaissent du fichier
+ginkgo_prec_write() {
+  local f i=0 out=""
+  f="$(ginkgo_dir)/precisions"
+  while [ "$i" -lt "$GP_N" ]; do
+    if [ "${GP_KIND[i]}" != - ]; then
+      out="$out${GP_ID[i]}"$'\t'"${GP_KIND[i]}"$'\t'"${GP_PROJ[i]:--}"$'\t'"${GP_LANE[i]:--}"$'\t'"${GP_WAIT[i]:--}"
+      out="$out"$'\t'"${GP_UNTIL[i]}"$'\t'"${GP_SAID[i]:--}"$'\n'
+    fi
+    i=$((i + 1))
+  done
+  [ -d "${f%/*}" ] || mkdir -p "${f%/*}"
+  ( umask 077; printf '%s' "$out" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f" ) || die "cannot write $f: nothing stored"
+}
+ginkgo_prec_time() { if [ "$1" = never ]; then echo never; else date -r "$1" +%Y-%m-%dT%H:%M; fi; }   # heure locale du Mac (TZ)
+# ginkgo_prec_kv : NOW= et WEEKDAY= (heure locale, pour « jusqu'à demain matin »), PRECISIONS=, puis par précision
+# PRECISION_n_ID=, _KIND=, _PROJECT=, _LANE=, _WAIT= (les champs posés seuls), _UNTIL=<AAAA-MM-JJTHH:MM>|never, _SAID=
+ginkgo_prec_kv() {
+  local i=0 n
+  kv NOW "$(ginkgo_prec_time "$GP_NOW")"; kv WEEKDAY "$(LC_ALL=C exec date -r "$GP_NOW" +%A)"; kv PRECISIONS "$GP_N"
+  while [ "$i" -lt "$GP_N" ]; do
+    n=$((i + 1))
+    kv "PRECISION_${n}_ID" "${GP_ID[i]}"; kv "PRECISION_${n}_KIND" "${GP_KIND[i]}"
+    [ -z "${GP_PROJ[i]}" ] || kv "PRECISION_${n}_PROJECT" "${GP_PROJ[i]}"
+    [ -z "${GP_LANE[i]}" ] || kv "PRECISION_${n}_LANE" "${GP_LANE[i]}"
+    [ -z "${GP_WAIT[i]}" ] || kv "PRECISION_${n}_WAIT" "${GP_WAIT[i]}"
+    kv "PRECISION_${n}_UNTIL" "$(ginkgo_prec_time "${GP_UNTIL[i]}")"
+    [ -z "${GP_SAID[i]}" ] || kv "PRECISION_${n}_SAID" "${GP_SAID[i]}"
+    i=$((i + 1))
+  done
+}
+ginkgo_precision() {
+  [ "$#" -ge 1 ] || usage
+  local sub="$1"; shift
+  case "$sub" in
+    list) [ "$#" = 0 ] || usage; ginkgo_prec_load; ginkgo_prec_kv ;;
+    set) ginkgo_prec_set "$@" ;;
+    remove) ginkgo_prec_remove "$@" ;;
+    *) usage ;;
+  esac
+}
+# ginkgo_prec_set <ignore|only|night> [--project p] [--lane l] [--wait w] [--for <N>m|h|d | --until <AAAA-MM-JJTHH:MM>]
+# [--said <mots>] [--id <n>] : ID=, CHANGED=added|updated, la précision rangée ; même sorte et même cible : mise à jour
+ginkgo_prec_set() {
+  [ "$#" -ge 1 ] || usage
+  local kind="$1" pj='' ln='' wt='' dur='' until='' said='' id='' un=never n i hit=-1 max=0 changed=added
+  case "$kind" in ignore|only|night) ;; *) usage ;; esac
+  shift
+  while [ "$#" -gt 0 ]; do
+    [ "$#" -ge 2 ] || usage
+    case "$1" in
+      --project) pj="$2" ;; --lane) ln="$2" ;; --wait) wt="$2" ;; --for) dur="$2" ;; --until) until="$2" ;; --said) said="$2" ;;
+      --id) id="$2" ;;
+      *) usage ;;
+    esac
+    shift 2
+  done
+  [ -z "$dur" ] || [ -z "$until" ] || usage
+  # une précision fait taire des annonces : la voix de la personne seule, jamais l'agent d'un couloir (comme la mémoire de news)
+  ginkgo_human precision
+  [ -z "$ln" ] || [ -n "$pj" ] || die "a lane needs its project (--project): nothing stored"
+  [ -n "$pj$wt" ] || die "a precision needs a project, a lane or a kind of wait (--project, --lane, --wait): nothing stored"
+  if [ -n "$pj" ]; then project_exists "$pj" || die "unknown project: $pj — nothing stored"; fi
+  [ -z "$ln" ] || ginkgo_lane "$pj" "$ln" "nothing stored"
+  case "$wt" in ''|question|permission|blocked|acceptance|closing) ;;
+    *) die "unknown kind of wait: $wt — question, permission, blocked, acceptance or closing; nothing stored" ;; esac
+  case "$id" in ''|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) die "no precision $id: lab ginkgo precision list gives their ID=" ;; esac
+  ginkgo_prec_load
+  if [ -n "$dur" ]; then
+    n="${dur%[mhd]}"
+    case "$n:${#n}" in [1-9]*:[1-6]) case "$n" in *[!0-9]*) n='' ;; esac ;; *) n='' ;; esac
+    [ -n "$n" ] && [ "$n" != "$dur" ] \
+      || die "--for $dur: a number of minutes (m), hours (h) or days (d), as 30m, 2h or 3d — nothing stored"
+    case "$dur" in *m) un=$((GP_NOW + n * 60)) ;; *h) un=$((GP_NOW + n * 3600)) ;; *) un=$((GP_NOW + n * 86400)) ;; esac
+  elif [ -n "$until" ]; then
+    un="$(perl -e "$GINKGO_PREC_TIME_PL" "$until" 2>/dev/null)" && [ -n "$un" ] \
+      || die "--until $until: a local time YYYY-MM-DDTHH:MM, as 2026-11-29T09:00 — nothing stored"
+    [ "$un" -gt "$GP_NOW" ] || die "--until $until is already past (now $(ginkgo_prec_time "$GP_NOW")): nothing stored"
+  fi
+  said="$(printf '%s' "$said" | words_clean "$GINKGO_PREC_SAID_MAX" | tr -s ' ')"; said="${said# }"; said="${said% }"
+  i=0
+  while [ "$i" -lt "$GP_N" ]; do
+    [ "${GP_ID[i]}" -le "$max" ] || max="${GP_ID[i]}"
+    if [ -n "$id" ]; then [ "${GP_ID[i]}" != "$id" ] || hit="$i"
+    elif [ "${GP_KIND[i]}:${GP_PROJ[i]}:${GP_LANE[i]}:${GP_WAIT[i]}" = "$kind:$pj:$ln:$wt" ]; then hit="$i"; fi
+    i=$((i + 1))
+  done
+  [ -z "$id" ] || [ "$hit" -ge 0 ] || die "no precision $id: lab ginkgo precision list gives their ID="
+  if [ "$hit" -ge 0 ]; then changed=updated; id="${GP_ID[hit]}"; else hit="$GP_N"; id=$((max + 1)); GP_N=$((GP_N + 1)); fi
+  GP_ID[hit]="$id"; GP_KIND[hit]="$kind"; GP_PROJ[hit]="$pj"; GP_LANE[hit]="$ln"; GP_WAIT[hit]="$wt"; GP_UNTIL[hit]="$un"
+  GP_SAID[hit]="$said"
+  ginkgo_prec_write
+  kv ID "$id"; kv CHANGED "$changed"; kv KIND "$kind"
+  [ -z "$pj" ] || kv PROJECT "$pj"; [ -z "$ln" ] || kv LANE "$ln"; [ -z "$wt" ] || kv WAIT "$wt"
+  kv UNTIL "$(ginkgo_prec_time "$un")"
+  log_wrap "Precision $id $changed: Ginkgo applies it to what it announces and to its answers."
+}
+# ginkgo_prec_remove <id>|--all : REMOVED=<nombre> ; une précision inconnue est refusée, rien de retiré
+ginkgo_prec_remove() {
+  [ "$#" = 1 ] || usage
+  local i=0 n=0
+  case "$1" in --all|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; -*) usage ;; *) die "no precision $1: lab ginkgo precision list gives their ID=" ;; esac
+  ginkgo_human precision
+  ginkgo_prec_load
+  while [ "$i" -lt "$GP_N" ]; do
+    if [ "$1" = --all ] || [ "${GP_ID[i]}" = "$1" ]; then GP_KIND[i]=-; n=$((n + 1)); fi
+    i=$((i + 1))
+  done
+  [ "$1" = --all ] || [ "$n" -gt 0 ] || die "no precision $1: lab ginkgo precision list gives their ID="
+  ginkgo_prec_write
+  kv REMOVED "$n"
+  log_wrap "$n precision(s) removed: Ginkgo announces again what they set aside."
 }
 
 # ---------- lab ginkgo [projet] : lance l'app sur ce projet ----------
@@ -629,12 +1135,27 @@ ginkgo_build() {
   "$b" --output "${LAB_GINKGO_APP_DIR:-$(ginkgo_dir)}" --scratch "$(ginkgo_dir)/build" >&2 || die "Ginkgo.app build failed: see the output above"
 }
 ginkgo_launch() {
-  [ "$#" -le 1 ] || usage
-  local p app hash; p="$(resolve_project "${1:-}")"; load_project "$p"
+  # --background (lot 06) : lancé sans conversation ni micro en mode commande (l'écoute du nom en mode nom), pour l'app Treelab
+  local bg=0 a; local -a rest=()
+  for a in "$@"; do case "$a" in --background) bg=1 ;; -*) usage ;; *) rest+=("$a") ;; esac; done
+  [ "${#rest[@]}" -le 1 ] || usage
+  set -- "${rest[@]+"${rest[@]}"}"
+  # lot 07 : Ginkgo est au-dessus de toutes les conversations — un projet (argument, ou le dossier courant) n'est que son point de
+  # départ (FOCUS=) ; hors de tout projet, il part de tout le poste (--project vide, FOCUS=none)
+  local p="" app hash sock where
+  if [ -n "${1:-}" ]; then p="$(resolve_project "$1")"; load_project "$p"
+  elif project_from_cwd_set "$PWD"; then p="$FOUND_PROJECT"; load_project "$p"; fi
+  where="${p:-all projects}"
+  sock="$(ginkgo_socket)"
+  if [ "$(byte_len "$sock")" -gt "$GINKGO_SOCKET_MAX" ]; then
+    local why; why="socket path of $(byte_len "$sock") bytes, beyond $GINKGO_SOCKET_MAX (sun_path): $sock — never truncated; set a shorter LAB_STATE_DIR"
+    [ "$bg" = 0 ] || die "$why: nothing launched"
+    warn "$why: Ginkgo starts without the channel of the Treelab app"
+  fi
   ginkgo_platform
   if ! ginkgo_key_present; then
     # premier lancement (lot 04) : dans un terminal, la clé est demandée masquée et rangée, puis l'app s'ouvre ; ailleurs, refus
-    [ -t 0 ] || die "no OpenAI key in the keychain: lab ginkgo key openai stores it once, then lab ginkgo $p"
+    [ -t 0 ] || die "no OpenAI key in the keychain: lab ginkgo key openai stores it once, then lab ginkgo${p:+ $p}"
     log_wrap "Ginkgo answers with your own OpenAI API key, asked once and stored in the macOS keychain."
     ginkgo_key openai
   fi
@@ -646,19 +1167,37 @@ ginkgo_launch() {
     if [ ! -d "$app" ] || { [ -n "$hash" ] && [ "$hash" != "$(ginkgo_app_hash)" ]; }; then ginkgo_build; kv BUILT yes; fi
     [ -d "$app" ] || die "Ginkgo.app not found after its build: $app"
   fi
-  # une seule app à la fois : celle d'un autre projet se ferme (micro et connexion fermés avec elle)
-  pkill -x Ginkgo >/dev/null 2>&1 || true
-  local i=0; while pgrep -x Ginkgo >/dev/null 2>&1 && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done   # sinon macOS réactive l'ancienne
+  # une seule app à la fois : celle d'un autre projet se ferme (micro et connexion fermés avec elle) ; sinon macOS réactive l'ancienne
+  ginkgo_stop || die "the running Ginkgo did not stop, even forced: nothing launched; quit it from its menu bar icon"
+  # lot 05 : le mode d'écoute et la touche, lus une fois (un seul avertissement pour une valeur illisible)
+  local listen hotkey; listen="$(ginkgo_listen_mode)"; hotkey="$(ginkgo_hotkey_value)"
   # l'app relance lab : même registre, même état que cette commande (comme launch_registry et l'alarme de lab wake)
   local -a env=(--env "PATH=$PATH" --env "LAB_HOME=$LAB_HOME")
   [ -z "${LAB_PROJECTS_DIR:-}" ] || env+=(--env "LAB_PROJECTS_DIR=$LAB_PROJECTS_DIR")
   [ -z "${LAB_STATE_DIR:-}" ] || env+=(--env "LAB_STATE_DIR=$LAB_STATE_DIR")
   [ -z "${CMUX_SOCKET_PATH:-}" ] || env+=(--env "CMUX_SOCKET_PATH=$CMUX_SOCKET_PATH")
   [ -z "${CMUX_SOCKET:-}" ] || env+=(--env "CMUX_SOCKET=$CMUX_SOCKET")
+  local -a extra=(); [ "$bg" = 0 ] || extra+=(--background)
   open "${env[@]}" -a "$app" --args --project "$p" --lab "$(ginkgo_lab)" --log "$(ginkgo_dir)/ginkgo.log" \
-    --model "$(global_config_get ginkgo_model)" --lang "$(lab_lang_detect)" >/dev/null 2>&1 || die "macOS refused to open $app"
-  kv PROJECT "$p"; kv APP "$app"; kv LAUNCHED yes; kv LOG "$(ginkgo_dir)/ginkgo.log"
-  log_wrap "Ginkgo is listening for $p: speak freely; say stop (or use its menu bar icon) to close the microphone."
+    --model "$(global_config_get ginkgo_model)" --lang "$(lab_lang_detect)" --listen "$listen" --hotkey "$hotkey" \
+    --socket "$sock" "${extra[@]+"${extra[@]}"}" >/dev/null 2>&1 \
+    || die "macOS refused to open $app"
+  [ -z "$p" ] || kv PROJECT "$p"
+  kv FOCUS "${p:-none}"; kv APP "$app"; kv LAUNCHED yes; kv LOG "$(ginkgo_dir)/ginkgo.log"; kv LISTEN "$listen"; kv SOCKET "$sock"
+  if [ "$bg" = 1 ]; then
+    kv BACKGROUND yes
+    case "$listen" in
+      command) log_wrap "Ginkgo runs in the background for $where: no conversation and no microphone until the Treelab app opens it (lab ginkgo${p:+ $p} opens it too)." ;;
+      key) log_wrap "Ginkgo runs in the background for $where: hold $(ginkgo_hotkey_display "$hotkey") while you speak; the microphone is off otherwise." ;;
+      name) log_wrap "Ginkgo runs in the background for $where and waits for its name, heard on this Mac only: nothing leaves it before." ;;
+    esac
+    return 0
+  fi
+  case "$listen" in
+    key) log_wrap "Ginkgo is ready for $where: hold $(ginkgo_hotkey_display "$hotkey") while you speak, release it for the answer; the microphone is off otherwise." ;;
+    name) log_wrap "Ginkgo waits for its name in $where: say \"Ginkgo, …\" in one breath. This Mac alone hears the name: nothing leaves it before." ;;
+    *) log_wrap "Ginkgo is listening for $where: speak freely; say stop (or use its menu bar icon) to close the microphone." ;;
+  esac
 }
 
 # ---------- lab uninstall : les gestes Ginkgo (lot 04) ----------
@@ -676,6 +1215,7 @@ ginkgo_uninstall_plan() {   # <keep yes|no> [alone]
   [ "$running$keep${2:-}" != noyesalone ] || return 0
   [ "$running" = no ] || printf 'stop\tStop Ginkgo, running now (its microphone and its connection close with it).\n'
   printf 'microphone\tForget the microphone permission of Ginkgo (tccutil reset Microphone %s).\n' "$GINKGO_BUNDLE"
+  printf 'speech\tForget the speech recognition permission of Ginkgo (tccutil reset SpeechRecognition %s).\n' "$GINKGO_BUNDLE"
   if [ "$keep" = yes ]; then
     [ "$dir$key" = nono ] || printf 'kept\tKept with --keep-state: the OpenAI key and %s.\n' "$(ginkgo_dir)"
     return 0
@@ -690,12 +1230,13 @@ ginkgo_uninstall_apply() {
   while IFS=$'\t' read -r g m; do
     case "$g" in
       stop)
-        pkill -x Ginkgo >/dev/null 2>&1 || true
-        i=0; while pgrep -x Ginkgo >/dev/null 2>&1 && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-        if pgrep -x Ginkgo >/dev/null 2>&1; then log_wrap 'Ginkgo did not stop: quit it from its menu bar icon.'; else log_wrap 'Ginkgo stopped.'; fi ;;
+        if ginkgo_stop; then log_wrap 'Ginkgo stopped.'; else log_wrap 'Ginkgo did not stop: quit it from its menu bar icon.'; fi ;;
       microphone)   # sans entrée connue de macOS, tccutil répond non nul : rien à oublier
         if tccutil reset Microphone "$GINKGO_BUNDLE" >/dev/null 2>&1; then log_wrap 'Microphone permission of Ginkgo forgotten.'
         else log_wrap 'Microphone permission of Ginkgo: nothing to forget (tccutil found no entry).'; fi ;;
+      speech)   # lot 05 : le mode nom (reconnaissance vocale d'Apple sur le Mac seul)
+        if tccutil reset SpeechRecognition "$GINKGO_BUNDLE" >/dev/null 2>&1; then log_wrap 'Speech recognition permission of Ginkgo forgotten.'
+        else log_wrap 'Speech recognition permission of Ginkgo: nothing to forget (tccutil found no entry).'; fi ;;
       key)
         security delete-generic-password -s "$GINKGO_SERVICE" -a "$GINKGO_ACCOUNT" >/dev/null 2>&1 || true
         if ginkgo_key_present; then log_wrap "The OpenAI key is still in the keychain ($GINKGO_SERVICE): remove it in Keychain Access."
@@ -716,6 +1257,7 @@ cmd_ginkgo() {
   [ "${#A[@]}" = 0 ] || set -- "${A[@]}"
   case "${1:-}" in
     status) shift; [ "$#" = 0 ] || usage; ginkgo_status ;;
+    listen) shift; ginkgo_listen "$@" ;;
     key) shift; ginkgo_key "$@" ;;
     state) shift; ginkgo_state "$@" ;;
     tell) shift; ginkgo_tell "$@" ;;
@@ -725,6 +1267,8 @@ cmd_ginkgo() {
     close) shift; ginkgo_close "$@" ;;
     reply) shift; ginkgo_reply "$@" ;;
     news) shift; ginkgo_news "$@" ;;
+    precision) shift; ginkgo_precision "$@" ;;
+    --background) ginkgo_launch "$@" ;;
     -*) usage ;;
     *) ginkgo_launch "$@" ;;
   esac

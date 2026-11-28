@@ -71,6 +71,7 @@ LAB_MODULES=(
   snapshot
   sync
   tower
+  usage
   watch
   words
 )
@@ -163,12 +164,23 @@ usage: lab <command> [options]
          ; a VM session blocked on "blocked: need <need>: <detail>" comes back alone: run reopened on the Mac, need remembered
          ; last nightly CI of the base red: NIGHT=red: <summary>, NIGHT_FIX=lab new <project> fix-nuit-<date> --kind fix
   next   [project] <lane> --batch <slug> [--kind feat|fix|chore] [--title <text>]          legacy form: imposes the next batch
-  ginkgo [project]   opens Ginkgo, the spoken conversation with the tower of the project (macOS app, OpenAI key):
-         Ginkgo.app comes with treelab (Apple Silicon, macOS 14 or later); the first launch in a terminal asks for
-         a missing key; a checkout builds the app from its sources (BUILT=yes); then APP=, LAUNCHED=yes, LOG=
-  ginkgo status      PROVIDER=, KEY=present|absent (never the key itself), APP=<path>|absent, SOURCE=release|checkout
+  ginkgo [project] [--background]   opens Ginkgo, the spoken conversation with every tower of this computer (macOS app,
+         OpenAI key); a project, named or that of the current folder, is only where it starts (FOCUS=, none outside any
+         project): Ginkgo.app comes with treelab (Apple Silicon, macOS 14 or later); the first launch in a terminal
+         asks for a missing key; a checkout builds the app from its sources (BUILT=yes); then APP=, LAUNCHED=yes, LOG=,
+         SOCKET= ; --background: no conversation and no microphone in command mode (its name listened for in name mode),
+         for the Treelab app, which drives it through that local socket (BACKGROUND=yes; ready: the distributed
+         notification dev.treelab.ginkgo.ready) ; a socket path beyond 103 bytes is refused, never truncated
+  ginkgo status      PROVIDER=, KEY=present|absent (never the key itself), APP=<path>|absent, SOURCE=release|checkout,
+         LISTEN=command|key|name, HOTKEY=<keys> (option+space by default), PROTOCOL=1 when the app speaks the
+         channel contract v1 of the Treelab app (no line before it), SOCKET=<path of its local socket>
+  ginkgo listen [command|key|name]   how Ginkgo starts, LISTEN= ; command (default): speak freely once it opens ;
+         key: hold ginkgo_hotkey= while you speak ; name: say "Ginkgo", heard on this Mac only ; with a mode, writes
+         ginkgo_listen= in ~/.lab/config (other lines kept), as the menu of its icon does
   ginkgo key openai  stores the OpenAI API key in the macOS keychain: typed hidden, or read on stdin; KEY=stored
   ginkgo state [project]   read only: TOWER=present and the tower view, or TOWER=absent; nothing is created
+  ginkgo state --all   read only, every project of this computer: PROJECT=, TOWER=present|absent|unreadable, the lanes
+         waiting for you (LANE=, WAITS_FOR=, WHY=), LANES=, WAITING_FOR_YOU= ; then PROJECTS=
   ginkgo tell <project> <lane> <text>   delivers the text to the agent of that lane of the project
          (cmux agent message, sent from Ginkgo): TOLD=, TARGET=; unknown lane, tower or lane without a tab refused
   ginkgo question <project> <lane>   what the lane asks, word for word: its question box (WAITS=box, QID=, QUESTION_n=,
@@ -185,6 +197,20 @@ usage: lab <command> [options]
          NEW_n_KIND=, NEW_n_TEXT=, NEW_n_KEY=, RECAP=, RECAP_n_LANE=, RECAP_n_KEY= ; --forget: a spoken news the app
          could not say is new again ; ginkgo_speak= and ginkgo_quiet= in ~/.lab/config
   ginkgo news <project> --baseline   what waits now is seen and never announced (Ginkgo at launch)
+  ginkgo news --all --open yes|no [--forget <key>]... [--only-forgotten]   the same for every project of this
+         computer, read in the lane feed of the Treelab app while it runs (SOURCE=feed), computed otherwise
+         (SOURCE=computed) ; --only-forgotten, with --forget: only the lanes of the news given back are read again,
+         as Ginkgo does when it closes ; NEW_n_PROJECT=, keys <project>|<lane>|<kind>|<hash>
+  ginkgo news --all --baseline   what waits now on this computer is seen and never announced (Ginkgo at launch)
+  ginkgo precision set ignore|only|night [--project <project>] [--lane <lane>] [--wait <kind>] [--for <n>m|h|d]
+         [--until <YYYY-MM-DDTHH:MM>] [--said <words>] [--id <n>]   a precision said to Ginkgo: set aside (ignore, all
+         but only) or said even in quiet hours (night), for a project, a lane of it and/or a kind of wait (question,
+         permission, blocked, acceptance, closing), kept until removed or the time given (local time) ; the same kind
+         and target is updated, --id replaces one: ID=, CHANGED=added|updated ; set and remove: the user only
+  ginkgo precision list   NOW=, WEEKDAY=, PRECISIONS=, PRECISION_n_ID=, _KIND=, _PROJECT=, _LANE=, _WAIT=, _UNTIL=, _SAID=
+         ; news --all and news <project> leave out what they set aside (ASIDE=), state --all gives SET_ASIDE= per
+         project, then the precisions and NOW=
+  ginkgo precision remove <id>|--all   REMOVED= ; what it set aside is announced again
   app lanes [project [lane…]]   read only, for Treelab.app: per lane outside the tower PROJECT=, LANE=, WAITS_FOR=,
          WHY=, SESSION=, BATCH=, BATCH_STATE=, FOR_YOU=yes|no and its paths to watch (WATCH=, WATCH_ENTRIES=); per
          project ROOT=, LANES=, WAITING=, TERMINAL_APP=, TERMINAL_SOURCE=project|global|cmux|fork|none; then
@@ -198,6 +224,26 @@ usage: lab <command> [options]
          (ACTION=workspace), through the cmux socket or, when it refuses the caller, the cmux AppleScript: WAY=socket or
          WAY=applescript, and APP= the driven app; never starts an agent, a session or a tab. terminal_app= (path of a
          .app) in the project config, else in ~/.lab/config, makes lab drive that app (the Treelab fork of cmux) instead
+  app account   read only, for the settings of Treelab.app (account contract v1.1): PROTOCOL=1, SIGNED_IN=no, ACTIVATION=
+         key|none, EMAIL=, ROLE=, PLAN=trial|subscription|lifetime|unknown|none, PERIOD=, STATE=trial|active|ended|
+         unknown|none, TRIAL_DAYS_LEFT=, RENEWS= or ENDS= (YYYY-MM-DD), SEATS=, CHECKED= (UTC), WATCH= (the rights cache
+         rewritten by lab update and lab subscribe), then OFFER_* from the offer file of the server shipped with lab;
+         from the license of this Mac and that cache only: no network, nothing written. Refusals of the contract: rc 2
+  app ginkgo [--listen command|key|name] [--speak always|conversation|never] [--quiet HH:MM-HH:MM|off]   reads or
+         writes the Ginkgo settings of ~/.lab/config: LISTEN=, SPEAK=, QUIET=, APPLIES=now (speak, quiet) or next-open
+         (listen: taken when Ginkgo opens again); a wrong value: rc 2, REASON=invalid, nothing written; ~/.lab/config
+         not writable (link, lock held, read-only folder): rc 2, REASON=unwritable
+  app signin --email <address> · app signout --everywhere   the account commands of the contract: rc 2,
+         REASON=unsupported until accounts exist; nothing sent
+  app data --export <folder>   a readable copy of the data of this Mac in a new folder <folder>/treelab-export-
+         YYYYMMDD-HHMMSS (EXPORTED=): account, settings, lanes, Ginkgo log and news, agreements and words; no network,
+         never the license nor the keychain, each known key or token shape replaced by [secret removed]; folder missing or not
+         writable: rc 2, REASON=unwritable; a secret shape left (a file name): rc 2, REASON=secret, nothing exported
+  app data --erase [--confirm <token>]   a gesture of the person, refused to an agent (rc 2, REASON=agent): first
+         READBACK=, TOKEN=, EXPIRES_IN=120, nothing erased; then, the right token in time (one try, else REASON=token):
+         Ginkgo stopped if it runs (else REASON=busy), its log and news, the app snapshot, the account cache and the
+         OpenAI key erased, ERASED=yes; lab, projects, lanes, batch files, agreements, words, license and settings stay;
+         something left: ERASED=partial, LEFT=, rc 2, REASON=partial
   plan   [project]           overview of the lanes, recomputed at display
   list   [project]
   status [project] [lane]    with a lane: the project, that lane and its overlaps only
@@ -207,6 +253,9 @@ usage: lab <command> [options]
          Treelab (BLOCK=FAMILY), what to cut, why and what it implies (BLOCK=CUT), sessions asleep (BLOCK=HIBERNATED);
          --cut <pid|family|idle|lane-done> acts (BLOCK=RESULT), --wake <tab> resumes, --explain asks claude
          why; --fast: resident memory, acceptance of lanes not reread; idle threshold top_idle_hours= (24)
+  usage  <project> [--days N | --from <date> [--to <date>]]  share of the tokens sent above context_max, read in the
+         counters of the Claude journals of this Mac (7 days by default): SHARE_ABOVE, TOKENS, TOKENS_ABOVE, CALLS;
+         subagents apart (SUBAGENT_*); read-only
   sysmon   one collection pass for the menu-bar modules: six KEY=value blocks (BLOCK=CPU|MEM|DISK|NET|BATTERY|TEMP)
          from macmon (usage P/E, GPU, power, temps, fans) and native tools; top 5 consumers tied to project and lane;
          no macmon: TEMP and power absent, other modules intact. Read-only, readable view on stderr
@@ -270,8 +319,9 @@ usage: lab <command> [options]
          [--region r] [--service s]   writes the deploy./probe./include. block from a template; target already declared → refused
   close  [project] <lane> [--confirm <lane>] [--retire <sha>…] [--night-red-ok <reason>]   closes after acceptance and explicit
          agreement; fresh base checked again before the merge (conflict, regression outside the lane → named refusal)
-         last nightly CI of the base red → refused unless a proof of fix (green manual run of that workflow containing the first
-         red, ancestor of the head) or --night-red-ok: dated agreement committed in the acceptance section
+         last nightly CI of the base red → refused unless a proof of fix (green manual run of that workflow that replayed each
+         red job green, containing the first red, ancestor of the head) or --night-red-ok: dated agreement committed in the
+         acceptance section
          PR already merged and only the acceptance section after it → summary delivered by a dedicated PR (SUMMARY=#n), then removal;
          project with a tower: run by the tower or the user, refused to a lane agent; on the user's words read by lab
          (agreement via=words) the lane agent or the tower closes without --confirm (CLOSED_BY=words); the tower without --confirm
@@ -1022,7 +1072,13 @@ launch_sync() {
   kv SYNC "$SYNC_STATE${SYNC_DETAIL:+ ($SYNC_DETAIL)}"
   case "$SYNC_STATE" in
     up-to-date|merged) sync_mark_clear "$WT"; return 0 ;;
-    conflict) ;;
+    conflict) # la tour n'a aucun lot à corriger : sa session neuve garde sa boucle (lot 06 de contexte-neuf, recette du 2026-11-27),
+      # fusion annulée seulement ; git merge --abort échoué (not-cancelled) : session de correction comme un couloir ordinaire
+      if [ "$session" = tower ] && [ "${SYNC_KIND:-merge}" = merge ]; then
+        kv CONFLICT_FILES "$(printf '%s\n' "$SYNC_FILES" | sync_join)"
+        warn "$SYNC_DETAIL: the tower keeps its 30-minute loop, its lane intact (merge cancelled); resolve it in $WT when no gesture is in progress"
+        return 0
+      fi ;;
     *) case "$SYNC_DETAIL" in "modifications non commitées"*|"uncommitted changes"*|"no remote "*) ;; *) warn "lab sync: $SYNC_DETAIL — launch continued" ;; esac; return 0 ;;
   esac
   launch_sync_conflict "$lot"
@@ -1399,6 +1455,8 @@ cmd_next() {
       --title) title="$2"; title_set=1; shift 2 ;; --auto) shift ;; --local) NEXT_LOCAL=1; shift ;; -*) usage ;; *) pos+=("$1"); shift ;;   # --auto : synonyme conservé (lot 10)
     esac
   done
+  # tapé, le genre est validé ici, vide compris ; next_lot_in_lane lit le vide comme « non tapé » (lot 07 de contexte-neuf)
+  [ "$kind_set" != 1 ] || case "$kind" in feat|fix|chore) ;; *) die "kind expected: feat, fix or chore" ;; esac
   split_project_slug "${pos[@]+"${pos[@]}"}"; load_project "$PROJECT"
   watch_prune_gone   # dossiers de veilleurs des couloirs retirés, sans veilleur vivant (lot 01 de restes-cloud) ; muet
   require_wt
@@ -1485,6 +1543,7 @@ cmd_next() {
       log_wrap "Due measure first: $(wait_summary "$due"). The batch $new opens after it: run $NEXT_CMD again then."
       next_lot_in_lane "" chore "" 1 "$agent" "lab next $P_NAME $SLUG" "$due"; return
     fi
+    [ "$kind_set" = 1 ] || kind=""   # non tapé : next_lot_in_lane choisit selon la phase (fix en recette, feat sinon)
     next_lot_in_lane "$new" "$kind" "$title" 1 "$agent" "$NEXT_CMD"; return
   fi
   local lot st reprise nl slug next_title; lot="$(wt_lot_file "$WT")"; st="$(lot_state "$lot")"
@@ -1533,9 +1592,9 @@ next_lot_in_lane() {
     new="$(normalize_slug "$(lot_bare_slug "$1")")"   # « lot-02-foo » tapé après --lot vaut « foo », comme dans la Reprise
     ! lot_slug_reserved "$new" || die "batch slug $new refused: a .c<number> ending is reserved for reopening a waiting batch (chore/<slug>.c<n>)"
   fi
-  case "$kind" in feat|fix|chore) ;; *) die "kind expected: feat, fix or chore" ;; esac
-  local lot st br branch floor=0 correction=0
-  lot="$(wt_lot_file "$WT")"; st="$(lot_state "$lot")"; br="$(branch_name "$WT")"; branch="$kind/$new"
+  case "$kind" in feat|fix|chore|'') ;; *) die "kind expected: feat, fix or chore" ;; esac   # vide : --kind non tapé
+  local lot st br branch floor=0 correction=0 carry=0
+  lot="$(wt_lot_file "$WT")"; st="$(lot_state "$lot")"; br="$(branch_name "$WT")"
   [ -n "$br" ] || die "detached HEAD in $WT: git -C $WT switch <branch> first"
   case "$br" in   # la branche courante est celle du lot précédent : jamais la base ni staging (review du lot 9 : `git branch -D main` passait)
     "$P_BASE"|"${P_STAGING:-/}") die "the lane is on $br, not on a batch branch: git -C $WT switch <kind>/<slug> first (2026-09-02)" ;;
@@ -1552,16 +1611,22 @@ next_lot_in_lane() {
   fi
   case "$(lane_phase "$WT")" in
     'in acceptance'|'acceptance passed')
-      [ "$kind" = fix ] || die "feedback during acceptance opens a fix batch: lab next $P_NAME $SLUG --batch $new --kind fix"
+      # lot 07 de contexte-neuf : un besoin du même sujet est un lot de plus du couloir — fix sans --kind, feat et chore acceptés ;
+      # il part du résultat essayé quel que soit son genre
+      kind="${kind:-fix}"
       dirty_report "$WT" && [ -z "$DIRTY_UNTRACKED" ] || die "uncommitted changes ($DIRTY_LIST): commit the result and the summary before the fix"
       correction=1 ;;
   esac
+  kind="${kind:-feat}"; branch="$kind/$new"
   if ! untracked_warn "$WT" "next batch opened anyway, they follow it" && [ "${LAB_FORCE:-0}" != 1 ]; then
     die "dirty lane ($WT), modified tracked file(s): $(dirty_tracked_list) — the previous session must commit or fix them before the next batch"
   fi
   has_local_branch "$P_ROOT" "$branch" && die "branch already exists: $branch (git -C $P_ROOT branch -D $branch if it is dead)"
   if [ -n "$(wt_meta "$WT" stacked_on)" ] && [ "$(wt_meta "$WT" stack_branch)" = "$br" ]; then   # profondeur 1 (lot 14)
-    die "$br is still stacked on $(wt_meta "$WT" stacked_on) (#$(wt_meta "$WT" stacked_pr)): deliver it first with lab merge $P_NAME $SLUG — the watcher will move and push it after that merge; run lab next again then"
+    # lot 07 de contexte-neuf : en recette, le dernier lot empilé est porté par le lot de plus, qui hérite de l'empilement — rien
+    # poussé ni fusionné ; lab close prouve ensuite ses commits dans le résultat essayé (stack_carried, lib/close.sh)
+    [ "$correction" != 1 ] || carry=1
+    [ "$carry" = 1 ] || die "$br is still stacked on $(wt_meta "$WT" stacked_on) (#$(wt_meta "$WT" stacked_pr)): deliver it first with lab merge $P_NAME $SLUG — the watcher will move and push it after that merge; run lab next again then"
   fi
   local info num="" state="" pbase="" stack=0 aside=0
   info="$(pr_info "$P_ROOT" "$br")"
@@ -1629,6 +1694,21 @@ next_lot_in_lane() {
   fi
   git -C "$WT" switch --quiet -c "$branch" "$start" || die "git switch -c $branch $start refused"
   meta_set "$WT" kind "$kind"; meta_set "$WT" start "$(git -C "$WT" rev-parse HEAD)"; meta_set "$WT" lane "$SLUG"; meta_set "$WT" lot "$new"; remember_agent "$agent"
+  if [ "$carry" = 1 ]; then   # <branche portée>@<sommet du lot d'en dessous sous elle>, une entrée par lot porté
+    local carried; carried="$(wt_meta "$WT" stack_carried)"
+    meta_set "$WT" stack_carried "${carried:+$carried }$br@$(wt_meta "$WT" stack_tip)"; meta_set "$WT" stack_branch "$branch"
+    kv STACKED_ON "$(wt_meta "$WT" stacked_on)"
+    log_wrap "$br stays stacked on $(wt_meta "$WT" stacked_on) (#$(wt_meta "$WT" stacked_pr)): $branch carries it, nothing pushed nor merged; moved onto $(pr_base) as soon as that merge happens."
+    # une demande de fusion de la branche portée (file de la tour, veilleur de chaîne, même mort : watch_resume le relancerait) la
+    # livrerait hors recette, sans le lot de plus ; seul lab close la livre désormais — retirée, en le disant (revue du lot 07)
+    local mqc wfc why="carried by $branch during the acceptance: lab close delivers it"; mqc="$(merge_queue_file "$SLUG" "$br")"; wfc="$(watch_file "$br")"
+    if [ -f "$mqc" ]; then merge_queue_drop "$mqc"; log "$br withdrawn from the tower queue: $why"; fi
+    if [ "$(watch_get "$wfc" action)" = chain ]; then
+      case "$(watch_state "$wfc")" in
+        armed|waiting|dead) watch_stop "$wfc" "$why"; watch_issue "$wfc" removed "$why"; log "chain watcher of $br stopped: $why" ;;
+      esac
+    fi
+  fi
   if [ "$stack" = 1 ]; then
     meta_set "$WT" stacked_on "$br"; meta_set "$WT" stacked_pr "$num"; meta_set "$WT" stack_tip "$start"; meta_set "$WT" stack_branch "$branch"
     kv STACKED_ON "$br"
@@ -2672,6 +2752,7 @@ run() {
     app) . "$LAB_ROOT/lib/app.sh"; cmd_app "$@" ;;
     docker) . "$LAB_ROOT/lib/docker.sh"; cmd_docker "$@" ;;
     top) cmd_top "$@" ;; sysmon) cmd_sysmon "$@" ;; widget) cmd_widget "$@" ;; mcp) cmd_mcp "$@" ;;
+    usage) cmd_usage "$@" ;;
     --version) cmd_version ;;
     setup|uninstall|update) . "$LAB_ROOT/lib/install.sh"; . "$LAB_ROOT/lib/install_merge.sh"; . "$LAB_ROOT/lib/preflight.sh"; . "$LAB_ROOT/lib/setup.sh"; . "$LAB_ROOT/lib/update.sh"; . "$LAB_ROOT/lib/import.sh"; "cmd_$CMD" "$@" ;;
     doctor)

@@ -8,7 +8,11 @@
 # appel (0,11 s mesurées pour 1 100 processus) ; l'outil footprint coûtait 7,6 s pour les 850 processus du compte, 2 à 2,8 s en
 # parallèle (rapport de preuves du lot 01). Sans python3 ou sous --fast : mémoire résidente, marquée approximative.
 
+declare -F kv_value >/dev/null || . "${BASH_SOURCE[0]%/*}/kv.sh"
+declare -F context_max_set >/dev/null || . "${BASH_SOURCE[0]%/*}/context.sh"   # contexte de chaque session (lot 03 de contexte-neuf)
+
 TOP_TAIL_BYTES=65536     # fin de journal lue par session ; message au-delà : inactivité unknown, jamais proposée
+TOP_WIDE_BYTES=1048576   # seconde passe du contexte (lot 06 de contexte-neuf) : 1 Mio chiffre autant de sessions du poste que 16 Mio
 TOP_FAMILY_MEM_PCT=25    # famille hors Treelab proposée à l'explication au-delà de ce % de la mémoire physique
 TOP_FAMILY_CPU=100       # ... ou au-delà d'un cœur entier
 TOP_TOOL_CPU=50          # processus seul de l'utilisateur occupé à ce % depuis TOP_TOOL_AGE secondes : outil oublié ?
@@ -245,9 +249,26 @@ top_phases() {
 }
 
 # top_journals <rattachements> → « pid<TAB>epoch » du dernier message user ou assistant de chaque journal trouvé ; une seule
-# lecture tail -c bornée pour tous (en-têtes « ==> fichier <== », /dev/null en plus pour les avoir même avec un seul journal).
+# lecture tail -c bornée pour tous (en-têtes « ==> fichier <== », /dev/null en plus pour les avoir même avec un seul journal). Puis
+# (lot 03 de contexte-neuf) la ligne #K et « pid<TAB>contexte » : la même fin relue par un seul jq, formule CONTEXT_JQ_DEF de
+# lib/context.sh (celle du rappel et de la tour), frontières de compaction comprises (lot 06). Une seule lecture tail : la passe awk
+# envoie à jq les en-têtes et les seules lignes qui portent un compteur, jq écrit après le #K d'awk (fflush puis close) — relire les
+# fins pour jq coûtait 0,26 s de plus à --fast sur les 128 journaux du poste réel (preuve du lot 03, C5). Lot 06 : les seuls journaux
+# sans compteur dans cette fin (une compaction au repos écrit des centaines de Kio sans compteur) passent une seconde fois,
+# ensemble, lignes à compteur seules du dernier Mio (TOP_WIDE_BYTES ; 16 Mio, ceux du rappel, coûtaient des secondes à chaque rendu
+# du widget), lu et filtré par un seul perl : il se place sur la fin de chaque journal et cherche chaque motif dans tout le tampon,
+# lignes trouvées rendues dans leur ordre. tail -c de macOS recopie octet par octet et son grep -F à quatre motifs coûte par ligne :
+# plus d'une seconde chacun sur les fins de compaction, faites de milliers de lignes courtes (mesures du lot 06). Sans compteur là non
+# plus, ou frontière illisible : rien, CONTEXT=unknown.
+# shellcheck disable=SC2016 # programme jq, ses $ sont les siens
+TOP_CONTEXT_JQ='(reduce ($map | split("\n")[] | split("\t") | select(length == 2)) as $r ({}; .[$r[1]] = $r[0])) as $owner
+  | reduce inputs as $l ({cur: null, ctx: {}};
+      if ($l | startswith("==> ") and endswith(" <==")) then .cur = $owner[$l[4:-4]]
+      elif .cur == null then .
+      else ([$l | try fromjson catch empty | objects | counter_of] | last) as $c | if $c == null then . else .ctx[.cur] = $c end end)
+  | .ctx | to_entries[] | select(.value > 0) | "\(.key)\t\(.value)"'
 top_journals() {
-  local pid sid cand f g map="" ch; local -a files=()
+  local pid sid cand f g map="" ch hasjq=0 out got wmap=""; local -a files=() wide=()
   ch="$(claude_home)"
   while IFS=$'\t' read -r pid _ _ _ _ sid cand; do
     [ -n "$pid" ] || continue; f=""; [ "$sid" != - ] || sid=""; [ "$cand" != - ] || cand=""
@@ -257,7 +278,9 @@ top_journals() {
     files+=("$f"); map="$map$pid"$'\t'"$f"$'\n'
   done < <(printf '%s\n' "$1")
   [ "${#files[@]}" -gt 0 ] || return 0
-  { tail -c "$TOP_TAIL_BYTES" -- "${files[@]}" /dev/null 2>/dev/null || true; } | TOP_MAP="$map" LC_ALL=C awk "$TOP_AWK_LIB"'
+  if command -v jq >/dev/null 2>&1; then hasjq=1; fi
+  out="$({ tail -c "$TOP_TAIL_BYTES" -- "${files[@]}" /dev/null 2>/dev/null || true; } \
+    | TOP_MAP="$map" TOP_JQ="$CONTEXT_JQ_DEF$TOP_CONTEXT_JQ" LC_ALL=C awk -v hasjq="$hasjq" "$TOP_AWK_LIB"'
     # claude : horodatage qui suit le type au premier niveau ("type":"user|assistant","uuid":…,"timestamp":…) ; codex : premier
     # horodatage d une ligne response_item de rôle user ou assistant, ou d un événement user_message ou agent_message
     function msg_ts(l,   s) {
@@ -267,11 +290,31 @@ top_journals() {
       if (match(s, /"timestamp":"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) return substr(s, RSTART + 13, 19)
       return ""
     }
-    BEGIN { n = split(ENVIRON["TOP_MAP"], rows, "\n"); for (i = 1; i <= n; i++) if (split(rows[i], kv, "\t") == 2) owner[kv[2]] = kv[1] }
-    /^==> .* <==$/ { f = substr($0, 5, length($0) - 8); cur = (f in owner) ? owner[f] : ""; next }
+    BEGIN { n = split(ENVIRON["TOP_MAP"], rows, "\n"); for (i = 1; i <= n; i++) if (split(rows[i], kv, "\t") == 2) owner[kv[2]] = kv[1]
+      jq = "exec jq -nrR --arg map \"$TOP_MAP\" \"$TOP_JQ\" 2>/dev/null" }
+    /^==> .* <==$/ { f = substr($0, 5, length($0) - 8); cur = (f in owner) ? owner[f] : ""; if (cur != "" && hasjq) print $0 | jq; next }
     cur == "" { next }
-    { t = msg_ts($0); if (t != "") last[cur] = t }
-    END { for (p in last) print p "\t" iso_epoch(last[p]) }'
+    { t = msg_ts($0); if (t != "") last[cur] = t
+      if (hasjq && (index($0, "\"usage\":") || index($0, "\"token_count\"") || index($0, "\"compact_boundary\""))) print $0 | jq }
+    END { for (p in last) print p "\t" iso_epoch(last[p]); print "#K"; fflush(); if (hasjq) close(jq) }')"
+  printf '%s\n' "$out"
+  [ "$hasjq" = 1 ] || return 0
+  got="$(printf '%s\n' "$out" | sed -n '/^#K$/,$p' | cut -f1)"
+  while IFS=$'\t' read -r pid f; do
+    [ -n "$pid" ] || continue
+    case $'\n'"$got"$'\n' in *$'\n'"$pid"$'\n'*) continue ;; esac
+    wide+=("$f"); wmap="$wmap$pid"$'\t'"$f"$'\n'
+  done <<<"$map"
+  [ "${#wide[@]}" -gt 0 ] || return 0
+  # shellcheck disable=SC2016 # programme perl littéral
+  { perl -e 'my $w = shift; for my $f (@ARGV) { open(my $h, "<", $f) or next; my $s = -s $h;
+      seek($h, $s > $w ? $s - $w : 0, 0) or next; local $/; my $d = <$h>; next unless defined $d; my %at;
+      for my $k (q("usage":), q("token_count"), q("compact_boundary")) { my $p = 0;
+        while (($p = index($d, $k, $p)) >= 0) { my $b = rindex($d, "\n", $p) + 1; my $e = index($d, "\n", $p);
+          $e = length($d) if $e < 0; $at{$b} = $e; $p = $e } }
+      print "\n==> $f <==\n", map { substr($d, $_, $at{$_} - $_) . "\n" } sort { $a <=> $b } keys %at }' \
+      "$TOP_WIDE_BYTES" "${wide[@]}" 2>/dev/null || true; } \
+    | jq -nrR --arg map "$wmap" "$CONTEXT_JQ_DEF$TOP_CONTEXT_JQ" 2>/dev/null || true
 }
 
 # top_envs <pids séparés par des virgules> → « pid<TAB>onglet<TAB>espace » des sessions lancées dans cmux, lus dans leur environnement
@@ -384,6 +427,7 @@ top_snapshot() {
   elif ! mem="$(top_footprints "$ps_out")"; then
     msource=rss; mem=""; warn "memory footprint unreadable (python3 with libproc): resident memory shown instead, marked approximate"
   fi
+  context_max_set
   idle_h="$(global_config_get top_idle_hours)"
   case "$idle_h" in
     '') idle_h=24 ;;
@@ -400,7 +444,7 @@ top_snapshot() {
     printf '#S\n%s\n' "$ps_out"
   } | LC_ALL=C awk -v self="$$" -v uid="$(id -u)" -v fast="$fast" -v msource="$msource" -v idle_h="$idle_h" -v now_iso="$now_iso" \
       -v fam_pct="$TOP_FAMILY_MEM_PCT" -v fam_cpu="$TOP_FAMILY_CPU" -v tool_cpu="$TOP_TOOL_CPU" -v tool_age="$TOP_TOOL_AGE" -v zmin="$TOP_ZOMBIE_MIN" \
-      -v orphan_age="$TOP_ORPHAN_AGE" -v stop_s="$TOP_STOP_WAIT" -v keep="$(global_config_get top_keep)" -v probe="$probe" "$TOP_AWK_LIB"'
+      -v orphan_age="$TOP_ORPHAN_AGE" -v stop_s="$TOP_STOP_WAIT" -v keep="$(global_config_get top_keep)" -v probe="$probe" -v cmax="$CONTEXT_MAX" "$TOP_AWK_LIB"'
     function mb(x) { return int(x + 0.5) }
     function cpu1(c) { return sprintf("%.1f", c) }
     function mem_of(p) { if (!fast && (p in fp)) { approx = 0; return fp[p] / 1048576 } approx = 1; return RSS[p] / 1024 }
@@ -447,6 +491,7 @@ top_snapshot() {
     sec == "T" { if (NF >= 5) { TP[$1] = $2; TL[$1] = $3; TV[$1] = $4; TS[$1] = $5; TI[$1] = ($6 == "-") ? "" : $6 } next }
     sec == "H" { if (NF >= 2) { PH[$1 "\t" $2] = $3; MG[$1 "\t" $2] = $4 } next }
     sec == "J" { if (NF >= 2) JT[$1] = $2; next }
+    sec == "K" { if (NF >= 2) CX[$1] = $2; next }
     sec == "M" { if (split($0, a, " ") == 2) fp[a[1]] = a[2]; next }
     sec == "E" { if (NF >= 2) { SF[$1] = $2; SW[$1] = $3 } next }
     sec == "Q" { if (NF >= 4) QS[$1] = $4; if (NF >= 5 && $5 != "") QU[$1] = $5; next }
@@ -524,7 +569,8 @@ top_snapshot() {
         block("BLOCK=SESSION\nPID=" p "\nAGENT=" AG[p] "\nPROJECT=" proj "\nLANE=" lane "\nVIA=" ((p in TV) ? TV[p] : "none") "\nPHASE=" phase \
           "\nMEM=" mb(SM[p]) "\nMEM_APPROX=" (SA[p] ? "yes" : "no") "\nCPU=" cpu1(CPU[p]) "\nAGE=" ET[p] "\nIDLE=" idle \
           "\nCHILDREN=" KN[p] + 0 "\nCHILDREN_MEM=" mb(KM[p]) "\nCHILDREN_CPU=" cpu1(KC[p]) "\nZOMBIES=" ZC[p] + 0 \
-          "\nSURFACE=" SF[p] "\nWORKSPACE=" SW[p] "\nSTATUS=" ((p in QS) ? QS[p] : "unknown") "\nSESSION_ID=" TI[p] "\nBACKGROUND=" BG[p] + 0 "\n")
+          "\nSURFACE=" SF[p] "\nWORKSPACE=" SW[p] "\nSTATUS=" ((p in QS) ? QS[p] : "unknown") "\nSESSION_ID=" TI[p] "\nBACKGROUND=" BG[p] + 0 \
+          "\nCONTEXT=" ((p in CX) ? CX[p] : "unknown") "\nCONTEXT_ABOVE=" (((p in CX) && cmax + 0 > 0 && CX[p] + 0 > cmax + 0) ? "yes" : "no") "\n")
         if (SF[p] != "") LIVE[SF[p]] = p
         if (guard(p, 1) != "") continue
         where = (proj == "none") ? "outside projects" : ((lane == "main") ? proj " (main checkout)" : proj "/" lane)
@@ -609,7 +655,7 @@ top_snapshot() {
         "\nCOMPRESSED_MB=" ((page && stored != "") ? mb(stored * page / 1048576) : "") "\nCOMPRESSOR_MB=" ((page && occupied != "") ? mb(occupied * page / 1048576) : "") \
         "\nSWAP_USED_MB=" ((su ~ /^[0-9]/) ? unit_mb(su) : "") "\nSWAP_TOTAL_MB=" ((st ~ /^[0-9]/) ? unit_mb(st) : "") \
         "\nLOAD_1=" L[1] "\nLOAD_5=" L[2] "\nLOAD_15=" L[3] "\nTHERMAL=" thermal "\nSPEED_LIMIT=" ((speed > 0) ? speed : 100) \
-        "\nMEM_SOURCE=" msource "\nIDLE_HOURS=" idle_h "\nSESSIONS=" ns + 0 "\nZOMBIES=" zt + 0 "\nCUTS=" ncut + 0 "\nHIBERNATED=" nh + 0 "\n"
+        "\nMEM_SOURCE=" msource "\nIDLE_HOURS=" idle_h "\nCONTEXT_MAX=" cmax + 0 "\nSESSIONS=" ns + 0 "\nZOMBIES=" zt + 0 "\nCUTS=" ncut + 0 "\nHIBERNATED=" nh + 0 "\n"
       printf "%s", out; printf "%s", cuts; printf "%s", hibs; printf "%s", probes
     }'
 }
@@ -632,6 +678,9 @@ top_view() {
       if $s < 60 then "<1m" elif $s < 3600 then "\($s / 60 | floor)m" elif $s < 172800 then "\($s / 3600 | floor)h" else "\($s / 86400 | floor)d" end end;
     def where: if .PROJECT == "none" then "outside projects" elif .LANE == "main" then .PROJECT + " (main)" else .PROJECT + "/" + .LANE end;
     def gain: if (.MEM | tonumber? // 0) > 0 then ", frees about \(mem)" else "" end;
+    def ktok: (tonumber? // null) as $n | if $n == null then "?" elif $n >= 999500 then "\($n / 100000 | round / 10)M" else "\($n / 1000 | round)k" end;
+    def ctx: (.CONTEXT | ktok) + (if .CONTEXT_ABOVE == "yes" then "!" else "" end);
+    def cmax($v): if ($v | tonumber? // 0) > 0 then "context_max \($v | ktok)" else "context_max off" end;
     (map(select(.BLOCK == "MACHINE")) | .[0] // {}) as $m |
     map(select(.BLOCK == "SESSION")) as $s | map(select(.BLOCK == "FAMILY")) as $f | map(select(.BLOCK == "CUT")) as $c |
     map(select(.BLOCK == "HIBERNATED")) as $h |
@@ -641,10 +690,11 @@ top_view() {
       "Compressed \($m.COMPRESSED_MB | size) in \($m.COMPRESSOR_MB | size), swap \($m.SWAP_USED_MB | size) of \($m.SWAP_TOTAL_MB | size), load \($m.LOAD_1) \($m.LOAD_5) \($m.LOAD_15)",
       "Thermal \($m.THERMAL), \($m.ZOMBIES) zombie processes, memory read as \($src)",
       "",
-      "Sessions (\($s | length)), idle after \($m.IDLE_HOURS)h",
-      ("PID" | rpad(6)) + " " + ("Agent" | pad(6)) + " " + ("Where" | pad($w - 44)) + " " + ("Mem" | rpad(6)) + " " + ("+kids" | rpad(6)) + " " + ("CPU" | rpad(5)) + " " + ("Age" | rpad(4)) + " " + ("Idle" | rpad(4)),
-      ($s[] | (.PID | rpad(6)) + " " + (.AGENT | pad(6)) + " " + (where + phase | pad($w - 44)) + " " + (mem | rpad(6)) + " "
-        + (.CHILDREN_MEM | size | rpad(6)) + " " + (.CPU | rpad(5)) + " " + (.AGE | dur | rpad(4)) + " " + (.IDLE | dur | rpad(4))),
+      "Sessions (\($s | length)), idle after \($m.IDLE_HOURS)h, \(cmax($m.CONTEXT_MAX))",
+      ("PID" | rpad(6)) + " " + ("Agent" | pad(6)) + " " + ("Where" | pad($w - 50)) + " " + ("Mem" | rpad(6)) + " " + ("+kids" | rpad(6)) + " " + ("CPU" | rpad(5)) + " " + ("Age" | rpad(4)) + " " + ("Idle" | rpad(4)) + " " + ("Ctx" | rpad(5)),
+      ($s[] | (.PID | rpad(6)) + " " + (.AGENT | pad(6)) + " " + (where + phase | pad($w - 50)) + " " + (mem | rpad(6)) + " "
+        + (.CHILDREN_MEM | size | rpad(6)) + " " + (.CPU | rpad(5)) + " " + (.AGE | dur | rpad(4)) + " " + (.IDLE | dur | rpad(4)) + " " + (ctx | rpad(5))),
+      (select(any($s[]; .CONTEXT_ABOVE == "yes")) | "! above context_max: a Claude batch session is told to start fresh (lab next)" | wrap($w; "")),
       "",
       "Outside Treelab",
       ("Family" | pad(13)) + " " + ("Procs" | rpad(5)) + " " + ("Mem" | rpad(7)) + " " + ("CPU" | rpad(6)) + "  " + "Largest",
@@ -667,9 +717,10 @@ top_view() {
       " Zombie processes \($m.ZOMBIES)",
       " Memory read as \($src)",
       "",
-      "Sessions (\($s | length))",
+      "Sessions (\($s | length)), \(cmax($m.CONTEXT_MAX))",
       ($s[] | " \(.AGENT) \(.PID) \(where)", (select(phase != "") | "   phase \(.PHASE)"),
-        "   mem \(mem) +\(.CHILDREN_MEM | size), cpu \(.CPU)", "   age \(.AGE | dur), idle \(.IDLE | dur)"),
+        "   mem \(mem) +\(.CHILDREN_MEM | size), cpu \(.CPU)", "   age \(.AGE | dur), idle \(.IDLE | dur)",
+        "   context \(.CONTEXT | ktok)" + (if .CONTEXT_ABOVE == "yes" then ", above \($m.CONTEXT_MAX | ktok)" else "" end)),
       "",
       "Outside Treelab",
       ($f[] | " \(.FAMILY): \(.PROCESSES) procs", "   \(mem), cpu \(.CPU)"),

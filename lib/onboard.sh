@@ -238,10 +238,11 @@ lab — from need to delivery, one lane at a time
   lab next <project> <lane> — move to the lane's next step
   lab permanent <project> <lane> — keep a lane open for good, never closed
   lab tower <project> — the tower: what each lane waits for, alerts
-  lab ginkgo <project> — talk with the tower out loud (macOS)
+  lab ginkgo [project] — talk with every tower out loud (macOS)
   lab plan — see the lanes and their progress
   lab status — see the detailed state of each lane
   lab top — see who uses what on this machine, and what to cut
+  lab usage <project> — share of tokens sent above context_max
   lab widget install — the same in the menu bar, cut with one click
   lab mcp — see the tool servers (MCP), their copies and memory
 
@@ -360,7 +361,9 @@ Reads where the lane stands and starts what is needed: run or resume the batch, 
 
 If the last nightly CI of the main branch is red, it says so (NIGHT=red) and suggests a fix lane (NIGHT_FIX=), without blocking anything.
 
-Started from the lane's session, it replaces that session with a fresh one in the same tab. The second form imposes the next batch, for example a fix after your trial.
+Started from the lane's session, it replaces that session with a fresh one in the same tab. The second form imposes the next batch, for example a fix after your trial. During your trial, --kind is optional (fix by default), and a last batch stacked on a PR not yet merged is carried by the new one.
+
+A Claude batch session whose context goes above context_max (250000 tokens by default; set it in ~/.lab/config, 0 turns it off) is reminded after each action to update its log and Handoff, then to run lab next: the fresh session goes on from the Handoff. The tower starts fresh by itself too: it carries out your message or answer first, finishes the gesture in progress, then runs lab next <project> tower, and its fresh session runs its check again; nothing is asked of you.
 
 Each batch chooses by itself, without a question: only its Execution line written cloud at planning sends it to the Cloud. Without a line it stays on the Mac, as with mac — <need>: <detail> (secret, deploy, mac-tool, human, resource or live), a lab deploy or lab lock command in its Steps, or an unreadable line. lab next announces the choice in one line (EXECUTION=, EXECUTION_WHY=).
 
@@ -400,7 +403,7 @@ lab tower — the tower: what each lane waits for
 
 Every project has a tower: lab onboard creates it for a new project. The first call creates the tower of the project: the permanent lane tower, started under Claude in bypassPermissions mode (the first start may ask you once to confirm that mode). Its tab is the only one lab pins, first in the project's workspace. Its session applies the tower skill: about every 30 minutes it checks every lane, relaunches a stopped one, delivers what is ready, and lists what waits for you. It never answers a question in your place. TOWER=created gives the result; a tower under Codex is refused.
 
-Next calls print TOWER=present, then one block per lane: LANE=, WAITS_FOR= (you, merge, acceptance, close, date, ci or nothing), WHY= and SESSION= (live or none); WAITING_FOR_YOU= names the lanes that wait for you. merge: the lane's agent queued its batch, the tower merges it without asking you. close: acceptance passed, the tried revision is served and verified, and its prod check is green — the tower closes the lane alone.
+Next calls print TOWER=present, then one block per lane: LANE=, WAITS_FOR= (you, merge, acceptance, close, date, ci or nothing), WHY=, SESSION= (live or none) and CONTEXT= (the tokens the live session's last call sent to the model, unknown, or none). ABOVE_CONTEXT_MAX= names the lanes whose session is above context_max, and their WHY says so: the tower lists them and never acts in their place; a Claude session is told to hand off by itself, a Codex session gets no reminder. Above context_max, the tower itself starts fresh, asking you nothing: it carries out your message or answer, finishes the gesture in progress (a closing and its publication included), then lab next replaces its session in the same tab with a fresh one that runs the check and its 30-minute loop again. WAITING_FOR_YOU= names the lanes that wait for you. merge: the lane's agent queued its batch, the tower merges it without asking you. close: acceptance passed, the tried revision is served and verified, and its prod check is green — the tower closes the lane alone.
 
 In a project with a tower, only the tower merges, deploys and closes; a lane agent is queued (lab merge, lab deploy) or refused with a pointer to the tower (lab close, a raw merge or push to the main branches). If the shared .claude/settings.json forbids agents to push or merge, PROPOSE=lift-deny names those rules once: --lift-deny lists them, --yes removes only them in the tower (the lab guard replaces them), --no keeps them; the answer is written and never asked again.
 
@@ -418,12 +421,14 @@ Example:
 HELP
       ;;
     ginkgo) cat <<'HELP'
-lab ginkgo — talk with the tower of a project, out loud
+lab ginkgo — talk with every tower of this computer, out loud
 
-  lab ginkgo [project]
+  lab ginkgo [project] [--background]
   lab ginkgo status
+  lab ginkgo listen [command|key|name]
   lab ginkgo key openai
   lab ginkgo state [project]
+  lab ginkgo state --all
   lab ginkgo tell <project> <lane> <text>
   lab ginkgo question <project> <lane>
   lab ginkgo answer <project> <lane> --qid <id> (--q <n> [--choice <c>]... [--recommended] [--other <text>])...
@@ -433,14 +438,25 @@ lab ginkgo — talk with the tower of a project, out loud
   lab ginkgo reply <project> [--since <utc-time>]
   lab ginkgo news <project> --open yes|no [--forget <key>]...
   lab ginkgo news <project> --baseline
+  lab ginkgo news --all --open yes|no [--forget <key>]... [--only-forgotten]
+  lab ginkgo news --all --baseline
+  lab ginkgo precision set ignore|only|night [--project <project>] [--lane <lane>] [--wait <kind>] [--for <n>m|h|d] [--until <YYYY-MM-DDTHH:MM>] [--said <words>] [--id <n>]
+  lab ginkgo precision list
+  lab ginkgo precision remove <id>|--all
 
-Ginkgo is a small macOS app in the menu bar. lab ginkgo <project> opens it on that project: speak freely, without a key to hold; Ginkgo answers out loud, in your language, what the tower sees and what waits for you, and it passes a message on to a lane when you ask. Say stop, or use its menu bar icon, and the microphone closes: your voice only goes to OpenAI during an open conversation.
+Ginkgo is a small macOS app in the menu bar, above every conversation: it reads the towers of all your projects and acts on the one you name. lab ginkgo <project> opens it starting from that project (FOCUS=), lab ginkgo outside any project from the whole computer (FOCUS=none); lab ginkgo state --all reads what waits for you in each project, creating nothing. Speak freely, without a key to hold; Ginkgo answers out loud, in your language, what the tower sees and what waits for you, and it passes a message on to a lane when you ask. Say stop, or use its menu bar icon, and the microphone closes: your voice only goes to OpenAI during an open conversation.
 
 The voice engine is only ears and mouth: the work stays with the tower and the lanes. Ginkgo reads with lab ginkgo state, which never creates a tower (TOWER=absent without one), and speaks to a lane with lab ginkgo tell, which delivers the text to the agent of its tab through cmux, from Ginkgo; an unknown lane, a lane of another project, the tower itself or a lane without a tab are refused.
 
 Ginkgo also settles what the lanes wait for. lab ginkgo question reads the exact question of a lane: its whole choice box (questions, choices, descriptions, several choices, the recommended one, and a QID), or the end of the last message of a session that waits, or WAITS=none. lab ginkgo answer types the answers of the whole box in the lane's tab, one question after the other, the extra words going into "Other"; a question changed since it was read (QID), an unknown choice or a question left out are refused before any key. lab ginkgo order types an order in the tower's tab ("Ginkgo, voice of the user: ..."), and lab ginkgo reply reads the tower's answer. Closing a lane is never a free order: lab ginkgo close reads it back first (READBACK=, TOKEN=) and sends it to the tower only with that token, said back within 120 seconds.
 
-Ginkgo also speaks first when a lane starts waiting for you: a question, a permission, a blocked lane, an acceptance ready or a close to confirm; merges, CI and dates stay silent. Every 30 seconds the app reads lab ginkgo news. With the conversation open, it says out loud which lane asks and what, in a few words; closed, a Ginkgo notification with a sound opens the conversation when clicked, and the conversation starts with that news. Each wait is announced once, a new question again; what already waits when Ginkgo starts is not announced (lab ginkgo news --baseline), and a news Ginkgo could not say before the conversation closed is decided again (--forget). ginkgo_speak=always|conversation|never in ~/.lab/config: always by default (out loud when open, a notification when closed), conversation (out loud only), never. Quiet hours, ginkgo_quiet=21:00-08:00 by default, Mac time (off for none): nothing while the conversation is closed, then one notification sums up what still waits; a conversation you open yourself gets the news as usual.
+Three ways to start, ginkgo_listen=command|key|name in ~/.lab/config, or the menu of its menu bar icon, which changes it at once and writes it there (lab ginkgo listen <mode> does the same; without a mode, it says LISTEN=). command, the default: lab ginkgo <project> opens the conversation and you speak freely. key: hold Option-Space (⌥ Space) while you speak and release it for the answer; between two presses the microphone is off and nothing is sent, the connection closes after 120 seconds without a press, and a press while Ginkgo speaks cuts it; ginkgo_hotkey= picks another combination (ctrl, option or cmd, with shift if you like, and space or a letter, or a key F1 to F20). name: say "Ginkgo, what waits for me?" in one breath; the name is recognized on this Mac only, by Apple's speech recognition in the language of treelab, which never sends it away: nothing leaves the Mac before the name, and the sound sent starts at the name. A short sound confirms; if nothing is said within 8 seconds, the conversation closes and Ginkgo listens for its name again, as after stop or 120 seconds of silence. A locked or sleeping Mac closes the microphone until it is unlocked. The name needs macOS Dictation turned on (System Settings, Keyboard, Dictation); otherwise Ginkgo closes the microphone and its menu says so. macOS asks once for the speech recognition permission (again after each update); lab uninstall forgets it, with the microphone.
+
+Ginkgo also speaks first when a lane starts waiting for you: a question, a permission, a blocked lane, an acceptance ready or a close to confirm; merges, CI and dates stay silent. The app reads lab ginkgo news --all: the whole computer, each news naming its project; while the Treelab app runs, it reads the lane feed the app keeps up to date, every 30 seconds (SOURCE=feed, under a second), otherwise it computes everything, every 2 minutes (SOURCE=computed). With the conversation open, it says out loud which lane asks and what, in a few words; closed, a Ginkgo notification with a sound opens the conversation when clicked, and the conversation starts with that news. Each wait is announced once, a new question again; what already waits when Ginkgo starts is not announced (lab ginkgo news --baseline), and a news Ginkgo could not say before the conversation closed is decided again (--forget); when it closes, Ginkgo reads again only the lanes of those news (--only-forgotten). ginkgo_speak=always|conversation|never in ~/.lab/config: always by default (out loud when open, a notification when closed), conversation (out loud only), never. Quiet hours, ginkgo_quiet=21:00-08:00 by default, Mac time (off for none): nothing while the conversation is closed, then one notification sums up what still waits; a conversation you open yourself gets the news as usual.
+
+Tell Ginkgo also what you want to hear, a precision: "ignore demo", "only the questions of treelab", "even at night for this lane". Each one is ignore, only or night, about a project (--project), a lane of it (--lane) and/or a kind of wait (--wait question, permission, blocked, acceptance or closing). Ginkgo stores it at once with lab ginkgo precision set and says it back in one sentence, so you can correct it; it lasts until you say otherwise, or for the time you give (--for 30m, 2h or 3d, or --until 2026-11-29T09:00, Mac time). The same kind and target is updated (CHANGED=updated) and --id changes one; lab ginkgo precision list gives them with NOW= and WEEKDAY=, and lab ginkgo precision remove <id> or --all takes them back. lab keeps them in one place, in its state, and applies them to the news: what an ignore covers, or what no only covers (several only add up), is neither said nor held (ASIDE=), then announced once the precision is removed or past; a night precision goes through the quiet hours, and ignore wins over night. And to the answers: lab ginkgo state --all gives SET_ASIDE= per project, the lanes of WAITING_FOR_YOU= set aside, which Ginkgo only counts in a summary until you name one. Reading them is free, but an agent can neither store nor remove one: your voice alone, or your terminal.
+
+For the Treelab app, lab ginkgo <project> --background starts Ginkgo with no conversation and no microphone in command mode (in name mode, it listens for its name; with the key, it waits for it): the app then drives it through a local socket that is yours alone, SOCKET= of lab ginkgo status, under the lab state (a path beyond 103 bytes is refused, never truncated). It opens and closes the conversation, cuts every microphone, cancels a close waiting for your yes, changes the project, and receives live its state, its lines, what it did and the voice levels; Ginkgo says it is ready with the distributed notification dev.treelab.ginkgo.ready. Nothing there confirms a close, answers a lane or gives the tower an order: your voice alone, within 120 seconds, as with lab. lab ginkgo status says PROTOCOL=1 when the app speaks this channel (contract v1); without the line, the Treelab app asks for a Ginkgo update and launches nothing.
 
 Ginkgo.app comes with treelab, built and signed: nothing to install, on an Apple Silicon Mac with macOS 14 or later (elsewhere, lab ginkgo refuses and the rest of treelab works); a development checkout builds it from its sources. Your own OpenAI API key is used: the first lab ginkgo in a terminal asks for it, hidden, and stores it in the macOS keychain (lab ginkgo key openai does the same at any time); lab ginkgo status says whether it is there (KEY=present), never the key itself, and where the app comes from (SOURCE=release|checkout). macOS asks once for the microphone (again after each update); lab doctor says whether the shipped app is in place. ginkgo_model= in ~/.lab/config picks another OpenAI realtime model.
 
@@ -483,6 +499,21 @@ Example:
   lab status myproject mylane
 HELP
       ;;
+    usage) cat <<'HELP'
+lab usage — the share of tokens sent above context_max
+
+  lab usage <project> [--days N]
+  lab usage <project> --from <date> [--to <date>]
+
+Each action sends the whole conversation back to the model: the longer a session, the more each action costs, and above context_max (250 000 tokens by default, ~/.lab/config) a batch session is told to start fresh from its Handoff. lab usage measures how much of what a project's sessions sent to the model went to calls above that threshold, from the token counters of the Claude journals of this Mac, never their text.
+
+Over the last 7 days by default, --days N (1 to 365), or from --from to --to (YYYY-MM-DD at midnight UTC, or YYYY-MM-DDTHH:MM:SSZ; --to is now by default). SHARE_ABOVE gives the share in percent, TOKENS and TOKENS_ABOVE the tokens, CALLS the model calls, each counted once; subagents come apart (SUBAGENT_*). The project's root and its lanes are read; Codex and the sessions run on a Cloud machine are not. Read-only.
+
+Example:
+  lab usage myproject
+  lab usage myproject --days 30
+HELP
+      ;;
     top) cat <<'HELP'
 lab top — see who uses what on this machine, and what to cut
 
@@ -491,7 +522,7 @@ lab top — see who uses what on this machine, and what to cut
   lab top --wake <tab>
   lab top --explain <pid|family>
 
-Without an option, a read-only snapshot: memory pressure, compressed memory, swap, load and thermal state; then each claude or codex session, tied to its project and lane (by the lane's session lock, otherwise by its folder) and to its cmux tab, with its memory footprint, processor, age, time since its last exchange and status (idle, busy, or waiting for an answer: never put to sleep); the processes it started count with it. Everything else is grouped in families outside Treelab: Chrome, test browsers, virtual machines, node, cmux, cmux-cua, agent helpers, other.
+Without an option, a read-only snapshot: memory pressure, compressed memory, swap, load and thermal state; then each claude or codex session, tied to its project and lane (by the lane's session lock, otherwise by its folder) and to its cmux tab, with its memory footprint, processor, age, time since its last exchange, context (the tokens its last call sent to the model, marked ! above context_max) and status (idle, busy, or waiting for an answer: never put to sleep); the processes it started count with it. Everything else is grouped in families outside Treelab: Chrome, test browsers, virtual machines, node, cmux, cmux-cua, agent helpers, other.
 
 Last comes the list of what to cut, each with its reason, what the cut implies and the command of its click: a session idle for 24 hours or more (hibernate; set top_idle_hours= in LAB_HOME/config), a session whose lane is finished or removed (close), an agent holding three zombie processes or more (sleep then wake it), a tool server or test browser left orphan for an hour, a heavy family, a Lima virtual machine or a forgotten tool (stop). cmux, cmux-cua, the calling session and its parents, the parents of any session (a tab's shell, tmux), root processes, other accounts and the names in top_keep= (comma list in LAB_HOME/config) are never proposed; a tab shared by two sessions is only explained. Sessions put to sleep by lab appear with their wake command.
 
@@ -510,6 +541,12 @@ lab app — what Treelab.app reads, and the tab it brings forward
   lab app lanes [project [lane…]]
   lab app snapshot [--reader <pid>] [project [lane…]]
   lab app focus <project> <lane>
+  lab app account
+  lab app ginkgo [--listen <mode>] [--speak <mode>] [--quiet <HH:MM-HH:MM|off>]
+  lab app signin --email <address>
+  lab app signout --everywhere
+  lab app data --export <folder>
+  lab app data --erase [--confirm <token>]
 
 lanes reads every registered project, one project or some of its lanes, as the tower sees them: per lane outside the tower, what it waits for (WAITS_FOR=, WHY=), whether a session runs (SESSION=), its current batch (BATCH=, BATCH_STATE=) and whether it waits for you (FOR_YOU=yes|no, the tower's rule); per project, its lane count, how many wait for you (WAITING=) and the terminal app that opens its lanes (TERMINAL_APP=, and TERMINAL_SOURCE= for where that choice comes from: project, global, cmux, fork or none); then the total (WAITING_FOR_YOU=), lab's language (LANG=en|fr) and each terminal app installed on the Mac (TERMINAL_FOUND=). Each block also names the exact files and folders whose change can change its answer (WATCH=, WATCH_ENTRIES=), and per lane the paths lab keeps up to date itself (WRITTEN=), the processes whose end changes it (WATCH_PID=) and the first date it can change without a file (WAKE_AT=, epoch). Read only: no network, no tower created, nothing written.
 
@@ -519,10 +556,16 @@ focus brings the lane's cmux tab to the front (ACTION=tab), otherwise its projec
 
 The terminal app: lab drives cmux, or another app that keeps the cmux command, socket and AppleScript, such as the Treelab app built from cmux. terminal_app= followed by the path of the .app, in a project's config, then in ~/.lab/config, picks it; without the line, cmux itself (its command in the PATH, never the one of another app), otherwise a Treelab.app installed with its command (in /Applications or ~/Applications). terminal_cli= and terminal_socket=, in the same file as the line, set its command and its socket. Tabs, focus and notifications of that project then go to that app; projects without the line stay on cmux. A line naming a missing app is reported with its file and key, and nothing opens elsewhere. From the terminal of another app, its socket and tab are never passed on: drive a project from a terminal of its own app. Remove the line to go back to cmux.
 
+account, ginkgo, signin and signout serve the settings of Treelab.app (account contract v1.1). account reads the account of this Mac: PROTOCOL=1, SIGNED_IN=no until accounts exist, ACTIVATION=key when a license file activates this Mac (never read: it holds a secret), the rights that lab update and lab subscribe keep in their cache (PLAN=trial, subscription, lifetime for rights without an end, unknown before the first read, none without a license; STATE=trial, active, ended, unknown or none; TRIAL_DAYS_LEFT=, RENEWS= or ENDS= as YYYY-MM-DD, CHECKED= in UTC), WATCH= for the cache file whose change changes the answer, then the offer (OFFER_TRIAL_DAYS=, OFFER_MONTH=, OFFER_YEAR=, OFFER_CURRENCY=, OFFER_TAX=, OFFER_DISCOUNT_PCT= from OFFER_DISCOUNT_FROM= seats) from the offer file of the server shipped with lab. EMAIL=, ROLE=, PERIOD= and SEATS= stay empty until accounts. No network, nothing written. ginkgo reads LISTEN=, SPEAK= and QUIET= from ~/.lab/config and writes the ones given, all checked first: speak and quiet hours apply now, a new listen mode when Ginkgo opens again (APPLIES=now or next-open). signin and signout keep the form of the contract and answer REASON=unsupported until accounts exist: nothing is sent. Every refusal of these four commands exits with code 2 and REASON= (usage, invalid, unsupported, or unwritable when ~/.lab/config cannot be written) on stdout, the text on stderr; --json gives the same keys.
+
+data serves the data settings of Treelab.app (account contract v1.2). --export <folder> writes a readable copy of the data of this Mac into a new folder <folder>/treelab-export-YYYYMMDD-HHMMSS, never rewritten (EXPORTED=): README.txt, account.txt, settings.txt (Ginkgo and ~/.lab/config), lanes.txt (projects and lanes with their state), the Ginkgo log and its news (all projects and per project), the precisions told to Ginkgo, the agreements and words lab recorded per lane. No network; never the license nor the keychain; each known shape of a key or a token (sk-, ek_, tl_key_, Bearer, token=, secret=, password=, billing and checkout links) becomes [secret removed], and a shape left after that (a file name) removes the export (REASON=secret). A folder missing or not writable: REASON=unwritable. --erase is a gesture of the person, refused to an agent (REASON=agent): first a read-back (READBACK=, TOKEN=, EXPIRES_IN=120), nothing erased; then --erase --confirm <token>, one try within 120 s (else REASON=token), stops Ginkgo if it runs (else REASON=busy) and erases its log and news, the app snapshot (the mark of the live reader kept), the account cache and the OpenAI key of the keychain: ERASED=yes. lab, projects, lanes, batch files, agreements, words, the license and the settings (the Ginkgo precisions included) stay. Something left: ERASED=partial, LEFT= (ginkgo-log, ginkgo-news, app-snapshot, account-cache, keychain), REASON=partial.
+
 Examples:
   lab app lanes myproject
   lab app snapshot myproject payment
   lab app focus myproject payment
+  lab app account
+  lab app ginkgo --listen key --quiet 22:00-07:30
 HELP
       ;;
     sysmon) cat <<'HELP'
@@ -610,7 +653,7 @@ Shows what will be delivered and removed, then asks for a confirmation by typing
 
 Right before the merge, the main branch is read again up to date: if the merge would remove lines added by another lane, lab refuses and names them. Restore them, or confirm that removal with --retire <sha>: lab keeps it for this lane, so the next lab close, the tower's included, does not ask for it again.
 
-If the last nightly CI of the main branch is red, lab close refuses and suggests a fix lane, unless the lane proves its fix: a green manual run of the same workflow, on a revision that contains the first red commit and comes before the lane head; for such a lane, the count of red nights in lab doctor (ci.night_red_days) does not stop the delivery either. To close anyway, give your reason with --night-red-ok "<reason>": in both cases a dated agreement line (citing the green run for a proof) is committed in the acceptance section of the batch file, before the confirmation, and stays there if the closing stops.
+If the last nightly CI of the main branch is red, lab close refuses and suggests a fix lane, unless the lane proves its fix: a green manual run of the same workflow that replayed each red job green (the macos box checked for a macOS red), on a revision that contains the first red commit and comes before the lane head; for such a lane, the count of red nights in lab doctor (ci.night_red_days) does not stop the delivery either. To close anyway, give your reason with --night-red-ok "<reason>": in both cases a dated agreement line (citing the green run for a proof) is committed in the acceptance section of the batch file, before the confirmation, and stays there if the closing stops.
 
 --abandon removes a lane that has nothing to deliver, after the same confirmation.
 

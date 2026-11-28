@@ -278,6 +278,8 @@ hook_notify() {
     # lot 10 : les mots de l'utilisateur (prompt exact, libellé cliqué) enregistrés par lab, puis la consigne rendue à la session
     UserPromptSubmit) waits_clear "$root" 2>/dev/null || true; ( words_on_prompt "$root" ) 2>/dev/null || true; exit 0 ;;
     PostToolUse)   # la réponse à AskUserQuestion est arrivée : la boîte est effacée quoi que dise l'attente (un autre crochet a pu
+      # tous les outils passent par ce crochet depuis le lot 01 de contexte-neuf : seule la réponse à une question touche aux attentes
+      [ "$(printf '%s' "$PAYLOAD" | jq -r '.tool_name // empty' 2>/dev/null || true)" = AskUserQuestion ] || exit 0
       rm -f "$(waits_question_file "$root")" 2>/dev/null || true   # l'effacer le premier, essai réel du lot 02 de pilotage-voix)
       waits_clear_answered "$root" 2>/dev/null || true
       [ "$(printf '%s' "$PAYLOAD" | jq -r '.tool_name // empty' 2>/dev/null || true)" != AskUserQuestion ] || ( words_on_click "$root" ) 2>/dev/null || true

@@ -64,7 +64,7 @@ close_pr_read() { # actualise la PR exacte, sans interpréter un échec comme un
 }
 close_collect_branches() { # branche<TAB>révision<TAB>PR ou -<TAB>état[<TAB>#PR qui l’a livrée empilée, ou note des commits après fusion<TAB>tête fusionnée]
   local names name file branch head local_head remote_head rc start rel info number state current_num="${CLOSE_NUM:--}" seen=""
-  local out="" absorbers="" record by ahead anum t=$'\t' empty=0 late note pr_head
+  local out="" absorbers="" record by ahead anum t=$'\t' empty=0 late note pr_head tip
   [ "$CLOSE_PR_STATE" != EMPTY ] || empty=1   # lu avant la boucle : close_pr_read des anciens lots réécrit CLOSE_PR_STATE
   names="$(lane_plan_names "$WT")"; [ -n "$names" ] || names="$(basename "$CLOSE_LOT" .md)"
   while IFS= read -r name; do
@@ -100,8 +100,9 @@ $branch"
         # Documents externes : le prédécesseur direct d’un fix est encore
         # prouvé par le commit de départ, sans ajouter un historique parallèle.
         # lot vide (lot 01 de close-lot-vide) : le lot suivant part de la base, la tête d'un ancien lot n'y est donc jamais ; sa PR
-        # fusionnée vers la base à cette tête exacte prouve qu'elle ne porte rien de plus — la retirer ne perd rien
-        if [ "$head" != "$(wt_meta "$WT" start)" ] \
+        # fusionnée vers la base à cette tête exacte prouve qu'elle ne porte rien de plus — la retirer ne perd rien. Branche portée
+        # (stack_carried, écrit par lab next, lot 07 de contexte-neuf) : prouvée ; la seconde passe exige ses commits dans le résultat
+        if [ "$head" != "$(wt_meta "$WT" start)" ] && ! close_carried_tip "$branch" >/dev/null \
           && { [ "$empty" = 0 ] || ! info="$(pr_info_strict "$P_ROOT" "$branch")" || [ -z "$info" ] \
                || ! close_old_pr_merged "$(printf '%s' "$info" | cut -f1)" "$head"; }; then
           warn "branch $branch kept: old ownership not proven in the external documents"; continue
@@ -146,11 +147,28 @@ $branch"
           [ -n "$ahead" ] && [ "$ahead" != "$head" ] || continue
           if git -C "$WT" merge-base --is-ancestor "$head" "$ahead" 2>/dev/null; then by="$anum"; break; fi
         done <<<"$absorbers"
+        if [ -z "$by" ] && tip="$(close_carried_tip "$branch")"; then
+          # lot 07 de contexte-neuf : dernier lot empilé porté par un lot de plus pendant la recette, puis replacé sur la base avec
+          # lui — chacun de ses commits au-dessus du lot d'en dessous a sa copie rejouée dans le résultat essayé (même patch)
+          late="$(close_late_commits "$head" "$tip" carried)"
+          [ -z "$late" ] || die "work of $branch not included in the tried result: $late — lane kept"
+          printf '%s\tcarried by %s, never pushed\n' "$record" "$CLOSE_BRANCH"; continue
+        fi
         [ -n "$by" ] || die "work of $branch not included in the tried result: lane kept"
         printf '%s\t#%s\n' "$record" "$by" ;;
       ?*) printf '%s\n' "$record" ;;
     esac
   done <<<"$out"
+}
+# close_carried_tip <branche> → sommet du lot d'en dessous noté quand un lot de plus de la recette l'a portée (stack_carried de
+# .lab/meta, « <branche>@<sommet> » par entrée, lot 07 de contexte-neuf) ; rc 1 si elle n'y est pas
+close_carried_tip() {
+  local e; local -a list=()
+  read -r -a list <<<"$(wt_meta "$WT" stack_carried)"
+  for e in "${list[@]+"${list[@]}"}"; do
+    [ "${e%@*}" = "$1" ] && [ -n "${e##*@}" ] && { printf '%s\n' "${e##*@}"; return 0; }
+  done
+  return 1
 }
 # close_after_merge <tête de branche> (lot 03 de mcp-sobres) : rc 0 si la PR lue est fusionnée vers la base à une tête ancêtre de la
 # branche — des commits ajoutés après la fusion ; l'appelant exige ensuite qu'ils soient dans le résultat essayé
@@ -160,14 +178,15 @@ close_after_merge() {
 }
 # close_late_commits <tête de branche> <tête fusionnée> → « sha12 sujet, … » des commits absents du résultat essayé (5 au plus) ;
 # un commit recopié à l'identique (même patch-id, « - » de git cherry) dont le changement y reste est déjà livré (lot 05 de
-# ci-sobre) ; git cherry ignore les fusions : toute fusion tardive hors du résultat reste absente
+# ci-sobre) ; git cherry ignore les fusions : toute fusion tardive hors du résultat reste absente. Troisième argument « carried »
+# (branche portée, lot 07 de contexte-neuf) : la copie rejouée suffit, le lot de plus essayé a pu retoucher ses lignes
 close_late_commits() {
   local list cherry mark sha subject
   if cherry="$(git -C "$WT" cherry -v "$CLOSE_HEAD" "$1" "$2")" \
     && list="$(git -C "$WT" log --min-parents=2 --abbrev=12 --format='%h %s' "$1" "^$2" "^$CLOSE_HEAD" --)"; then
     while read -r mark sha subject; do
       [ -n "$sha" ] || continue
-      [ "$mark" = - ] && close_change_kept "$sha" && continue
+      [ "$mark" = - ] && { [ "${3:-}" = carried ] || close_change_kept "$sha"; } && continue
       list="${list:+$list
 }${sha:0:12} $subject"
     done <<<"$cherry"

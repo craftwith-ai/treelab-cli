@@ -20,6 +20,7 @@ Prerequisite: the current batch is planned or in progress (`planifié`, `en cour
 - Run the targeted checks. Quote command, exit code and an understandable result. When the project's CI workflow cites the `full-suite` label, the targeted tests are the same selection as its CI (`scripts/ci-select.sh files <base> HEAD` when the project has it) and no whole suite runs for a batch, locally or on the Cloud: it runs in CI at night (and at the tag when the workflow has one); a `full-suite` label posted by hand runs it once per posting, so remove the label and post it again to rerun it. Otherwise the whole suite waits for frozen code: `lab cloud <project> suite` when the project has `scripts/cloud-suite.sh` and it answers (rc 0 green, 1 red), otherwise the suite on the Mac, detached.
 - **Cause before the second fix.** Same symptom = same message, same counter or same metric. At the second fix of the same symptom, stop: read the code path end to end (or apply the project's investigation skill if there is one), then write **Cause** in the log entry — structural cause, or the admission "unknown" — before any new tweak. A third tweak without a written **Cause** is a closing red for `batch-end`.
 - **Proof of red.** For each bug fix and each new business rule, write the test first and watch it fail for the expected reason, before the fix; quote command and failure message under **Red before** in the log entry. A test never seen red proves nothing.
+- **Long outputs stay out of the context.** Every action sends the whole conversation back to the model: a test run, a CI log, a long file or a wide search read in the session is paid again at each following action. Send an output that needs no judgment (a test suite, a check) to a file outside the repository and read only its exit code, its counts and its failing lines; hand what needs reading (a CI log, a failure to diagnose, a search across many files) to a sub-agent that returns a short summary: command, exit code, evidence.
 - Log: at most one entry per session, timestamped by `lab now` (UTC, `YYYY-MM-DDTHH:MM:SSZ`), filled in during the session, ≤ 15 lines: **Proven** (command → result, commit), **Left**, **Decided not to do**, **Cause** when relevant. The long story, screenshots and measurements go to the evidence report `docs/lots/<lane>/preuves/lot-NN-<slug>.md`, linked from the entry; no figure is copied from one document to another.
 - An evidence file outside the repository (screenshot, output, measurement) is filed with `lab proof <project> <batch> add [--step <name>] <files…>`, never with a script nor a hand-written manifest.
 - A dated appointment made during the batch (follow-up, promised delivery, third-party deadline) is recorded with `lab due <project> add <due> <subject>`, never in the batch file nor the Handoff; `lab due <project>` lists them and settles the late ones.
@@ -30,13 +31,15 @@ Prerequisite: the current batch is planned or in progress (`planifié`, `en cour
 
 ## Heavy context
 
-Never use `/compact`. Update the log and `## Handoff`, then run yourself, from your session:
+Above `context_max=` of `~/.lab/config` (250 000 tokens by default, `0` turns it off), a Claude batch session receives after each action the reminder `LAB: context … above context_max`; Codex, without the reminder, applies the same rule once its session has grown long. Never use `/compact`. Finish the current step, update the log and `## Handoff`, then run yourself, from your session:
 
 ```text
 lab next <project> <lane>
 ```
 
 It checks everything that follows, then replaces your session with a fresh one in the same tab, with the same agent; finish your writes before running it (`--auto` is still accepted, same effect). A refusal kills nothing: it names the cause and the document to fix — fix it, then run it again. It refuses to replace another live session. Do not ask the user to step in.
+
+A user message or a clicked answer received above the threshold is not handled there: copy it word for word into `## Handoff` as the first thing to do, then run `lab next`; the fresh session handles it.
 
 ## End
 

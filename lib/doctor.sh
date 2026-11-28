@@ -337,6 +337,14 @@ doctor_ginkgo() {
   local app key=absent note
   ! ginkgo_key_present || key=present
   note="OpenAI key $key"; [ "$key" = present ] || note="$note (lab ginkgo key openai, or asked at the first lab ginkgo)"
+  # lot 05 : comment Ginkgo démarre (ginkgo_listen=), une information, jamais un rouge ; une valeur illisible est nommée. Sans processus
+  # hors du mode touche : le doctor tient son budget (tests/charge.bats, 552 > 550 en CI avant)
+  local hk=""; ginkgo_listen_read
+  if [ -z "$GINKGO_LISTEN" ]; then ginkgo_listen_phrase command; note="$note; $GINKGO_PHRASE (ginkgo_listen=$GINKGO_LISTEN_RAW unreadable)"
+  else
+    [ "$GINKGO_LISTEN" != key ] || hk="$(ginkgo_hotkey_value 2>/dev/null)"
+    ginkgo_listen_phrase "$GINKGO_LISTEN" "$hk"; note="$note; $GINKGO_PHRASE (ginkgo_listen=$GINKGO_LISTEN)"
+  fi
   if [ "${DOC_RELEASE:-no}" != yes ]; then flag global.ginkgo ok checkout "Ginkgo.app is built from the sources at the first lab ginkgo; $note"; return 0; fi
   app="$LAB_INSTALL_ROOT/apps/Ginkgo.app"
   if [ ! -d "$app" ]; then

@@ -334,16 +334,17 @@ notify_fields() {
     (if length == 1 then .[0] else error("stream") end) | (.prompt | s) as $p
     | (if ($p | explode | any(.[]; . > 127 or . < 9)) or ($p | ascii_downcase | . as $l | any(("ferm", "clo", "recett", "accept", "approuv", "approve", "valide"); . as $w | $l | contains($w)))
        then "perl" else "no" end) as $w
-    | @sh "HN_EVENT=\(.hook_event_name | s) HN_CWD=\(.cwd | s) HN_TRANSCRIPT=\(.transcript_path | s) HN_PROMPT=\($p) HN_WORDS=\($w)"' \
+    | @sh "HN_EVENT=\(.hook_event_name | s) HN_CWD=\(.cwd | s) HN_TRANSCRIPT=\(.transcript_path | s) HN_PROMPT=\($p) HN_WORDS=\($w) HN_TOOL=\(.tool_name | s) HN_AGENT=\(.agent_id | s)"' \
     <<<"$PAYLOAD" 2>/dev/null)" || return 1
   case "$out" in HN_EVENT=*) ;; *) return 1 ;; esac
   eval "$out"
-  chomp HN_EVENT; chomp HN_CWD; chomp HN_TRANSCRIPT; chomp HN_PROMPT
+  chomp HN_EVENT; chomp HN_CWD; chomp HN_TRANSCRIPT; chomp HN_PROMPT; chomp HN_TOOL; chomp HN_AGENT
   HOOK_CWD="${HN_CWD:-$HOOK_HERE}"
 }
 # notify_ordinary : rc 0 après avoir fait ce que hook_notify (lib/hooks.sh) fait d'un prompt qui ne parle ni de recette ni de
 # fermeture, ou d'une fin de tour : transcript rangé, attente effacée. rc 1 sans rien écrire pour tout autre événement, ou un doute
 notify_ordinary() {
+  # shellcheck disable=SC2153 # HN_* posés par l'eval de notify_fields
   case "$HN_EVENT" in UserPromptSubmit|Stop) ;; *) return 1 ;; esac
   guard_fast_root "${CLAUDE_PROJECT_DIR:-$HOOK_CWD}" || return 1
   [ -n "$GF_ROOT" ] || return 0
@@ -359,12 +360,33 @@ notify_ordinary() {
 }
 # notify_main : le crochet entier ; sur stdout, la seule ligne JSON hookSpecificOutput du chemin complet
 notify_main() {
-  local out line
+  local out line fields=0
   guard_load kv
-  if notify_fields && notify_ordinary; then return 0; fi
+  if notify_fields; then
+    fields=1
+    # PostToolUse sur tous les outils (lot 01 de contexte-neuf) : seule la réponse à AskUserQuestion touche aux attentes
+    if [ "$HN_EVENT" = PostToolUse ] && [ "$HN_TOOL" != AskUserQuestion ]; then notify_context; return 0; fi
+    if notify_ordinary; then [ "$HN_EVENT" != UserPromptSubmit ] || notify_context; return 0; fi
+  fi
   out="$(printf '%s' "$PAYLOAD" | "$LAB_ROOT/bin/lab" hook notify 2>/dev/null)" || true
   while IFS= read -r line; do
-    case "$line" in '{"hookSpecificOutput":'*) printf '%s\n' "$line"; return 0 ;; esac
+    case "$line" in '{"hookSpecificOutput":'*) printf '%s\n' "$line"; return 0 ;; esac   # la consigne des mots d'accord reste seule
   done <<<"$out"
+  # un prompt, ou la réponse cliquée à AskUserQuestion (seul PostToolUse à prendre le chemin complet) : le rappel, sans consigne d'accord
+  if [ "$fields" = 1 ]; then case "$HN_EVENT" in UserPromptSubmit|PostToolUse) notify_context ;; esac; fi
   return 0
+}
+# notify_context : le rappel de contexte neuf (lib/context.sh) d'une session de lot, ou de la tour (lot 05 : son propre message, elle
+# repart par lab next <projet> tower) ; rien pour un sous-agent (il lancerait lab next à la place de la session), un dossier sans
+# fiche de couloir. Le dossier de lancement fait foi, comme pour la garde.
+notify_context() {
+  local project lane role=''
+  [ -z "$HN_AGENT" ] && [ -n "$HN_TRANSCRIPT" ] || return 0
+  guard_fast_root "${CLAUDE_PROJECT_DIR:-$HOOK_CWD}" || return 0
+  [ -n "$GF_ROOT" ] && [ -f "$GF_ROOT/.lab/meta" ] || return 0
+  if kv_value "$GF_ROOT/.lab/meta" role && [ "$KV_VALUE" = tower ]; then role=tower; fi
+  kv_value "$GF_ROOT/.lab/meta" project && [ -n "$KV_VALUE" ] || return 0; project="$KV_VALUE"
+  kv_value "$GF_ROOT/.lab/meta" lane && [ -n "$KV_VALUE" ] || return 0; lane="$KV_VALUE"
+  guard_load context
+  context_reminder "$HN_EVENT" "$HN_TRANSCRIPT" "$project" "$lane" "$HN_TOOL" "$role"
 }

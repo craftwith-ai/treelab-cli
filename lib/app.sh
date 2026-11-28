@@ -565,6 +565,281 @@ app_focus() {
   kv WORKSPACE "$ws"; kv SURFACE ""; kv ACTION workspace; kv WAY socket; kv APP "$(app_cmux_app)"
 }
 
+# ---------- compte et réglages (lot 01 de compte-app) ----------
+# Contrat « compte et réglages » v1.1, tenu par le couloir de l'app : l'app lit l'état que lab écrit et agit par ses commandes. Un refus
+# du contrat rend le code 2, REASON= sur la sortie et le texte sur stderr ; lecture sans réseau ni écriture.
+APP_PROTOCOL=1
+APP_TRIAL_DAYS=14   # TRIAL_SECONDS de api/src/trial.ts (tests/app_account.bats les compare)
+
+# app_refuse <raison> <texte> : REASON= sur la sortie, le texte sur stderr, code 2
+app_refuse() { kv REASON "$1"; log_wrap "$2"; exit 2; }
+
+# app_amount <centimes> → l'euro sans décimale s'il est rond, sinon deux décimales (3950 → 39.50)
+app_amount() { if [ $(($1 % 100)) = 0 ]; then printf '%s\n' "$(($1 / 100))"; else printf '%s.%02d\n' "$(($1 / 100))" "$(($1 % 100))"; fi; }
+
+# app_offer_kv : OFFER_* depuis le fichier d'offre du serveur (api/src/offer.json, livré dans la release), jamais écrit dans l'app ;
+# fichier absent ou hors forme : aucune clé OFFER_, rien d'autre ne change
+app_offer_kv() {
+  local f="${LAB_OFFER_FILE:-$LAB_ROOT/api/src/offer.json}" row month year cur pct from
+  row="$(jq -er 'def n: type=="number" and floor==. and .>0; .subscription | select((.month|n) and (.year|n) and (.currency|type=="string")
+    and (.team_percent_off|n) and (.team_seats|n)) | [.month, .year, (.currency|ascii_upcase), .team_percent_off, .team_seats] | @tsv' \
+    "$f" 2>/dev/null)" || return 0
+  IFS=$'\t' read -r month year cur pct from <<<"$row"
+  kv OFFER_TRIAL_DAYS "$APP_TRIAL_DAYS"; kv OFFER_MONTH "$(app_amount "$month")"; kv OFFER_YEAR "$(app_amount "$year")"
+  kv OFFER_CURRENCY "$cur"; kv OFFER_TAX included; kv OFFER_DISCOUNT_PCT "$pct"; kv OFFER_DISCOUNT_FROM "$from"
+}
+
+# app_license_present : la licence de ce Mac, sans la lire (elle porte le jeton d'activation) — la règle du doctor : fichier ordinaire,
+# non vide, lisible, pas un lien, droits 0600
+app_license_present() {
+  local f="$LAB_HOME/license"
+  [ -f "$f" ] && [ ! -L "$f" ] && [ -s "$f" ] && [ -r "$f" ] && [ "$(stat -f %Lp "$f" 2>/dev/null)" = 600 ]
+}
+
+# lab app account : le compte de ce Mac. Avant les comptes (lots 03 et suivants) : SIGNED_IN=no, ACTIVATION=key|none, droits lus du
+# cache qu'écrivent lab update et lab subscribe (lib/entitlement.sh) — EMAIL, PERIOD, SEATS et ROLE vides. RENEWS : la fin payée, que
+# le serveur prolonge de 24 h tant que l'abonnement se renouvelle (api/contracts/subscription-v1.md, règle des droits)
+# shellcheck disable=SC2153 # ENT_* sont posés par entitlement_state (lib/entitlement.sh, chargé ici)
+app_account() {
+  [ "$#" = 0 ] || app_refuse usage "usage: lab app account (read only, no option)"
+  local plan=none state=none days='' renews='' ends='' checked='' activation=none now
+  . "$LAB_ROOT/lib/entitlement.sh"
+  if app_license_present; then
+    activation=key; plan=unknown; state=unknown
+    now="$(entitlement_now 2>/dev/null)" || now=''
+    ENT_PLAN='' ENT_UNTIL='' ENT_RENEWS='' ENT_CHECKED=''   # horloge illisible : entitlement_state rend sans lire le cache
+    entitlement_state "$now"
+    [ -z "$ENT_CHECKED" ] || checked="$(entitlement_instant "$ENT_CHECKED")"
+    if [ -n "$ENT_PLAN" ] && [ -z "$ENT_UNTIL" ]; then plan=lifetime; state=active
+    elif [ -n "$ENT_PLAN" ]; then
+      plan="$ENT_PLAN"
+      case "$ENT_STATE" in
+        ended) state=ended; ends="$(entitlement_day "$ENT_UNTIL")" ;;
+        active|ending)
+          if [ "$plan" = trial ]; then state=trial; days=$(( (ENT_UNTIL - now + 86399) / 86400 )); else state=active; fi
+          if [ "$ENT_RENEWS" = true ]; then renews="$(entitlement_day "$((ENT_UNTIL - 86400))")"; else ends="$(entitlement_day "$ENT_UNTIL")"; fi ;;
+      esac
+    fi
+  fi
+  kv PROTOCOL "$APP_PROTOCOL"; kv SIGNED_IN no; kv ACTIVATION "$activation"; kv EMAIL ''; kv ROLE ''
+  kv PLAN "$plan"; kv PERIOD ''; kv STATE "$state"; kv TRIAL_DAYS_LEFT "$days"; kv RENEWS "$renews"; kv ENDS "$ends"
+  kv SEATS ''; kv CHECKED "$checked"; kv WATCH "$(entitlement_file)"
+  app_offer_kv
+}
+
+# app_quiet_norm <HH:MM-HH:MM|off> → la plage écrite à deux chiffres, ou off ; rc 1 pour une plage illisible ou vide (début = fin)
+app_quiet_norm() {
+  local s e
+  [ "$1" != off ] || { printf 'off\n'; return 0; }
+  [ "${1#*-}" != "$1" ] && ginkgo_minute_set "${1%%-*}" && s="$GINKGO_MINUTE" && ginkgo_minute_set "${1#*-}" && e="$GINKGO_MINUTE" &&
+    [ "$s" != "$e" ] || return 1
+  printf '%02d:%02d-%02d:%02d\n' $((s / 60)) $((s % 60)) $((e / 60)) $((e % 60))
+}
+
+# app_ginkgo_write <clé> <valeur> : ginkgo_config_write, dont le refus (lien, verrou tenu, dossier non inscriptible, vus avant tout
+# changement) devient celui du contrat : code 2, REASON=unwritable, son texte sur stderr
+app_ginkgo_write() {
+  local err
+  err="$(ginkgo_config_write "$1" "$2" 2>&1)" || app_refuse unwritable "${err#"$DIE_PREFIX"}"
+}
+
+# lab app ginkgo [--listen command|key|name] [--speak always|conversation|never] [--quiet HH:MM-HH:MM|off] : les réglages de Ginkgo de
+# ~/.lab/config (ginkgo_listen=, ginkgo_speak=, ginkgo_quiet=), lus ou écrits (tout est vérifié avant la première écriture). Parole et
+# heures calmes valent tout de suite (lab les relit à chaque annonce) ; l'écoute, dès que --listen est donné, à la prochaine
+# ouverture de Ginkgo (APPLIES=next-open). Aucun événement n'est envoyé à Ginkgo.
+app_ginkgo() {
+  local listen='' speak='' quiet='' q
+  . "$LAB_ROOT/lib/ginkgo.sh"
+  while [ "$#" -gt 0 ]; do
+    [ "$#" -ge 2 ] && [ -n "$2" ] || app_refuse usage "usage: lab app ginkgo [--listen <mode>] [--speak <mode>] [--quiet <HH:MM-HH:MM|off>]"
+    case "$1" in
+      --listen) case "$2" in command|key|name) listen="$2" ;; *) app_refuse invalid "unknown listen mode: $2 (command, key or name): nothing changed" ;; esac ;;
+      --speak) case "$2" in always|conversation|never) speak="$2" ;; *) app_refuse invalid "unknown speak mode: $2 (always, conversation or never): nothing changed" ;; esac ;;
+      --quiet) quiet="$(app_quiet_norm "$2")" || app_refuse invalid "quiet hours $2 are not HH:MM-HH:MM (two different times) or off: nothing changed" ;;
+      *) app_refuse usage "usage: lab app ginkgo [--listen <mode>] [--speak <mode>] [--quiet <HH:MM-HH:MM|off>]" ;;
+    esac
+    shift 2
+  done
+  [ -z "$listen" ] || app_ginkgo_write ginkgo_listen "$listen"
+  [ -z "$speak" ] || app_ginkgo_write ginkgo_speak "$speak"
+  [ -z "$quiet" ] || app_ginkgo_write ginkgo_quiet "$quiet"
+  ginkgo_listen_mode >/dev/null; kv LISTEN "$GINKGO_LISTEN"
+  ginkgo_speak_mode_set; kv SPEAK "$GINKGO_SPEAK"
+  ginkgo_config_set ginkgo_quiet; q="$(app_quiet_norm "${GINKGO_CONF:-$GINKGO_QUIET_DEFAULT}")" || { ginkgo_quiet_range_set; q="$GINKGO_QUIET_DEFAULT"; }
+  kv QUIET "$q"
+  [ -z "$listen$speak$quiet" ] || if [ -n "$listen" ]; then kv APPLIES next-open; else kv APPLIES now; fi
+}
+
+# lab app signin --email <adresse> · lab app signout --everywhere : la forme du contrat, refusée en code 2 (REASON=unsupported) tant
+# que les comptes n'existent pas au serveur (lots 03 et 04) ; rien n'est envoyé
+app_signin() {
+  [ "$#" = 2 ] && [ "$1" = --email ] && [ -n "$2" ] || app_refuse usage "usage: lab app signin --email <address>"
+  app_refuse unsupported "Signing in by email arrives with a later version of lab: nothing sent. lab subscribe and the OpenAI key already work."
+}
+app_signout() {
+  [ "$#" = 1 ] && [ "$1" = --everywhere ] || app_refuse usage "usage: lab app signout --everywhere"
+  app_refuse unsupported "Signing out everywhere arrives with a later version of lab: nothing changed."
+}
+
+# ---------- lab app data (lot 02 de compte-app) : export lisible sans secret, effacement en deux temps ----------
+APP_DATA_USAGE="usage: lab app data --export <folder> | --erase [--confirm <token>]"
+APP_ERASE_TTL=120
+# APP_SECRET_PERL : APP_SECRET_MODE=redact (entrée standard → sortie) remplace chaque motif de secret connu par [secret removed], la
+# clé d'un clé=valeur gardée (espaces autour du signe égal compris ; une valeur entre guillemets jusqu'au guillemet fermant, ou
+# jusqu'à la fin de la ligne s'il manque), comme le préfixe d'un lien de facturation ou de caisse (?link= ou ?claim=,
+# lib/subscribe.sh) ; scan (chemins en arguments) rend 1 au premier motif restant, dans un chemin (un nom de fichier n'est jamais
+# filtré) ou dans le texte d'un fichier — une valeur qui commence par un guillemet comprise —, 0 sinon
+# shellcheck disable=SC2016 # du perl : ses $ ne sont jamais développés par le shell
+APP_SECRET_PERL='
+my $v = qr{tl_key_[A-Za-z0-9_-]+|\bsk-[A-Za-z0-9_-]{16,}|\bek_[A-Za-z0-9_-]{16,}|(?i:bearer)[ \t]+[A-Za-z0-9._~+/=-]{16,}|[?&](?i:link|claim)=\K[0-9A-Fa-f]{32,}};
+my $k = qr{(?i:token|secret|password|passwd|api_key|apikey|access_key)[ \t]*=[ \t]*};
+my $q = qr{"[^"\n]*"?|\x27[^\x27\n]*\x27?|[^\s&"\x27<>]+};
+my $r = "[secret removed]";
+my $left = sub { $_[0] =~ $v || $_[0] =~ /$k(?!\Q$r\E)[^\s&<>]/ };
+if (($ENV{APP_SECRET_MODE} // "") eq "scan") {
+  for my $f (@ARGV) {
+    exit 1 if $left->($f);
+    next unless -f $f;
+    open(my $h, "<", $f) or exit 1;
+    while (<$h>) { exit 1 if $left->($_) }
+  }
+  exit 0;
+}
+while (<STDIN>) { s/$v/$r/g; s/($k)(?!\Q$r\E)(?:$q)/$1$r/g; print }'
+app_data_put() { APP_SECRET_MODE=redact perl -e "$APP_SECRET_PERL" >"$1"; }   # <fichier> : l'entrée standard filtrée
+# app_data_copy <source> <destination> : un fichier ordinaire (jamais un lien) filtré ; rien pour un absent
+app_data_copy() { [ -f "$1" ] && [ ! -L "$1" ] || return 0; mkdir -p "${2%/*}" && app_data_put "$2" <"$1"; }
+app_data_clean() {   # depuis le dossier de l'export : rc 0 sans motif de secret, ni dans les chemins ni dans les textes
+  local f; local -a fs=()
+  while IFS= read -r -d '' f; do fs+=("$f"); done < <(find . -mindepth 1 -print0)
+  [ "${#fs[@]}" = 0 ] || APP_SECRET_MODE=scan perl -e "$APP_SECRET_PERL" "${fs[@]}"
+}
+app_data_readme() {   # <horodatage>
+  cat <<EOF
+Treelab data export of this Mac — $1 (UTC), lab $(app_snap_version)
+
+What this folder holds, as readable text:
+- account.txt: the account of this Mac (lab app account).
+- settings.txt: the Ginkgo settings (lab app ginkgo) and the lab settings (~/.lab/config).
+- lanes.txt: your projects and lanes with their state (lab app lanes).
+- ginkgo/: the Ginkgo log, its news for all projects (news-all) and, per project, its news; the precisions you told Ginkgo
+  (precisions: ignore, only, even at night), kept as a setting when the data are erased.
+- agreements/ and words/: per project and lane, the agreements and the words lab recorded.
+
+No secret: the licence of this Mac, the OpenAI key (macOS keychain) and the confirmation tokens are never copied. Texts in the
+known shapes of a key or a token (sk-, ek_, tl_key_ and Bearer keys, the values of token, secret and password settings, the
+billing and checkout links) are replaced by [secret removed]; a text of another shape stays as written, so read this folder before you share it. Your code and
+your batch files stay in your repositories.
+EOF
+}
+# app_data_fill <dossier> <horodatage> : chaque fichier de l'export, filtré ; rc 1 au premier échec (set -e est sans effet ici)
+app_data_fill() {
+  local d="$1" f p k
+  app_data_readme "$2" >"$d/README.txt" || return 1
+  ( app_account ) 2>/dev/null | app_data_put "$d/account.txt" || return 1
+  { printf '# Ginkgo settings (lab app ginkgo)\n'; ( app_ginkgo ) 2>/dev/null
+    printf '\n# lab settings (~/.lab/config)\n'; [ ! -f "$LAB_HOME/config" ] || cat "$LAB_HOME/config"; } | app_data_put "$d/settings.txt" || return 1
+  { ( app_lanes ) 2>/dev/null || printf 'LANES=unreadable\n'; } | app_data_put "$d/lanes.txt" || return 1
+  mkdir -p "$d/ginkgo/news" "$d/agreements" "$d/words" || return 1
+  for f in "$(ginkgo_dir)"/ginkgo.log*; do app_data_copy "$f" "$d/ginkgo/${f##*/}" || return 1; done
+  app_data_copy "$(ginkgo_dir)/news" "$d/ginkgo/news-all" || return 1   # lab ginkgo news --all, le mode de Ginkgo.app
+  for f in "$LAB_STATE"/*/ginkgo/news; do p="${f%/ginkgo/news}"; app_data_copy "$f" "$d/ginkgo/news/${p##*/}" || return 1; done
+  app_data_copy "$(ginkgo_dir)/precisions" "$d/ginkgo/precisions" || return 1   # ce que la personne a dit à Ginkgo : un réglage, gardé à l'effacement
+  for k in agreements words; do
+    for f in "$LAB_STATE"/*/"$k"/*; do p="${f%/"$k"/*}"; app_data_copy "$f" "$d/$k/${p##*/}/${f##*/}" || return 1; done
+  done
+}
+# lab app data --export <dossier> : un dossier neuf treelab-export-<AAAAMMJJ-HHMMSS>[-N] (700) dans <dossier>, jamais réécrit ; sans
+# réseau, aucune source écrite, ni la licence ni le trousseau lus ; un motif de secret resté après le filtre retire l'export
+app_data_export() {
+  local dest now stamp base dir i=1
+  dest="$(cd "$1" 2>/dev/null && pwd)" && [ -w "$dest" ] \
+    || app_refuse unwritable "cannot export into $1: not an existing folder this user can write — nothing written"
+  now="$(entitlement_now)" || now="$(date +%s)"
+  stamp="$(date -u -r "$now" +%Y%m%d-%H%M%S)"
+  base="${dest%/}/treelab-export-$stamp"; dir="$base"
+  until ( umask 077; mkdir "$dir" ) 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -le 99 ] || app_refuse unwritable "cannot create a new folder in $dest — nothing written"
+    dir="$base-$i"
+  done
+  if ! ( umask 077; app_data_fill "$dir" "$stamp" ); then
+    rm -R "$dir" 2>/dev/null || true
+    app_refuse unwritable "the export into $dir failed: nothing exported"
+  fi
+  if ! ( cd "$dir" && app_data_clean ); then
+    rm -R "$dir" 2>/dev/null || true
+    app_refuse secret "a text shaped like a key or a token stayed in the export (a file name, the name of a lane?): nothing exported"
+  fi
+  kv EXPORTED "$dir"
+}
+
+app_erase_pending() { printf '%s/app-erase-pending\n' "$LAB_STATE"; }
+# app_erase_rm <nom> <chemin>… : retire chaque chemin ; un chemin resté ajoute <nom> à APP_LEFT
+app_erase_rm() {
+  local n="$1" f; shift
+  for f in "$@"; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    rm -R "$f" 2>/dev/null || true
+    if [ -e "$f" ] || [ -L "$f" ]; then case " $APP_LEFT " in *" $n "*) ;; *) APP_LEFT="${APP_LEFT:+$APP_LEFT }$n" ;; esac; fi
+  done
+}
+# lab app data --erase [--confirm <jeton>] : geste de la personne, refusé à un agent aux deux temps ; d'abord la relecture (READBACK,
+# TOKEN, EXPIRES_IN, rien effacé), puis, jeton juste dans le délai (un seul essai) : Ginkgo arrêté s'il tourne, son journal et ses
+# nouvelles, l'instantané de l'app (la marque du lecteur et le verrou de l'écrivain gardés), le cache des droits et la clé OpenAI
+# effacés. Restent lab, ~/.lab/config (réglages de Ginkgo compris), la licence, projets, couloirs, fiches, accords et mots.
+app_data_erase() {
+  local token='' f now at ptoken d e
+  case "$#" in
+    0) ;;
+    2) [ "$1" = --confirm ] && [ -n "$2" ] || app_refuse usage "$APP_DATA_USAGE"; token="$2" ;;
+    *) app_refuse usage "$APP_DATA_USAGE" ;;
+  esac
+  [ "$(caller_role)" = human ] \
+    || app_refuse agent "Erasing the data of this Mac is a gesture of the person (Treelab or their terminal): refused to an agent, nothing erased."
+  f="$(app_erase_pending)"; now="$(entitlement_now)" || now="$(date +%s)"
+  if [ -z "$token" ]; then
+    token="$(LC_ALL=C od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+    { mkdir -p "$LAB_STATE" && ( umask 077; printf 'token=%s\nat=%s\n' "$token" "$now" >"$f.tmp.$$" && mv "$f.tmp.$$" "$f" ); } 2>/dev/null \
+      || app_refuse unwritable "cannot write $f: nothing to confirm"
+    kv READBACK "Erase the data of Treelab on this Mac: Ginkgo stops if it runs; its log and its news, what lab keeps for the app, the account cache and the OpenAI key (macOS keychain) leave this Mac. Kept: lab, your projects, lanes, batch files, agreements and words, your account and licence, the Ginkgo settings. Confirm with the token within $APP_ERASE_TTL s."
+    kv TOKEN "$token"; kv EXPIRES_IN "$APP_ERASE_TTL"
+    return 0
+  fi
+  [ -s "$f" ] && [ ! -L "$f" ] || app_refuse token "no erase read back: nothing erased — run lab app data --erase first"
+  ptoken="$(sed -n 's/^token=//p' "$f")"; at="$(sed -n 's/^at=//p' "$f")"
+  rm -f "$f" 2>/dev/null || app_refuse unwritable "cannot consume the read-back $f: nothing erased"   # un seul essai
+  [ -n "$ptoken" ] && [ "$token" = "$ptoken" ] || app_refuse token "wrong confirmation token: nothing erased — read it back again (lab app data --erase)"
+  case "$at" in ''|*[!0-9]*) app_refuse token "unreadable read-back: nothing erased — read it back again" ;; esac
+  [ "$((now - at))" -ge 0 ] && [ "$((now - at))" -le "$APP_ERASE_TTL" ] \
+    || app_refuse token "the read-back is older than $APP_ERASE_TTL s: nothing erased — read it back again (lab app data --erase)"
+  . "$LAB_ROOT/lib/ginkgo.sh"
+  if pgrep -x Ginkgo >/dev/null 2>&1 && ! ginkgo_stop; then
+    app_refuse busy "Ginkgo did not stop: quit it from its menu bar icon, then erase again — nothing erased"
+  fi
+  APP_LEFT=''
+  app_erase_rm ginkgo-log "$(ginkgo_dir)"/ginkgo.log*
+  app_erase_rm ginkgo-news "$(ginkgo_dir)/news" "$LAB_STATE"/*/ginkgo/news
+  d="$LAB_STATE/app-snapshot"
+  if [ -d "$d" ] && [ ! -L "$d" ]; then
+    for e in "$d"/* "$d"/.[!.]*; do case "${e##*/}" in reader|lock) ;; *) app_erase_rm app-snapshot "$e" ;; esac; done
+  fi
+  app_erase_rm account-cache "$(entitlement_file)"
+  if ginkgo_key_present; then
+    security delete-generic-password -s "$GINKGO_SERVICE" -a "$GINKGO_ACCOUNT" >/dev/null 2>&1 || true
+    ! ginkgo_key_present || APP_LEFT="${APP_LEFT:+$APP_LEFT }keychain"
+  fi
+  if [ -z "$APP_LEFT" ]; then kv ERASED yes; return 0; fi
+  kv ERASED partial; kv LEFT "$APP_LEFT"
+  app_refuse partial "Some data stayed on this Mac ($APP_LEFT): remove it by hand (the OpenAI key in Keychain Access, service $GINKGO_SERVICE)."
+}
+app_data() {
+  case "${1:-}" in
+    --export) [ "$#" = 2 ] && [ -n "$2" ] || app_refuse usage "$APP_DATA_USAGE"; . "$LAB_ROOT/lib/ginkgo.sh"; app_data_export "$2" ;;
+    --erase) shift; app_data_erase "$@" ;;
+    *) app_refuse usage "$APP_DATA_USAGE" ;;
+  esac
+}
+
 cmd_app() {
   [ "$#" -ge 1 ] || usage
   local sub="$1"; shift
@@ -572,6 +847,11 @@ cmd_app() {
     lanes) app_lanes "$@" ;;
     focus) app_focus "$@" ;;
     snapshot) APP_SNAP_FULL_LAB=1; unset LAB_SNAP_FULL; app_snapshot "$@" ;;
+    account) app_account "$@" ;;
+    ginkgo) app_ginkgo "$@" ;;
+    signin) app_signin "$@" ;;
+    signout) app_signout "$@" ;;
+    data) app_data "$@" ;;
     *) usage ;;
   esac
 }
